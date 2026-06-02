@@ -12972,7 +12972,7 @@ const port = Number(portValue ?? process.env.PORT ?? "8080");
 
 if (process.platform === "linux") {
   const missing: string[] = [];
-  const has = (cmd: string) => Bun.spawnSync(["which", cmd]).exitCode === 0;
+  const has = (cmd: string) => Bun.which(cmd) !== null;
   if (!has("unzip")) missing.push("unzip  (backup restore / skill import from ZIP)");
   if (!has("zip")) missing.push("zip  (backup export)");
   if (!has("wl-copy") && !has("xclip")) missing.push("wl-clipboard or xclip  (clipboard tool)");
