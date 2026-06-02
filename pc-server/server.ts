@@ -5623,7 +5623,7 @@ async function readSystemClipboardText() {
       const proc = Bun.spawnSync(["xclip", "-selection", "clipboard", "-o"]);
       if (proc.exitCode === 0) return new TextDecoder().decode(proc.stdout).trim();
     }
-  } catch {}
+  } catch (e) { console.warn("[clipboard] read failed:", e); }
   return "";
 }
 
@@ -5645,7 +5645,7 @@ async function writeSystemClipboardText(text: string) {
       proc.stdin.end();
       await proc.exited;
     }
-  } catch {}
+  } catch (e) { console.warn("[clipboard] write failed:", e); }
 }
 
 // Global serialization lock for system TTS. Without this, parallel client
