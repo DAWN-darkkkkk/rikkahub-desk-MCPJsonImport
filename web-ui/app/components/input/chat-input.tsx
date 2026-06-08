@@ -355,38 +355,57 @@ function ChatInputInner({
       }
 
       const allFiles = Array.from(fileList);
-      const results = await Promise.all(
-        allFiles.map(async (f) => ({ file: f, ...(await detectUploadFile(f)) })),
-      );
-      const uploadableFiles = results.filter((r) => r.allowed);
-      const skippedFiles = results.filter((r) => !r.allowed);
-
-      if (skippedFiles.length > 0) {
-        toast.warning(
-          t("chat.unsupported_file_skipped", { count: skippedFiles.length }),
-        );
-      }
-
-      if (uploadableFiles.length === 0) {
-        return;
-      }
-
-      const formData = new FormData();
-      const safeFiles = await Promise.all(uploadableFiles.map(async ({ file, mimeType }) => {
-        // 用 magic bytes 检测结果覆盖浏览器的 file.type，修正跨平台 MIME 歧义
-        const safeFile =
-          file.type !== mimeType
-            ? new globalThis.File([file], file.name, { type: mimeType })
-            : file;
-        return normalizeImageForModelUpload(safeFile);
-      }));
-      safeFiles.forEach((safeFile) => {
-        formData.append("files", safeFile, safeFile.name);
-      });
-
+      // Set the busy state up front so the user gets immediate feedback even during the
+      // (potentially slow) detection + image-normalization phases. Previously these ran
+      // before setUploading(true) and outside the try/catch, so any throw in file-type
+      // detection or image decoding silently rejected the whole upload with no UI feedback
+      // — the "上传后没反应、文件没显示" symptom.
       setUploading(true);
       setError(null);
       try {
+        const results = await Promise.all(
+          allFiles.map(async (f) => {
+            try {
+              return { file: f, ...(await detectUploadFile(f)) };
+            } catch {
+              // Detection failed (corrupt buffer, file-type lib error) — fall back to
+              // treating it as an allowed plain-text-ish upload rather than dropping it.
+              return { file: f, allowed: true, mimeType: f.type || "application/octet-stream" };
+            }
+          }),
+        );
+        const uploadableFiles = results.filter((r) => r.allowed);
+        const skippedFiles = results.filter((r) => !r.allowed);
+
+        if (skippedFiles.length > 0) {
+          toast.warning(
+            t("chat.unsupported_file_skipped", { count: skippedFiles.length }),
+          );
+        }
+
+        if (uploadableFiles.length === 0) {
+          return;
+        }
+
+        const formData = new FormData();
+        const safeFiles = await Promise.all(uploadableFiles.map(async ({ file, mimeType }) => {
+          // 用 magic bytes 检测结果覆盖浏览器的 file.type，修正跨平台 MIME 歧义
+          const safeFile =
+            file.type !== mimeType
+              ? new globalThis.File([file], file.name, { type: mimeType })
+              : file;
+          // Image normalization can throw on corrupt/unsupported images — never let that
+          // abort the whole upload; fall back to the original file.
+          try {
+            return await normalizeImageForModelUpload(safeFile);
+          } catch {
+            return safeFile;
+          }
+        }));
+        safeFiles.forEach((safeFile) => {
+          formData.append("files", safeFile, safeFile.name);
+        });
+
         const response = await api.postMultipart<UploadFilesResponseDto>(
           "files/upload",
           formData,
