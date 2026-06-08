@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, s
 import * as fsPromises from "node:fs/promises";
 import { dirname, extname, join, resolve } from "node:path";
 import process from "node:process";
-import { gunzipSync, gzipSync, inflateRawSync } from "node:zlib";
+import { gunzipSync, gzipSync, inflateRawSync, inflateSync } from "node:zlib";
 import { Database } from "bun:sqlite";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -6187,42 +6187,58 @@ function extractStoredFileText(entry: StoredFile) {
 
 // --- Document parsers: aligned with Android's document module ---
 
+function inflatePdfStream(raw: Buffer): Buffer | null {
+  // PDF FlateDecode streams are zlib-wrapped (0x78 header). Try zlib first,
+  // then raw deflate as a fallback for non-standard producers.
+  try {
+    return inflateSync(raw);
+  } catch { /* not zlib-wrapped */ }
+  try {
+    return inflateRawSync(raw);
+  } catch { /* not raw deflate either */ }
+  return null;
+}
+
 function extractPdfText(pathValue: string) {
   // Android uses MuPDF; for Bun we extract text from FlateDecode streams.
   // Covers the vast majority of text-heavy PDFs.
   const buf = readFileSync(pathValue);
   const text: string[] = [];
   const streamRe = /stream\r?\n/g;
+  const latin1 = buf.toString("latin1");
   let match: RegExpExecArray | null;
-  while ((match = streamRe.exec(buf.toString("latin1"))) !== null) {
+  while ((match = streamRe.exec(latin1)) !== null) {
     const start = match.index + match[0].length;
     const endBuf = buf.subarray(start);
     const endIdx = endBuf.indexOf(Buffer.from("endstream"));
     if (endIdx < 0) continue;
-    const raw = endBuf.subarray(0, endIdx);
-    try {
-      const decompressed = Bun.gunzipSync(raw);
-      const str = decompressed.toString("latin1");
-      // Tj operator: (text) Tj
-      const tjMatch = str.match(/\(([^\\)]*(?:\\.[^\\)]*)*)\)\s*Tj/g);
-      if (tjMatch) {
-        for (const m of tjMatch) {
-          const inner = m.replace(/^\(/, "").replace(/\)\s*Tj$/, "");
-          text.push(unescapePdfString(inner));
+    // Trim a trailing EOL that sits between the stream data and the `endstream` keyword.
+    let rawEnd = endIdx;
+    if (rawEnd >= 2 && endBuf[rawEnd - 2] === 0x0d && endBuf[rawEnd - 1] === 0x0a) rawEnd -= 2;
+    else if (rawEnd >= 1 && (endBuf[rawEnd - 1] === 0x0a || endBuf[rawEnd - 1] === 0x0d)) rawEnd -= 1;
+    const raw = endBuf.subarray(0, rawEnd);
+    const decompressed = inflatePdfStream(raw);
+    if (!decompressed) continue;
+    const str = decompressed.toString("latin1");
+    // Tj operator: (text) Tj
+    const tjMatch = str.match(/\(([^\\)]*(?:\\.[^\\)]*)*)\)\s*Tj/g);
+    if (tjMatch) {
+      for (const m of tjMatch) {
+        const inner = m.replace(/^\(/, "").replace(/\)\s*Tj$/, "");
+        text.push(unescapePdfString(inner));
+      }
+    }
+    // TJ array operator: [(text) num (text)] TJ
+    const tjArrayMatch = str.match(/\[([^\]]*)\]\s*TJ/g);
+    if (tjArrayMatch) {
+      for (const m of tjArrayMatch) {
+        const arrContent = m.replace(/^\[/, "").replace(/\]\s*TJ$/, "");
+        const parts = arrContent.match(/\(([^\\)]*(?:\\.[^\\)]*)*)\)/g);
+        if (parts) {
+          text.push(parts.map((p) => unescapePdfString(p.slice(1, -1))).join(""));
         }
       }
-      // TJ array operator: [(text) num (text)] TJ
-      const tjArrayMatch = str.match(/\[([^\]]*)\]\s*TJ/g);
-      if (tjArrayMatch) {
-        for (const m of tjArrayMatch) {
-          const arrContent = m.replace(/^\[/, "").replace(/\]\s*TJ$/, "");
-          const parts = arrContent.match(/\(([^\\)]*(?:\\.[^\\)]*)*)\)/g);
-          if (parts) {
-            text.push(parts.map((p) => unescapePdfString(p.slice(1, -1))).join(""));
-          }
-        }
-      }
-    } catch { /* not a gzip stream */ }
+    }
   }
   const result = text.join(" ").replace(/\s+/g, " ").trim();
   return result.slice(0, 240_000);
@@ -6247,18 +6263,19 @@ function extractDocxText(pathValue: string) {
   if (!bodyMatch) return stripXmlText(xml).slice(0, 240_000);
   const body = bodyMatch[1];
   const result: string[] = [];
-  // Split into paragraphs and tables
-  const blocks = body.split(/(<\/w:(?:p|tbl)>)/i);
-  let buffer = "";
-  for (const block of blocks) {
-    buffer += block;
-    if (/<\/w:p>/i.test(block)) {
-      const text = extractDocxParagraph(buffer);
+  // Walk top-level blocks in document order. We can't naively split on </w:p> because
+  // tables contain <w:p> elements inside their cells — match whole <w:tbl>...</w:tbl> and
+  // top-level <w:p>...</w:p> blocks instead, scanning left to right.
+  const blockRe = /<w:tbl[\s>][\s\S]*?<\/w:tbl>|<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>|<w:p\s*\/>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = blockRe.exec(body)) !== null) {
+    const block = m[0];
+    if (/^<w:tbl[\s>]/i.test(block)) {
+      const table = extractDocxTable(block);
+      if (table) result.push(table);
+    } else {
+      const text = extractDocxParagraph(block);
       if (text) result.push(text);
-      buffer = "";
-    } else if (/<\/w:tbl>/i.test(block)) {
-      result.push(extractDocxTable(buffer));
-      buffer = "";
     }
   }
   return result.join("\n\n").slice(0, 240_000);
@@ -6281,7 +6298,7 @@ function extractDocxParagraph(xml: string): string {
     const runXml = runMatch[0];
     const isBold = /<w:b[\s>/]/i.test(runXml);
     const isItalic = /<w:i[\s>/]/i.test(runXml);
-    const tMatch = runXml.match(/<w:t[^>]*>([\s\S]*?)<\/w:t>/i);
+    const tMatch = runXml.match(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/i);
     if (tMatch) {
       let text = tMatch[1];
       if (isBold && isItalic) text = `***${text}***`;
@@ -6311,7 +6328,7 @@ function extractDocxTable(xml: string): string {
     let cellMatch: RegExpExecArray | null;
     while ((cellMatch = cellRe.exec(rowMatch[0])) !== null) {
       const cellTexts: string[] = [];
-      const tRe = /<w:t[^>]*>([\s\S]*?)<\/w:t>/gi;
+      const tRe = /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/gi;
       let tMatch: RegExpExecArray | null;
       while ((tMatch = tRe.exec(cellMatch[0])) !== null) {
         cellTexts.push(tMatch[1]);
@@ -6348,7 +6365,7 @@ function extractPptxText(pathValue: string) {
     const xml = slideEntries[i].data.toString("utf8");
     const parts: string[] = [];
     // Extract text from <a:t> tags (matches Android's extractTextRun / extractShapeText)
-    const tRe = /<a:t>([\s\S]*?)<\/a:t>/gi;
+    const tRe = /<a:t(?:\s[^>]*)?>([\s\S]*?)<\/a:t>/gi;
     let tMatch: RegExpExecArray | null;
     while ((tMatch = tRe.exec(xml)) !== null) {
       parts.push(tMatch[1]);
@@ -6359,8 +6376,10 @@ function extractPptxText(pathValue: string) {
     if (notesEntry) {
       const notesXml = notesEntry.data.toString("utf8");
       const notesParts: string[] = [];
-      while ((tMatch = tRe.exec(notesXml)) !== null) {
-        notesParts.push(tMatch[1]);
+      const notesRe = /<a:t(?:\s[^>]*)?>([\s\S]*?)<\/a:t>/gi;
+      let nMatch: RegExpExecArray | null;
+      while ((nMatch = notesRe.exec(notesXml)) !== null) {
+        notesParts.push(nMatch[1]);
       }
       notes = notesParts.join(" ").trim();
     }
