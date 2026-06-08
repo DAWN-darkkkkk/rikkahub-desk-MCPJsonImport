@@ -1,10 +1,38 @@
 import { createHash, createHmac } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { dirname, extname, join, resolve } from "node:path";
 import process from "node:process";
-import { gunzipSync, gzipSync, inflateRawSync, inflateSync } from "node:zlib";
+import { gunzipSync, gzipSync, inflateRawSync } from "node:zlib";
 import { Database } from "bun:sqlite";
+
+// mupdf-wasm.wasm 通过 `with { type: "file" }` 让 bun build --compile 把这个 9.6MB 的
+// wasm 二进制嵌进单 exe。运行时通过 readFileSync(mupdfWasmPath) 读出字节,塞进 mupdf 暴露
+// 的全局 `$libmupdf_wasm_Module.wasmBinary`,这样 mupdf 初始化时不会再尝试按文件路径查找
+// wasm —— 而在 compile 后的单 exe 里,那个文件路径根本不存在。
+//
+// 必须用相对路径(而非 "mupdf/dist/mupdf-wasm.wasm" 这种 package 名前缀): Bun 的
+// `with { type: "file" }` 走的是文件路径解析,不走 node module resolution;后者在 compile
+// 后的 exe 内会找不到 package。已在 Windows 隔离目录(无 node_modules)实测验证,dev 和
+// compile 后的 exe 都能正确加载并提取 PDF。
+import mupdfWasmPath from "./node_modules/mupdf/dist/mupdf-wasm.wasm" with { type: "file" };
+
+type MupdfModule = typeof import("mupdf");
+let mupdfModule: MupdfModule | null = null;
+let mupdfLoadingPromise: Promise<MupdfModule> | null = null;
+async function loadMupdf(): Promise<MupdfModule> {
+  if (mupdfModule) return mupdfModule;
+  // 并发的多个 PDF 上传共用同一个 init,避免重复实例化 wasm。
+  if (mupdfLoadingPromise) return mupdfLoadingPromise;
+  mupdfLoadingPromise = (async () => {
+    const wasmBinary = readFileSync(mupdfWasmPath);
+    (globalThis as Record<string, unknown>)["$libmupdf_wasm_Module"] = { wasmBinary };
+    const mod = await import("mupdf");
+    mupdfModule = mod;
+    return mod;
+  })();
+  return mupdfLoadingPromise;
+}
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -6151,6 +6179,67 @@ function readZipEntries(buffer: Buffer) {
   return entries;
 }
 
+// Extract a single named member from a (potentially huge) zip via an external `unzip` /
+// `tar.exe` invocation, so we don't decompress every entry into JS heap just to read one
+// XML file. Returns the member's raw bytes or null on failure.
+//
+// Platform support:
+//   - Windows 10+ : System32\tar.exe (BSD libarchive build) speaks zip natively. We
+//     spell out the full path to avoid PATH resolving to GNU tar shipped with Git Bash etc.,
+//     which only handles tar archives and rejects zip with "This does not look like a tar archive".
+//   - Linux: standard `unzip -p <zip> <member>` writes the decompressed bytes to stdout.
+//
+// Falls back to in-memory readZipEntries if the spawn fails (e.g. missing tool, sandboxed
+// environment), so the caller doesn't have to handle that case.
+function extractSingleZipMemberStreaming(zipPath: string, memberName: string): Buffer | null {
+  try {
+    const isWindows = process.platform === "win32";
+    const cmd = isWindows
+      ? [join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe"), "-xOf", zipPath, memberName]
+      : ["unzip", "-p", zipPath, memberName];
+    const proc = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe" });
+    if (proc.exitCode !== 0) {
+      const stderr = new TextDecoder().decode(proc.stderr ?? new Uint8Array()).slice(0, 200);
+      console.warn(`[document] ${cmd[0]} exit ${proc.exitCode}: ${stderr}`);
+      return null;
+    }
+    const out = proc.stdout;
+    if (!out || out.length === 0) return null;
+    return Buffer.from(out);
+  } catch (err) {
+    console.warn(`[document] streaming zip extract spawn failed: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+// --- Document extraction OOM protection ---------------------------------------------------
+//
+// Android's document module is fully streaming (InputStream.copyTo / ZipFile.getInputStream
+// / MuPDF page-by-page), so it doesn't need explicit size caps — single-file memory peak
+// stays low even for multi-hundred-MB files. PC end's readFileSync-and-parse approach can't
+// match that everywhere without rewriting the zip parser, so we layer in size guards: above
+// these thresholds, extraction is skipped and prompt falls back to a brief notice (see
+// extractDocumentPromptText). 240 KB extracted-text cap is the existing prompt limit.
+const MAX_PDF_EXTRACT_BYTES = 100 * 1024 * 1024;   // 100 MB — MuPDF streams pages, headroom for big books
+const MAX_DOCX_EXTRACT_BYTES = 50 * 1024 * 1024;   // 50 MB compressed (~5-10× decompressed XML)
+const MAX_PPTX_EXTRACT_BYTES = 100 * 1024 * 1024;  // 100 MB — PPTX often padded with embedded images
+const MAX_EPUB_EXTRACT_BYTES = 100 * 1024 * 1024;
+const MAX_TEXT_EXTRACT_BYTES = 10 * 1024 * 1024;   // plain text/code; above this we read only head
+const MAX_EXTRACTED_CHARS = 240_000;
+// DOCX above this size routes to the external-unzip path (`tar.exe` on Windows, `unzip` on
+// Linux) to extract only `word/document.xml`, instead of decompressing every zip entry into
+// JS heap. Threshold picked at the point where in-memory cost starts to matter.
+const DOCX_STREAMING_THRESHOLD_BYTES = 20 * 1024 * 1024;
+
+function getStoredFileSize(entry: StoredFile): number {
+  if (typeof entry.size === "number" && entry.size > 0) return entry.size;
+  try {
+    return statSync(entry.path).size;
+  } catch {
+    return 0;
+  }
+}
+
 function extractEpubText(pathValue: string) {
   const entries = readZipEntries(readFileSync(pathValue));
   const textEntries = entries
@@ -6161,106 +6250,188 @@ function extractEpubText(pathValue: string) {
     .map((entry) => stripXmlText(entry.data.toString("utf8")))
     .filter(Boolean)
     .join("\n\n");
-  return text.slice(0, 240_000);
+  return text.slice(0, MAX_EXTRACTED_CHARS);
 }
 
-function extractStoredFileText(entry: StoredFile) {
+// Synchronous text extraction for the non-PDF formats. The three on-demand call sites
+// (contentPartsForApi / Claude blocks / responses) stay sync and use this to back-fill
+// extractedText for legacy entries; PDFs there fall back to a "[Document]" prompt.
+function extractStoredFileTextSync(entry: StoredFile): string {
   const name = entry.fileName.toLowerCase();
   const mimeValue = entry.mime.toLowerCase();
+  const size = getStoredFileSize(entry);
   try {
-    if (mimeValue === "application/epub+zip" || name.endsWith(".epub")) return extractEpubText(entry.path);
-    if (mimeValue === "application/pdf" || name.endsWith(".pdf")) return extractPdfText(entry.path);
-    if (mimeValue === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || name.endsWith(".docx")) return extractDocxText(entry.path);
-    if (mimeValue === "application/vnd.openxmlformats-officedocument.presentationml.presentation" || name.endsWith(".pptx")) return extractPptxText(entry.path);
+    if (mimeValue === "application/epub+zip" || name.endsWith(".epub")) {
+      if (size > MAX_EPUB_EXTRACT_BYTES) {
+        console.warn(`[document] skipping EPUB extraction: ${entry.fileName} ${size} > ${MAX_EPUB_EXTRACT_BYTES}`);
+        return "";
+      }
+      return extractEpubText(entry.path);
+    }
+    if (mimeValue === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || name.endsWith(".docx")) {
+      if (size > MAX_DOCX_EXTRACT_BYTES) {
+        console.warn(`[document] skipping DOCX extraction: ${entry.fileName} ${size} > ${MAX_DOCX_EXTRACT_BYTES}`);
+        return "";
+      }
+      return extractDocxText(entry.path, size);
+    }
+    if (mimeValue === "application/vnd.openxmlformats-officedocument.presentationml.presentation" || name.endsWith(".pptx")) {
+      if (size > MAX_PPTX_EXTRACT_BYTES) {
+        console.warn(`[document] skipping PPTX extraction: ${entry.fileName} ${size} > ${MAX_PPTX_EXTRACT_BYTES}`);
+        return "";
+      }
+      return extractPptxText(entry.path);
+    }
     if (
       mimeValue.startsWith("text/") ||
       /\.(txt|md|markdown|csv|tsv|json|jsonl|yaml|yml|xml|html|htm|css|js|ts|tsx|jsx|py|java|kt|rs|go|c|cpp|h|hpp|cs|php|rb|sh|ps1|sql)$/i.test(name)
     ) {
-      return readFileSync(entry.path, "utf8").slice(0, 240_000);
+      if (size > MAX_TEXT_EXTRACT_BYTES) {
+        // Don't readFileSync a 200 MB log file just to slice the first 240 KB —
+        // open + read the head with a bounded buffer instead.
+        return readTextFileHead(entry.path, MAX_EXTRACTED_CHARS);
+      }
+      return readFileSync(entry.path, "utf8").slice(0, MAX_EXTRACTED_CHARS);
     }
   } catch (err) {
-    console.warn(`[document] extract failed for ${entry.fileName}:`, err);
-    return "";
+    console.warn(`[document] sync extract failed for ${entry.fileName}:`, err);
   }
   return "";
 }
 
-// --- Document parsers: aligned with Android's document module ---
-
-function inflatePdfStream(raw: Buffer): Buffer | null {
-  // PDF FlateDecode streams are zlib-wrapped (0x78 header). Try zlib first,
-  // then raw deflate as a fallback for non-standard producers.
+// Read at most `maxBytes` from the start of a text file without buffering the rest.
+// Used for very large text/log uploads where readFileSync would balloon JS heap.
+function readTextFileHead(pathValue: string, maxBytes: number): string {
+  const fd = openSync(pathValue, "r");
   try {
-    return inflateSync(raw);
-  } catch { /* not zlib-wrapped */ }
-  try {
-    return inflateRawSync(raw);
-  } catch { /* not raw deflate either */ }
-  return null;
+    const buf = Buffer.alloc(maxBytes);
+    const bytesRead = readSync(fd, buf, 0, maxBytes, 0);
+    return buf.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
 }
 
-function extractPdfText(pathValue: string) {
-  // Android uses MuPDF; for Bun we extract text from FlateDecode streams.
-  // Covers the vast majority of text-heavy PDFs.
-  const buf = readFileSync(pathValue);
-  const text: string[] = [];
-  const streamRe = /stream\r?\n/g;
-  const latin1 = buf.toString("latin1");
-  let match: RegExpExecArray | null;
-  while ((match = streamRe.exec(latin1)) !== null) {
-    const start = match.index + match[0].length;
-    const endBuf = buf.subarray(start);
-    const endIdx = endBuf.indexOf(Buffer.from("endstream"));
-    if (endIdx < 0) continue;
-    // Trim a trailing EOL that sits between the stream data and the `endstream` keyword.
-    let rawEnd = endIdx;
-    if (rawEnd >= 2 && endBuf[rawEnd - 2] === 0x0d && endBuf[rawEnd - 1] === 0x0a) rawEnd -= 2;
-    else if (rawEnd >= 1 && (endBuf[rawEnd - 1] === 0x0a || endBuf[rawEnd - 1] === 0x0d)) rawEnd -= 1;
-    const raw = endBuf.subarray(0, rawEnd);
-    const decompressed = inflatePdfStream(raw);
-    if (!decompressed) continue;
-    const str = decompressed.toString("latin1");
-    // Tj operator: (text) Tj
-    const tjMatch = str.match(/\(([^\\)]*(?:\\.[^\\)]*)*)\)\s*Tj/g);
-    if (tjMatch) {
-      for (const m of tjMatch) {
-        const inner = m.replace(/^\(/, "").replace(/\)\s*Tj$/, "");
-        text.push(unescapePdfString(inner));
-      }
+// Full async version, used only by the upload endpoint. Adds PDF handling on top of the
+// sync formats. Run once at upload time and cache into entry.extractedText.
+async function extractStoredFileText(entry: StoredFile): Promise<string> {
+  const name = entry.fileName.toLowerCase();
+  const mimeValue = entry.mime.toLowerCase();
+  if (mimeValue === "application/pdf" || name.endsWith(".pdf")) {
+    const size = getStoredFileSize(entry);
+    if (size > MAX_PDF_EXTRACT_BYTES) {
+      console.warn(`[document] skipping PDF extraction: ${entry.fileName} ${size} > ${MAX_PDF_EXTRACT_BYTES}`);
+      return "";
     }
-    // TJ array operator: [(text) num (text)] TJ
-    const tjArrayMatch = str.match(/\[([^\]]*)\]\s*TJ/g);
-    if (tjArrayMatch) {
-      for (const m of tjArrayMatch) {
-        const arrContent = m.replace(/^\[/, "").replace(/\]\s*TJ$/, "");
-        const parts = arrContent.match(/\(([^\\)]*(?:\\.[^\\)]*)*)\)/g);
-        if (parts) {
-          text.push(parts.map((p) => unescapePdfString(p.slice(1, -1))).join(""));
-        }
-      }
+    try {
+      return await extractPdfText(entry.path);
+    } catch (err) {
+      console.warn(`[document] PDF extract failed for ${entry.fileName}:`, err);
+      return "";
     }
   }
-  const result = text.join(" ").replace(/\s+/g, " ").trim();
-  return result.slice(0, 240_000);
+  return extractStoredFileTextSync(entry);
 }
 
-function unescapePdfString(s: string) {
-  return s
-    .replace(/\\n/g, "\n").replace(/\\r/g, "\r").replace(/\\t/g, "\t")
-    .replace(/\\\(/g, "(").replace(/\\\)/g, ")").replace(/\\\\/g, "\\")
-    .replace(/\\(\d{1,3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)));
+// Format a fallback prompt fragment for a document whose text content isn't available —
+// either the size cap kicked in, the format isn't extractable here (image-only PDF that
+// MuPDF couldn't OCR, exotic mime), or the entry record is gone. The model needs *some*
+// signal that the user attached a file, plus a hint about why it can't see the content,
+// so it doesn't hallucinate that it read the contents.
+function fallbackDocumentText(part: { fileName: string; url: string; entry: StoredFile | null }): string {
+  const { fileName, url, entry } = part;
+  if (!entry) {
+    return `[Document: ${fileName}] ${url} (file entry missing — user may need to re-upload)`;
+  }
+  const size = getStoredFileSize(entry);
+  const name = entry.fileName.toLowerCase();
+  const mimeValue = entry.mime.toLowerCase();
+  const sizeMb = (size / (1024 * 1024)).toFixed(1);
+
+  // Size-cap path: tell the model the file is too big to inline so it can ask the user
+  // to split / summarize rather than pretend to have read it.
+  const overCap =
+    ((mimeValue === "application/pdf" || name.endsWith(".pdf")) && size > MAX_PDF_EXTRACT_BYTES) ||
+    ((mimeValue === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || name.endsWith(".docx")) && size > MAX_DOCX_EXTRACT_BYTES) ||
+    ((mimeValue === "application/vnd.openxmlformats-officedocument.presentationml.presentation" || name.endsWith(".pptx")) && size > MAX_PPTX_EXTRACT_BYTES) ||
+    ((mimeValue === "application/epub+zip" || name.endsWith(".epub")) && size > MAX_EPUB_EXTRACT_BYTES);
+  if (overCap) {
+    return `[Document: ${fileName} — too large to inline (${sizeMb} MB). Ask the user to split it or describe the part they need.]`;
+  }
+  // Extraction was attempted but came back empty — could be a scanned PDF without OCR-able
+  // text, an unsupported binary format, or a parse failure logged at upload time.
+  return `[Document: ${fileName} — content could not be extracted; the file may be image-only or use an unsupported format.] ${url}`;
+}
+
+// --- Document parsers: aligned with Android's document module ---
+
+// PDF parser — mirrors Android's PdfParser.kt:
+//   document = PDFDocument.openDocument(file.absolutePath).asPDF()
+//   for i in 0 until pages: page.toStructuredText().asText()
+//
+// Uses MuPDF WASM (the same engine Android uses as native via JNI). Same API surface,
+// same extraction quality —— scanned pages, CID fonts, complex layouts all handled by
+// MuPDF's structured-text extractor rather than our previous regex-based approach.
+//
+// Memory: MuPDF maintains its own wasm heap; we MUST destroy() doc/page/stext explicitly
+// because JS GC can't reach into wasm memory. try/finally pairing is non-negotiable.
+async function extractPdfText(pathValue: string): Promise<string> {
+  const mupdf = await loadMupdf();
+  const buf = readFileSync(pathValue);
+  const doc = mupdf.Document.openDocument(buf, "application/pdf");
+  try {
+    const pageCount = doc.countPages();
+    const parts: string[] = [];
+    let totalLen = 0;
+    for (let i = 0; i < pageCount; i++) {
+      const page = doc.loadPage(i);
+      try {
+        const stext = page.toStructuredText();
+        try {
+          // Aligned with Android: "---Page ${i+1}:\n${stext.asText()}"
+          const pageText = stext.asText();
+          parts.push(`---Page ${i + 1}:\n${pageText}`);
+          totalLen += pageText.length;
+          // Early-stop once we've crossed the prompt cap. Saves time and memory for
+          // 1000-page PDFs where the model only sees the first chunk anyway.
+          if (totalLen > MAX_EXTRACTED_CHARS) break;
+        } finally {
+          stext.destroy?.();
+        }
+      } finally {
+        page.destroy?.();
+      }
+    }
+    return parts.join("\n").slice(0, MAX_EXTRACTED_CHARS);
+  } finally {
+    doc.destroy?.();
+  }
 }
 
 // DOCX parser — mirrors Android's DocxParser.kt:
 // Parse word/document.xml from the ZIP, extract paragraphs with heading/list/table structure.
-function extractDocxText(pathValue: string) {
-  const entries = readZipEntries(readFileSync(pathValue));
-  const docEntry = entries.find((e) => e.name === "word/document.xml");
-  if (!docEntry) return "";
-  const xml = docEntry.data.toString("utf8");
+// For files above DOCX_STREAMING_THRESHOLD_BYTES, route to extractSingleZipMemberStreaming
+// (external unzip) so we only spend RAM on the one entry we care about instead of every
+// member in the archive.
+function extractDocxText(pathValue: string, sizeBytes?: number) {
+  const size = sizeBytes ?? statSync(pathValue).size;
+  let docXmlData: Buffer | null = null;
+  if (size >= DOCX_STREAMING_THRESHOLD_BYTES) {
+    docXmlData = extractSingleZipMemberStreaming(pathValue, "word/document.xml");
+    if (!docXmlData) {
+      console.warn(`[document] streaming extract failed for ${pathValue}; falling back to in-memory`);
+    }
+  }
+  if (!docXmlData) {
+    const entries = readZipEntries(readFileSync(pathValue));
+    const docEntry = entries.find((e) => e.name === "word/document.xml");
+    if (!docEntry) return "";
+    docXmlData = docEntry.data;
+  }
+  const xml = docXmlData.toString("utf8");
   // Extract body content
   const bodyMatch = xml.match(/<w:body[\s>]?([\s\S]*?)<\/w:body>/i);
-  if (!bodyMatch) return stripXmlText(xml).slice(0, 240_000);
+  if (!bodyMatch) return stripXmlText(xml).slice(0, MAX_EXTRACTED_CHARS);
   const body = bodyMatch[1];
   const result: string[] = [];
   // Walk top-level blocks in document order. We can't naively split on </w:p> because
@@ -6278,7 +6449,7 @@ function extractDocxText(pathValue: string) {
       if (text) result.push(text);
     }
   }
-  return result.join("\n\n").slice(0, 240_000);
+  return result.join("\n\n").slice(0, MAX_EXTRACTED_CHARS);
 }
 
 function extractDocxParagraph(xml: string): string {
@@ -6389,7 +6560,7 @@ function extractPptxText(pathValue: string) {
     if (notes) slide += `\n\n### Speaker Notes\n\n${notes}`;
     slides.push(slide);
   }
-  return slides.join("\n\n").slice(0, 240_000);
+  return slides.join("\n\n").slice(0, MAX_EXTRACTED_CHARS);
 }
 
 function documentPromptText(fileName: string, content: string) {
@@ -6436,7 +6607,7 @@ function contentPartsForApi(parts: JsonValue[], targetModel?: Model) {
       // Match Android's DocumentAsPromptTransformer: extract text on demand if not cached.
       let extractedText = String(entry?.extractedText ?? "").trim();
       if (!extractedText && entry) {
-        const fresh = extractStoredFileText(entry);
+        const fresh = extractStoredFileTextSync(entry);
         if (fresh) {
           extractedText = fresh;
           // Cache for future requests (matches Android reading file on each send,
@@ -6450,7 +6621,7 @@ function contentPartsForApi(parts: JsonValue[], targetModel?: Model) {
         type: "text",
         text: extractedText
           ? documentPromptText(fileName, extractedText)
-          : `[Document: ${fileName}] ${url}`,
+          : fallbackDocumentText({ fileName, url, entry: entry ?? null }),
       });
     } else if (part.type === "audio" || part.type === "video") {
       const url = String(part.url ?? "");
@@ -6531,7 +6702,7 @@ function claudeBlocksFromUiParts(parts: JsonValue[]) {
       const entry = fileEntryFromApiUrl(url);
       let extractedText = String(entry?.extractedText ?? "").trim();
       if (!extractedText && entry) {
-        const fresh = extractStoredFileText(entry);
+        const fresh = extractStoredFileTextSync(entry);
         if (fresh) {
           extractedText = fresh;
           entry.extractedText = fresh;
@@ -6543,7 +6714,7 @@ function claudeBlocksFromUiParts(parts: JsonValue[]) {
         type: "text",
         text: extractedText
           ? documentPromptText(fileName, extractedText)
-          : `[Document: ${fileName}] ${url}`,
+          : fallbackDocumentText({ fileName, url, entry: entry ?? null }),
       });
     }
   }
@@ -7083,7 +7254,7 @@ function responseApiDocumentPart(part: Record<string, JsonValue>) {
   const entry = fileEntryFromApiUrl(url);
   let extractedText = String(entry?.extractedText ?? "").trim();
   if (!extractedText && entry) {
-    const fresh = extractStoredFileText(entry);
+    const fresh = extractStoredFileTextSync(entry);
     if (fresh) {
       extractedText = fresh;
       entry.extractedText = fresh;
@@ -7092,7 +7263,7 @@ function responseApiDocumentPart(part: Record<string, JsonValue>) {
     }
   }
   return responseApiTextPart(
-    extractedText ? documentPromptText(fileName, extractedText) : `[Document: ${fileName}] ${url}`,
+    extractedText ? documentPromptText(fileName, extractedText) : fallbackDocumentText({ fileName, url, entry: entry ?? null }),
     "user",
   );
 }
@@ -12487,11 +12658,13 @@ async function routeApi(request: Request, url: URL) {
         const target = join(filesDir, `${fileId}${extname(file.name)}`);
         await Bun.write(target, file);
         const entry: StoredFile = { id: fileId, path: target, fileName: file.name, mime: file.type || "application/octet-stream", size: file.size };
-        const extractedText = extractStoredFileText(entry);
+        const t0 = Date.now();
+        const extractedText = await extractStoredFileText(entry);
         if (extractedText) {
           entry.extractedText = extractedText;
           entry.extractedAt = Date.now();
         }
+        console.log(`[upload] ${entry.fileName} (${(file.size / 1024).toFixed(1)} KB) extracted ${extractedText.length} chars in ${Date.now() - t0}ms`);
         state.files.push(entry);
         return {
           id: fileId,
