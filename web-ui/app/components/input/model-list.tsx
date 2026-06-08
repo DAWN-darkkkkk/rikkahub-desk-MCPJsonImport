@@ -39,10 +39,6 @@ interface ModelSection {
 
 const FAVORITE_SECTION_ID = "__favorites__";
 
-function isProviderTested(provider: Record<string, unknown>) {
-  return provider.testPassed === true || provider.name === "RikkaHub";
-}
-
 function normalizeKeyword(value: string) {
   return value.trim().toLowerCase();
 }
@@ -191,7 +187,7 @@ export function ModelList({ disabled = false, className, onChanged }: ModelListP
     }
 
     return settings.providers
-      .filter((provider) => provider.enabled && isProviderTested(provider as unknown as Record<string, unknown>))
+      .filter((provider) => provider.enabled)
       .flatMap((provider) => provider.models)
       .filter((model) => model.type === "CHAT");
   }, [settings]);
@@ -204,7 +200,7 @@ export function ModelList({ disabled = false, className, onChanged }: ModelListP
     const keyword = normalizeKeyword(searchKeywords);
 
     return settings.providers
-      .filter((provider) => provider.enabled && isProviderTested(provider as unknown as Record<string, unknown>))
+      .filter((provider) => provider.enabled)
       .map((provider) => {
         const models = provider.models.filter((model) => {
           if (model.type !== "CHAT") {
@@ -269,7 +265,6 @@ export function ModelList({ disabled = false, className, onChanged }: ModelListP
     if (!open || !settings) return;
     const providersToQuery = settings.providers.filter((provider) =>
       provider.enabled &&
-      isProviderTested(provider as unknown as Record<string, unknown>) &&
       isBalanceEnabled(provider as unknown as Record<string, unknown>) &&
       !balances[provider.id]
     );

@@ -305,10 +305,6 @@ function renderMessageTemplatePreview(template: string, message: string, role: s
   return template.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (match, key) => values[key] ?? match);
 }
 
-function isProviderTested(provider: ProviderProfile) {
-  return provider.testPassed === true || provider.name === "RikkaHub";
-}
-
 function PasswordInput({ value, onChange, placeholder }: { value: string; onChange: (value: string) => void; placeholder?: string }) {
   const [visible, setVisible] = React.useState(false);
   return (
@@ -1105,6 +1101,38 @@ function ProvidersSection({ settings, onSettings }: { settings: Settings; onSett
       setFetchingModels(false);
     }
   };
+  const handleToggleEnabled = async (enabled: boolean) => {
+    // 关闭：直接关
+    if (!enabled) {
+      patchDraft({ enabled: false });
+      return;
+    }
+    // 已有已启用模型（历史 / 用户此前已勾选）：直接启用，不自动拉取
+    if ((draft.models ?? []).length > 0) {
+      patchDraft({ enabled: true });
+      return;
+    }
+    // 空列表：先持久化当前配置（让服务端拿到最新 baseUrl / apiKey），再拉取上游模型
+    setFetchingModels(true);
+    try {
+      await api.post("settings/provider", draft);
+      const result = await api.post<{ endpoint: string; models: ProviderModel[] }>("settings/provider/models", { providerId: draft.id });
+      if (!result.models.length) {
+        toast.error("未获取到任何模型，无法启用，请检查供应商配置");
+        return;
+      }
+      // 与单个勾选时一致地分类 CHAT / IMAGE / EMBEDDING
+      const models = result.models.map(applyAutoModelType);
+      setFetchedModels(result.models);
+      patchDraft({ enabled: true, models });
+      toast.success(`已获取 ${models.length} 个模型并启用`);
+    } catch (error) {
+      // 不 patch enabled —— 保持关闭
+      toast.error(error instanceof Error ? error.message : "获取模型失败，未能启用");
+    } finally {
+      setFetchingModels(false);
+    }
+  };
   const checkBalance = async () => {
     setCheckingBalance(true);
     setBalanceResult("正在查询余额...");
@@ -1282,7 +1310,7 @@ function ProvidersSection({ settings, onSettings }: { settings: Settings; onSett
             </div>
             <div className="flex items-center gap-2">
               <span className="text-sm text-muted-foreground">启用</span>
-              <Switch checked={draft.enabled} onCheckedChange={(enabled) => patchDraft({ enabled })} />
+              <Switch checked={draft.enabled} disabled={fetchingModels} onCheckedChange={(enabled) => void handleToggleEnabled(enabled)} />
             </div>
           </div>
           <div className="grid gap-4 md:grid-cols-2">
@@ -2513,7 +2541,7 @@ function SearchSection({ settings, onSettings }: { settings: Settings; onSetting
 
 function DefaultModelsSection({ settings, onSettings }: { settings: Settings; onSettings: (settings: Settings) => void }) {
   const allModels = settings.providers.flatMap((provider) =>
-    isProviderTested(provider) ? (provider.models ?? []).map((model) => ({ ...model, providerName: provider.name })) : [],
+    provider.enabled ? (provider.models ?? []).map((model) => ({ ...model, providerName: provider.name })) : [],
   );
   // Image generation models live on providers that don't necessarily pass the chat test
   // (image-only providers like findcg gpt-image-2). Source them directly from enabled providers
