@@ -7836,7 +7836,7 @@ function reasoningPayloadForProvider(providerItem: Provider, modelItem: Model, l
     return siliconflowThinkingModels.has(modelItem.modelId) ? { enable_thinking: enabled } : {};
   }
   if (["ark.cn-beijing.volces.com", "open.bigmodel.cn", "api.moonshot.cn", "api.deepseek.com"].includes(host)) {
-    return { thinking: { type: enabled ? "enabled" : "disabled" }, ...(host === "api.deepseek.com" && enabled && ["low", "medium", "high"].includes(normalized) ? { reasoning_effort: normalized } : {}) };
+    return { thinking: { type: enabled ? "enabled" : "disabled" }, ...(host === "api.deepseek.com" && enabled && normalized !== "auto" ? { reasoning_effort: normalized } : {}) };
   }
   if (host === "integrate.api.nvidia.com") {
     if (normalized === "auto") return {};
@@ -7845,8 +7845,8 @@ function reasoningPayloadForProvider(providerItem: Provider, modelItem: Model, l
       if (normalized === "off") return { reasoning_effort: "none" };
       return { reasoning_effort: "high" };
     }
+    // Non-deepseek NVIDIA: maps "none" → "low", passes everything else through (Android: level.effort)
     if (normalized === "off") return { reasoning_effort: "low" };
-    if (normalized === "xhigh") return { reasoning_effort: "high" };
     return { reasoning_effort: normalized };
   }
   if (host === "chat.intern-ai.org.cn") return { thinking_mode: enabled };
