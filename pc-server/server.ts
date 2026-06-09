@@ -7798,8 +7798,7 @@ function reasoningPayloadForProvider(providerItem: Provider, modelItem: Model, l
   if (host === "openrouter.ai") {
     if (normalized === "off") return { reasoning: { effort: "none" } };
     if (normalized === "auto") return { reasoning: { enabled: true } };
-    if (["low", "medium", "high"].includes(normalized)) return { reasoning: { effort: normalized } };
-    return { reasoning: { enabled: true } };
+    return { reasoning: { effort: normalized } };
   }
   if (host === "dashscope.aliyuncs.com") {
     const result: Record<string, any> = { enable_thinking: enabled };
@@ -7851,11 +7850,10 @@ function reasoningPayloadForProvider(providerItem: Provider, modelItem: Model, l
     return { reasoning_effort: normalized };
   }
   if (host === "chat.intern-ai.org.cn") return { thinking_mode: enabled };
-  // Android default else branch: OpenAI 官方只接受 low/medium/high；其他兼容网关一般忽略未知字段。
-  // 因此 OFF 映射成 "low"（最低预算），AUTO 不带任何字段。
+  // Android default else branch: passes effort through as-is (including "xhigh").
+  // OFF maps to "low" (lowest budget), AUTO sends no field.
   if (normalized === "auto") return {};
   if (normalized === "off") return { reasoning_effort: "low" };
-  if (!["low", "medium", "high"].includes(normalized)) return {};
   return { reasoning_effort: normalized };
 }
 
