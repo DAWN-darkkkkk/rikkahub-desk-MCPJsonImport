@@ -437,7 +437,7 @@ const statePath = join(dataDir, "state.json");
 // MUST be kept in sync with web-ui/src-tauri/tauri.conf.json's `version` field. The update
 // checker compares this against the latest GitHub release tag and the version is also shown
 // verbatim in the About page. If you bump tauri.conf.json's version, bump this too.
-const APP_VERSION = "1.0.8";
+const APP_VERSION = "1.0.9";
 
 type GithubRelease = {
   tag_name?: string;
@@ -1446,7 +1446,6 @@ function proxyStatusPayload() {
 
 let state = loadState();
 state.launchCount += 1;
-saveState();
 
 applyEffectiveProxy();
 setInterval(applyEffectiveProxy, SYSTEM_PROXY_REFRESH_MS).unref();
@@ -1537,6 +1536,10 @@ async function flushSaveState(): Promise<void> {
     try { await activeSaveStatePromise; } catch { /* already logged */ }
   }
 }
+
+// 顶层启动写盘：必须放在 activeSaveStatePromise / coalescedSaveRequested 这些 let
+// 声明之后调用，否则会撞 TDZ 触发模块加载时的 ReferenceError，导致服务直接起不来。
+saveState();
 
 function addLog(input: Omit<RequestLog, "id" | "at">) {
   const requestPreview = input.requestPreview ?? input.requestBody;
@@ -7203,6 +7206,191 @@ function claudeToolsFromOpenAiTools(tools: any[], providerItem: Provider) {
     .filter(Boolean);
 }
 
+// 递归剔除 Google Gemini 不支持的 JSON Schema 关键字。镜像安卓
+// me/rerere/ai/util/Request.kt 的 removeElements + GoogleProvider 中对
+// functionDeclarations.parameters 的清理（const/format/additionalProperties/enum 等）。
+const GOOGLE_SCHEMA_STRIP_KEYS = new Set([
+  "const",
+  "exclusiveMaximum",
+  "exclusiveMinimum",
+  "format",
+  "additionalProperties",
+  "enum",
+]);
+
+function googleStripSchemaKeys(value: JsonValue): JsonValue {
+  if (Array.isArray(value)) return value.map((item) => googleStripSchemaKeys(item));
+  if (isRecord(value)) {
+    const out: Record<string, JsonValue> = {};
+    for (const [key, val] of Object.entries(value)) {
+      if (GOOGLE_SCHEMA_STRIP_KEYS.has(key)) continue;
+      out[key] = googleStripSchemaKeys(val as JsonValue);
+    }
+    return out;
+  }
+  return value;
+}
+
+// 把 OpenAI 格式的 function tools 转成 Gemini functionDeclarations，镜像安卓
+// GoogleProvider.buildCompletionRequestBody:418-445。
+function googleFunctionDeclarations(tools: any[]) {
+  return tools
+    .map((tool) => {
+      const fn = tool?.function ?? {};
+      const name = String(fn.name ?? "");
+      if (!name) return null;
+      return {
+        name,
+        description: String(fn.description ?? ""),
+        parameters: googleStripSchemaKeys(isRecord(fn.parameters) ? fn.parameters : { type: "object", properties: {} }),
+      };
+    })
+    .filter(Boolean);
+}
+
+// 把单条 OpenAI 格式 content 转成 Gemini parts（text / inlineData）。
+function googlePartsFromApiContent(content: any): Record<string, JsonValue>[] {
+  if (typeof content === "string") {
+    return content ? [{ text: content }] : [];
+  }
+  if (!Array.isArray(content)) {
+    const text = String(content ?? "");
+    return text ? [{ text }] : [];
+  }
+  const parts: Record<string, JsonValue>[] = [];
+  for (const item of content) {
+    if (!isRecord(item)) continue;
+    if (item.type === "text") {
+      const text = String(item.text ?? "");
+      if (text) parts.push({ text });
+    } else if (item.type === "image_url") {
+      const dataUrl = String((item.image_url as any)?.url ?? "");
+      const parsed = parseDataUrl(dataUrl);
+      if (parsed) {
+        parts.push({ inlineData: { mimeType: parsed.mime, data: parsed.data } });
+      } else if (dataUrl) {
+        parts.push({ text: `[Image: ${dataUrl}]` });
+      }
+    }
+  }
+  return parts;
+}
+
+// 把 OpenAI 格式的 messagesForApi 转成 Gemini contents。镜像安卓
+// GoogleProvider.buildContents/addModelMessage/addUserMessage：
+// - system 消息单独抽出，不进 contents
+// - assistant 的 tool_calls → functionCall part
+// - role:"tool" 结果 → functionResponse part（Gemini 中以 user role 发送）
+function googleContentsFromApiMessages(messages: ApiMessage[]): Record<string, JsonValue>[] {
+  const contents: Record<string, JsonValue>[] = [];
+  for (const item of messages) {
+    if (item.role === "system") continue;
+    if (item.role === "tool") {
+      contents.push({
+        role: "user",
+        parts: [{
+          functionResponse: {
+            name: String((item as any).name ?? ""),
+            response: { result: apiContentText(item.content) },
+          },
+        }],
+      });
+      continue;
+    }
+    if (item.role === "assistant") {
+      const parts = googlePartsFromApiContent(item.content);
+      const toolCalls = Array.isArray(item.tool_calls) ? item.tool_calls : [];
+      for (const call of toolCalls) {
+        const fn = (call as any)?.function ?? {};
+        const name = String(fn.name ?? "");
+        if (!name) continue;
+        parts.push({ functionCall: { name, args: parseToolInput(fn.arguments) } });
+      }
+      if (parts.length) contents.push({ role: "model", parts });
+      continue;
+    }
+    const parts = googlePartsFromApiContent(item.content);
+    if (parts.length) contents.push({ role: "user", parts });
+  }
+  return contents;
+}
+
+// 构建 Gemini 的 generationConfig（含 thinkingConfig）。镜像安卓
+// GoogleProvider.buildCompletionRequestBody:366-409。
+function googleGenerationConfig(modelItem: Model, assistant: Assistant) {
+  const config: Record<string, JsonValue> = {};
+  if (assistant.temperature != null) config.temperature = assistant.temperature;
+  if (assistant.topP != null) config.topP = assistant.topP;
+  if (assistant.maxTokens != null) config.maxOutputTokens = assistant.maxTokens;
+  if (supportsOutputModality(modelItem, "IMAGE")) {
+    config.responseModalities = ["TEXT", "IMAGE"];
+  }
+  if (supportsAbility(modelItem, "REASONING")) {
+    const normalized = reasoningLevelNormalized(assistant.reasoningLevel);
+    const isGemini3 = /\bgemini[-._]?3\b/i.test(modelItem.modelId);
+    const isGeminiPro = /2[.-]5.*pro/i.test(modelItem.modelId);
+    const thinkingConfig: Record<string, JsonValue> = { includeThoughts: true };
+    if (normalized === "off") {
+      if (isGemini3) {
+        thinkingConfig.thinkingLevel = "minimal";
+      } else if (!isGeminiPro) {
+        thinkingConfig.thinkingBudget = 0;
+        thinkingConfig.includeThoughts = false;
+      }
+    } else if (normalized !== "auto") {
+      if (isGemini3) {
+        thinkingConfig.thinkingLevel = normalized === "low" ? "low" : normalized === "medium" ? "medium" : "high";
+      } else {
+        thinkingConfig.thinkingBudget = budgetTokensFor(normalized);
+      }
+    }
+    config.thinkingConfig = thinkingConfig;
+  }
+  return config;
+}
+
+const GOOGLE_SAFETY_SETTINGS = [
+  { category: "HARM_CATEGORY_HARASSMENT", threshold: "OFF" },
+  { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "OFF" },
+  { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "OFF" },
+  { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "OFF" },
+  { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "OFF" },
+];
+
+// 构建 Gemini 的完整请求体。镜像安卓 GoogleProvider.buildCompletionRequestBody。
+function buildGoogleRequestBody(messagesForApi: ApiMessage[], modelItem: Model, assistant: Assistant) {
+  const systemContent = messagesForApi.find((item) => item.role === "system")?.content;
+  const hasImageOutput = supportsOutputModality(modelItem, "IMAGE");
+  const functionTools = supportsAbility(modelItem, "TOOL")
+    ? [...openAiSearchTools(), ...openAiLocalTools(assistant), ...openAiSkillTools(assistant), ...openAiMcpTools(assistant)]
+    : [];
+  const functionDeclarations = googleFunctionDeclarations(functionTools);
+  // 内置工具（googleSearch/urlContext）目前与函数工具互斥，优先内置工具，镜像安卓
+  // buildCompletionRequestBody:446-468（model.tools 覆盖 functionDeclarations）。
+  const builtInTools: Record<string, JsonValue>[] = [];
+  if (hasBuiltInTool(modelItem, "search")) builtInTools.push({ googleSearch: {} });
+  if (hasBuiltInTool(modelItem, "url_context") || hasBuiltInTool(modelItem, "urlContext")) {
+    builtInTools.push({ urlContext: {} });
+  }
+  const tools = builtInTools.length
+    ? builtInTools
+    : functionDeclarations.length
+      ? [{ functionDeclarations }]
+      : undefined;
+  const body: Record<string, JsonValue> = {
+    // system 在图片输出模型上不发送，对齐安卓 buildCompletionRequestBody:352。
+    ...(systemContent && !hasImageOutput
+      ? { systemInstruction: { parts: [{ text: apiContentText(systemContent) }] } }
+      : {}),
+    generationConfig: googleGenerationConfig(modelItem, assistant),
+    contents: googleContentsFromApiMessages(messagesForApi),
+    ...(tools ? { tools } : {}),
+    safetySettings: GOOGLE_SAFETY_SETTINGS,
+  };
+  return body;
+}
+
+
 // 按工具边界把 ASSISTANT 消息的 parts 分组。镜像安卓
 // ai/src/main/java/me/rerere/ai/provider/providers/ProviderMessageUtils.kt 的
 // groupPartsByToolBoundary：连续的"已执行 tool" parts 合为一组，与它们之前的
@@ -7471,6 +7659,24 @@ function reasoningLevelNormalized(level: string | null | undefined) {
 function budgetTokensFor(level: string): number {
   const map: Record<string, number> = { off: 0, low: 1_000, medium: 2_000, high: 8_000, xhigh: 16_000 };
   return map[level] ?? 8_000;
+}
+
+// DeepSeek 系列模型的特色是展示原始思维链。当 DeepSeek 走 Anthropic(Claude) 格式时，
+// 用 display:"raw" 而非 "summarized"，让用户看到完整的思维链而非摘要。其它模型保持
+// "summarized"。匹配 deepseek-r1 / deepseek-reasoner / deepseek-v4 等当前与未来命名。
+function isDeepSeekModel(modelItem: Model) {
+  return /deepseek/i.test(String(modelItem.modelId ?? ""));
+}
+
+// 构建 Claude(Anthropic) 的 thinking + output_config 负载，主路径与辅助路径共用，
+// 对齐安卓 ClaudeProvider.buildMessageRequest:308-331。
+function claudeThinkingPayload(modelItem: Model, level: string | null | undefined): Record<string, JsonValue> {
+  if (!supportsAbility(modelItem, "REASONING")) return {};
+  const normalized = reasoningLevelNormalized(level);
+  if (normalized === "off") return { thinking: { type: "disabled" } };
+  const display = isDeepSeekModel(modelItem) ? "raw" : "summarized";
+  if (normalized === "auto") return { thinking: { type: "adaptive", display } };
+  return { thinking: { type: "adaptive", display }, output_config: { effort: normalized } };
 }
 
 function supportsAbility(modelItem: Model, ability: string) {
@@ -8640,45 +8846,18 @@ async function callProvider(
   let body: Record<string, any>;
 
   if (providerItem.type === "google") {
-    const googleTools = hasBuiltInTool(picked.model, "search")
-      ? [{ googleSearch: {} }]
-      : undefined;
-    const googleUrl = `${providerItem.baseUrl.replace(/\/+$/, "")}/models/${selectedModel}:generateContent?key=${encodeURIComponent(providerItem.apiKey)}`;
-    const systemContent = messagesForApi.find((item) => item.role === "system")?.content;
-    const normalizedReasoning = reasoningLevelNormalized(assistant.reasoningLevel);
-    const isGemini3 = /\bgemini[-._]?3\b/i.test(picked.model.modelId);
-    const isGeminiPro = /2[.-]5.*pro/i.test(picked.model.modelId);
-    // Android uses top-level thinkingConfig, not generationConfig.
-    const hasReasoning = supportsAbility(picked.model, "REASONING");
-    let thinkingConfig: Record<string, any> | undefined;
-    if (hasReasoning) {
-      thinkingConfig = { includeThoughts: true };
-      if (normalizedReasoning === "off") {
-        if (isGemini3) {
-          thinkingConfig.thinkingLevel = "minimal";
-        } else if (!isGeminiPro) {
-          thinkingConfig.thinkingBudget = 0;
-          thinkingConfig.includeThoughts = false;
-        }
-      } else if (normalizedReasoning !== "auto") {
-        if (isGemini3) {
-          thinkingConfig.thinkingLevel = normalizedReasoning === "xhigh" ? "high" : normalizedReasoning;
-        } else {
-          thinkingConfig.thinkingBudget = budgetTokensFor(normalizedReasoning);
-        }
-      }
+    // Gemini 鉴权：API key 走 query param（与安卓非 Vertex 路径的 x-goog-api-key 等价，
+    // 这里沿用既有 query 形式以兼容各类兼容网关）。
+    const apiKey = providerItem.apiKey;
+    const baseUrl = providerItem.baseUrl;
+    body = buildGoogleRequestBody(messagesForApi, picked.model, assistant);
+    const finalBody = applyCustomBody(body, assistant, picked.model);
+    // 有 hooks（来自会话）时走 SSE 流式 + 工具循环；辅助调用无 hooks 时退回非流式。
+    if (hooks?.message != null) {
+      return streamGoogleChatWithTools(baseUrl, headers, apiKey, selectedModel, finalBody, providerItem, assistant, signal, hooks);
     }
-    body = {
-      contents: messagesForApi
-        .filter((item) => item.role !== "system")
-        .map((item) => ({ role: item.role === "assistant" ? "model" : "user", parts: [{ text: item.content }] })),
-      systemInstruction: systemContent
-        ? { parts: [{ text: systemContent }] }
-        : undefined,
-      ...(thinkingConfig ? { thinkingConfig } : {}),
-      tools: googleTools,
-    };
-    return fetchText(googleUrl, headers, applyCustomBody(body, assistant, picked.model), providerItem, (raw) => raw.candidates?.[0]?.content?.parts?.[0]?.text, signal);
+    const googleUrl = `${baseUrl.replace(/\/+$/, "")}/models/${selectedModel}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    return fetchText(googleUrl, headers, finalBody, providerItem, (raw) => raw.candidates?.[0]?.content?.parts?.map((part: any) => part?.text ?? "").join("") ?? "", signal);
   }
 
   if (providerItem.type === "claude") {
@@ -8698,7 +8877,7 @@ async function callProvider(
     const canStream = hooks?.message != null;
     body = {
       model: selectedModel,
-      max_tokens: assistant.maxTokens ?? 4096,
+      max_tokens: assistant.maxTokens ?? 64_000,
       stream: canStream,
       system: claudeSystemContent(systemContent, providerItem),
       messages: claudeMessagesFromApiMessages(messages, providerItem),
@@ -8709,16 +8888,8 @@ async function callProvider(
         : {}),
       ...(assistant.temperature != null && !reasoningActive ? { temperature: assistant.temperature } : {}),
       ...(assistant.topP != null ? { top_p: assistant.topP } : {}),
-      ...(supportsAbility(picked.model, "REASONING")
-        ? {
-            thinking: reasoningActive
-              ? { type: "adaptive", display: "summarized" }
-              : { type: "disabled" },
-            ...(reasoningActive && normalizedReasoning !== "auto"
-              ? { output_config: { effort: normalizedReasoning } }
-              : {}),
-          }
-        : {}),
+      // thinking + output_config：DeepSeek 走 Claude 格式时用 display:"raw" 展示原始思维链
+      ...claudeThinkingPayload(picked.model, assistant.reasoningLevel),
       ...(claudeTools.length ? { tools: claudeTools } : {}),
     };
     if (canStream) {
@@ -8737,10 +8908,11 @@ async function callProvider(
     body = {
       model: selectedModel,
       stream: false,
-      store: !hasBuiltInTool(picked.model, "image_generation"),
+      store: false,
       ...(systemContent ? { instructions: systemContent } : {}),
       input: conversationResponseApiInput(conversation, assistant),
       ...(isModelAllowTemperature(picked.model) ? { temperature: assistant.temperature ?? undefined } : {}),
+      ...(isModelAllowTemperature(picked.model) ? { top_p: assistant.topP ?? undefined } : {}),
       ...(assistant.maxTokens != null ? { max_output_tokens: assistant.maxTokens } : {}),
       ...(reasoning ? { reasoning } : {}),
       ...(include ? { include } : {}),
@@ -8856,10 +9028,11 @@ async function callProviderStreaming(conversation: Conversation, assistantMessag
     const body = applyCustomBody({
       model: selectedModel,
       stream: true,
-      store: !hasBuiltInTool(picked.model, "image_generation"),
+      store: false,
       ...(systemContent ? { instructions: systemContent } : {}),
       input: conversationResponseApiInput(conversation, assistant),
       ...(isModelAllowTemperature(picked.model) ? { temperature: assistant.temperature ?? undefined } : {}),
+      ...(isModelAllowTemperature(picked.model) ? { top_p: assistant.topP ?? undefined } : {}),
       ...(assistant.maxTokens != null ? { max_output_tokens: assistant.maxTokens } : {}),
       ...(reasoning ? { reasoning } : {}),
       ...(include ? { include } : {}),
@@ -9431,6 +9604,257 @@ async function fetchClaudeTextWithTools(
   }
 
   throw new Error("Too many consecutive Claude tool calls without final assistant content");
+}
+
+// ===== Google / Gemini 流式 + 工具循环 =====
+// 镜像安卓 GoogleProvider.streamText：通过 streamGenerateContent?alt=sse 拿到 SSE，
+// 逐 chunk 解析 candidates[].content.parts，区分 thought(reasoning) / text / inlineData(图片)
+// / functionCall，并把增量推给实时 UI。返回该轮的聚合结果供工具循环驱动。
+type GoogleStreamRoundResult = {
+  textOut: string;
+  thinkingOut: string;
+  functionCalls: Array<{ id: string; name: string; args: Record<string, JsonValue>; thoughtSignature?: string }>;
+  modelParts: Record<string, JsonValue>[];
+  usage: Message["usage"] | undefined;
+  raw: string;
+};
+
+function googleUsageFromMeta(meta: any): Message["usage"] | undefined {
+  if (!meta || typeof meta !== "object") return undefined;
+  const promptTokens = Number(meta.promptTokenCount ?? 0);
+  const thoughtTokens = Number(meta.thoughtsTokenCount ?? 0);
+  const candidatesTokens = Number(meta.candidatesTokenCount ?? 0);
+  return {
+    promptTokens,
+    completionTokens: candidatesTokens + thoughtTokens,
+    totalTokens: Number(meta.totalTokenCount ?? 0),
+    cachedTokens: Number(meta.cachedContentTokenCount ?? 0),
+  };
+}
+
+async function readGoogleStreamingRound(
+  response: Response,
+  hooks: StreamHooks,
+  assistant: Assistant,
+  signal?: AbortSignal,
+): Promise<GoogleStreamRoundResult> {
+  const reader = response.body?.getReader();
+  const result: GoogleStreamRoundResult = {
+    textOut: "",
+    thinkingOut: "",
+    functionCalls: [],
+    modelParts: [],
+    usage: undefined,
+    raw: "",
+  };
+  if (!reader) return result;
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  const handleChunk = (raw: any) => {
+    if (!raw || typeof raw !== "object") return;
+    const blockReason = raw.promptFeedback?.blockReason;
+    if (blockReason) throw new Error(`Gemini blocked: ${blockReason}`);
+    const meta = raw.usageMetadata;
+    if (meta) result.usage = googleUsageFromMeta(meta) ?? result.usage;
+    const candidate = raw.candidates?.[0];
+    const parts = candidate?.content?.parts;
+    if (!Array.isArray(parts)) return;
+    for (const part of parts) {
+      if (!isRecord(part)) continue;
+      if (typeof part.text === "string" && part.text) {
+        if (part.thought === true) {
+          result.thinkingOut += part.text;
+          appendReasoningDelta(hooks, part.text);
+        } else {
+          result.textOut += part.text;
+          result.modelParts.push({ text: part.text });
+          addStreamText(hooks, part.text);
+        }
+      } else if (isRecord(part.inlineData)) {
+        const mime = String((part.inlineData as any).mimeType ?? "image/png");
+        const data = String((part.inlineData as any).data ?? "");
+        if (part.thought === true) {
+          // 思考过程中的草稿图直接忽略，对齐安卓 parseMessagePart。
+          continue;
+        }
+        if (data && mime.startsWith("image/")) {
+          addStreamImage(hooks, `data:${mime};base64,${data}`);
+        }
+      } else if (isRecord(part.functionCall)) {
+        const fc = part.functionCall as any;
+        const name = String(fc.name ?? "");
+        if (!name) continue;
+        const args = isRecord(fc.args) ? (fc.args as Record<string, JsonValue>) : {};
+        const thoughtSignature = part.thoughtSignature != null ? String(part.thoughtSignature) : undefined;
+        const callId = id();
+        result.functionCalls.push({ id: callId, name, args, thoughtSignature });
+        result.modelParts.push({
+          functionCall: { name, args },
+          ...(thoughtSignature ? { thoughtSignature } : {}),
+        });
+        if (hooks.message) {
+          finishReasoningParts(hooks.message);
+          replaceLoadingReasoningWithTool(hooks.message, {
+            type: "tool",
+            toolCallId: callId,
+            toolName: name,
+            input: JSON.stringify(args),
+            output: [],
+            approvalState: initialApprovalState(name, assistant),
+          });
+          touchStream(hooks);
+        }
+      }
+    }
+  };
+
+  for (;;) {
+    if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    result.raw += chunk;
+    buffer += chunk;
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      for (const payload of parseSseChunks(frame)) {
+        if (!payload || payload === "[DONE]") continue;
+        try {
+          handleChunk(JSON.parse(payload));
+        } catch (err) {
+          if (err instanceof Error && (err.message.startsWith("Gemini blocked") || err.message.startsWith("Gemini "))) throw err;
+          // 忽略 Gemini 偶发的非 JSON 行
+        }
+      }
+    }
+  }
+  if (buffer.trim()) {
+    for (const payload of parseSseChunks(buffer)) {
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        handleChunk(JSON.parse(payload));
+      } catch {
+        // ignore trailing fragment
+      }
+    }
+  }
+  return result;
+}
+
+// 驱动 Gemini 的流式工具循环。镜像安卓 GenerationHandler 的 step 循环 + GoogleProvider.streamText：
+// 每轮拿到 functionCall 就执行工具，把 functionResponse 作为 user 消息追加，再发起下一轮，
+// 直到模型不再请求工具。无 hooks（辅助调用）时不会走到这里。
+async function streamGoogleChatWithTools(
+  baseUrl: string,
+  headers: Record<string, string>,
+  apiKey: string,
+  modelId: string,
+  body: Record<string, any>,
+  providerItem: Provider,
+  assistant: Assistant,
+  signal: AbortSignal | undefined,
+  hooks: StreamHooks,
+) {
+  const streamUrl = `${baseUrl.replace(/\/+$/, "")}/models/${modelId}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
+  let contents = Array.isArray(body.contents) ? [...body.contents] : [];
+  let currentBody = { ...body, contents };
+  let allContent = "";
+  for (let round = 0; round < MAX_TOOL_STEPS; round += 1) {
+    if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
+    const roundStarted = Date.now();
+    const response = await fetch(streamUrl, {
+      method: "POST",
+      headers: { ...headers, Accept: "text/event-stream" },
+      body: JSON.stringify(currentBody),
+      signal,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      addLog({
+        providerId: providerItem.id,
+        providerName: providerItem.name,
+        url: streamUrl,
+        ok: false,
+        status: response.status,
+        kind: round === 0 ? "provider:chat:stream" : "provider:chat:tool_result:stream",
+        durationMs: Date.now() - roundStarted,
+        requestPreview: jsonPreview(currentBody),
+        responsePreview: textPreview(text),
+        error: textPreview(text),
+      });
+      throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
+    }
+    const round_ = await readGoogleStreamingRound(response, hooks, assistant, signal);
+    if (hooks.message && round_.usage) hooks.message.usage = round_.usage;
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url: streamUrl,
+      ok: true,
+      status: response.status,
+      kind: round === 0 ? "provider:chat:stream" : "provider:chat:tool_result:stream",
+      durationMs: Date.now() - roundStarted,
+      requestPreview: jsonPreview(currentBody),
+      responsePreview: textPreview(round_.raw),
+    });
+    if (round_.textOut) {
+      allContent += `${allContent ? "\n" : ""}${round_.textOut}`;
+    }
+    if (round_.functionCalls.length === 0) {
+      finishReasoningParts(hooks.message!);
+      return allContent.trim() || "(empty response)";
+    }
+    // 任何工具需要审批就暂停本轮，等用户决定（与 Claude/OpenAI 路径一致）。
+    const hasPendingInBatch = round_.functionCalls.some((fc) => toolNeedsApproval(fc.name, assistant));
+    if (hasPendingInBatch) {
+      return allContent.trim() || "";
+    }
+    const responseParts: Record<string, JsonValue>[] = [];
+    for (const fc of round_.functionCalls) {
+      const toolCall = {
+        id: fc.id,
+        type: "function" as const,
+        function: { name: fc.name, arguments: JSON.stringify(fc.args ?? {}) },
+      };
+      let toolResult: unknown;
+      try {
+        toolResult = await executeToolCall(toolCall, assistant);
+      } catch (err) {
+        toolResult = toolExecutionErrorPayload(err);
+      }
+      const outputParts = await toolResultToParts(toolResult);
+      if (hooks.message) {
+        hooks.message.parts = hooks.message.parts.map((part) => {
+          if (!isRecord(part) || part.type !== "tool" || part.toolCallId !== fc.id) return part;
+          return { ...part, input: toolCall.function.arguments, output: outputParts as unknown as JsonValue };
+        });
+        touchStream(hooks);
+      }
+      responseParts.push({
+        functionResponse: { name: fc.name, response: { result: apiContentText(partsToToolResultText(outputParts)) } },
+      });
+    }
+    // Gemini 要求把模型这轮的 parts（含 functionCall）原样回放，再追加 user 的 functionResponse。
+    contents = [
+      ...contents,
+      { role: "model", parts: round_.modelParts.length ? round_.modelParts : [{ text: round_.textOut }] },
+      { role: "user", parts: responseParts },
+    ];
+    currentBody = { ...body, contents };
+  }
+  throw new Error("Too many consecutive Gemini tool calls without final assistant content");
+}
+
+// functionResponse 的 result 文本：把工具输出 parts 拼成纯文本，对齐安卓
+// toFunctionResponsePart（只取 Text part 拼接）。
+function partsToToolResultText(parts: JsonValue[]): string {
+  if (!Array.isArray(parts)) return "";
+  return parts
+    .map((part) => (isRecord(part) && part.type === "text" ? String(part.text ?? "") : ""))
+    .filter(Boolean)
+    .join("\n");
 }
 
 async function fetchOpenAiText(
@@ -10591,7 +11015,8 @@ async function fetchAuxiliaryText(modelId: string, prompt: string, kind: string,
       messages: [{ role: "user", content: prompt }],
       stream,
       ...(options.temperature != null && (!reasoningLevel || !reasoningEnabled(reasoningLevel)) ? { temperature: options.temperature } : {}),
-      ...(reasoningLevel && supportsAbility(modelItem, "REASONING") ? { thinking: { type: reasoningEnabled(reasoningLevel) ? "adaptive" : "disabled", ...(reasoningLevelNormalized(reasoningLevel) === "auto" ? { display: "summarized" } : {}) } } : {}),
+      // 与主路径一致：thinking + output_config，DeepSeek 走 Claude 格式时 display:"raw"
+      ...(reasoningLevel ? claudeThinkingPayload(modelItem, reasoningLevel) : {}),
     };
     if (stream && options.onDelta) {
       try {
