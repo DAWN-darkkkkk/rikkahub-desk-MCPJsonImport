@@ -8714,7 +8714,7 @@ async function callProvider(
             thinking: reasoningActive
               ? { type: "adaptive", display: "summarized" }
               : { type: "disabled" },
-            ...(reasoningActive && ["low", "medium", "high"].includes(normalizedReasoning)
+            ...(reasoningActive && normalizedReasoning !== "auto"
               ? { output_config: { effort: normalizedReasoning } }
               : {}),
           }
