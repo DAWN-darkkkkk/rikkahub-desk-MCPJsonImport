@@ -63,10 +63,11 @@ function SilentUpdateChecker() {
     return () => { cancelled = true; };
   }, []);
 
+  if (!update) return null;
   return (
     <UpdateDialog
-      info={update!}
-      open={update !== null}
+      info={update}
+      open={true}
       onClose={() => setUpdate(null)}
     />
   );

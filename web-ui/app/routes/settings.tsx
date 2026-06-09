@@ -5826,7 +5826,7 @@ function AboutSection() {
   // Hard-coded current version — must match pc-server/server.ts:APP_VERSION and
   // web-ui/src-tauri/tauri.conf.json:version. The update checker compares this against
   // the latest GitHub release.
-  const APP_VERSION = "1.0.8";
+  const APP_VERSION = "1.0.9";
 
   const [checking, setChecking] = React.useState(false);
   const [updateInfo, setUpdateInfo] = React.useState<UpdateInfo | null>(null);
@@ -5846,7 +5846,7 @@ function AboutSection() {
   const aboutRows = [
     { label: "版本", value: APP_VERSION, icon: Settings2, onClick: undefined, action: "update" as const },
     { label: "系统", value: typeof navigator === "undefined" ? "Web" : navigator.userAgent, icon: Smartphone, onClick: undefined, action: undefined },
-    { label: "官网", value: "https://rikka-ai.com", icon: Globe, onClick: () => void openExternal("https://rikka-ai.com/"), action: undefined },
+    { label: "官网", value: "https://rikkahub-desktop.pages.dev", icon: Globe, onClick: () => void openExternal("https://rikkahub-desktop.pages.dev/"), action: undefined },
     { label: "GitHub", value: "https://github.com/yuh-G/rikkahub-desktop", icon: Github, onClick: () => void openExternal("https://github.com/yuh-G/rikkahub-desktop"), action: undefined },
     { label: "License", value: "https://github.com/yuh-G/rikkahub-desktop/blob/master/LICENSE", icon: FileClock, onClick: () => void openExternal("https://github.com/yuh-G/rikkahub-desktop/blob/master/LICENSE"), action: undefined },
   ];
@@ -5908,11 +5908,13 @@ function AboutSection() {
           })}
         </div>
       </div>
-      <UpdateDialog
-        info={updateInfo!}
-        open={updateInfo !== null}
-        onClose={() => setUpdateInfo(null)}
-      />
+      {updateInfo && (
+        <UpdateDialog
+          info={updateInfo}
+          open={true}
+          onClose={() => setUpdateInfo(null)}
+        />
+      )}
     </>
   );
 }
