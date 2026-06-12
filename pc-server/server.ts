@@ -446,7 +446,7 @@ function writeSkippedVersion(version: string) {
 // One ping per app start + periodic updates during the session.  Sends only:
 //   device UUID, date, version, OS, cumulative message count for the day.
 // No user content, no IP storage, no model names, no file names.
-const ANALYTICS_ENDPOINT = "https://rikkahub-analytics.yuh-g.workers.dev/ping";
+const ANALYTICS_ENDPOINT = "https://rikkahub-desktop.pages.dev/ping";
 const deviceIdPath = join(dataDir, "device-id.txt");
 let analyticsDeviceId = "";
 let analyticsMsgCount = 0;
