@@ -112,3 +112,8 @@ the runtime will.
   `callProviderStreaming`, add to the defaultSettings list, add provider-specific paths
   for the test endpoints.
 - **Releasing a new exe**: web-ui build + pc-server compile. Smoke first.
+- **Releasing the Linux binary**: push a `v*.*.*` tag — `.github/workflows/build-linux.yml`
+  compiles the x64 binary on CI and attaches it to the Release automatically. The in-app
+  updater matches the asset by the `Rikkahub_<tag>_linux_x64` naming convention, so don't
+  rename the uploaded file. Windows (`Rikkahub_<tag>_x64-setup.exe`) and Linux assets live
+  side by side on the same Release.
