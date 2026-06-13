@@ -56,7 +56,7 @@ jobs:
           ls -lh "$out"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Rikkahub_${{ steps.ver.outputs.version }}_linux_x64
           path: Rikkahub_${{ steps.ver.outputs.version }}_linux_x64
