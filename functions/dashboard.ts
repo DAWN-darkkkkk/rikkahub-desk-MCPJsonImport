@@ -367,6 +367,78 @@ const dashboardHtml = `<!DOCTYPE html>
     font-size: 11px;
   }
 
+  /* ─────────── 用户表格 ─────────── */
+  .users-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 12.5px;
+  }
+  .users-table thead th {
+    padding: 10px 14px;
+    text-align: left;
+    color: var(--text-dim);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border-bottom: 1px solid var(--border);
+  }
+  .users-table thead th.num { text-align: right; }
+  .users-table tbody td {
+    padding: 11px 14px;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border);
+    font-variant-numeric: tabular-nums;
+  }
+  .users-table tbody td.num {
+    text-align: right;
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--text);
+  }
+  .users-table tbody tr:last-child td { border-bottom: 0; }
+  .users-table tbody tr { transition: background 0.15s ease; }
+  .users-table tbody tr:hover { background: rgba(255,255,255,0.02); }
+  .device-id {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px;
+    color: var(--text);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .device-id .copy-icon {
+    width: 12px;
+    height: 12px;
+    color: var(--text-dim);
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+  .device-id:hover .copy-icon { opacity: 1; }
+  .device-id.copied .copy-icon { opacity: 1; color: var(--emerald); }
+  .os-tag {
+    display: inline-block;
+    font-size: 10.5px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    font-family: 'Inter', sans-serif;
+  }
+  .os-tag.win { background: rgba(56,189,248,0.12); color: #38bdf8; }
+  .os-tag.mac { background: rgba(167,139,250,0.14); color: #a78bfa; }
+  .os-tag.linux { background: rgba(251,191,36,0.14); color: #fbbf24; }
+  .ver-tag {
+    display: inline-block;
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    background: rgba(255,255,255,0.05);
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
   /* ─────────── 加载/错误状态 ─────────── */
   .loading {
     display: flex;
@@ -731,10 +803,54 @@ function render(data) {
     html += '</div>';
   }
 
+  // ── 用户列表(最近活跃 50 个设备) ──
+  if (data.recentUsers && data.recentUsers.length) {
+    let usersTable = '<table class="users-table"><thead><tr>';
+    usersTable += '<th>设备 ID</th><th>系统</th><th>版本</th><th>首次出现</th><th>最近活跃</th>';
+    usersTable += '<th class="num">活跃天数</th><th class="num">累计消息</th>';
+    usersTable += '</tr></thead><tbody>';
+    for (const u of data.recentUsers) {
+      const short = (u.device_id || '').slice(0, 8);
+      const osLabel = u.os === 'win' ? 'Windows' : u.os === 'mac' ? 'macOS' : u.os === 'linux' ? 'Linux' : '—';
+      const osClass = u.os === 'win' ? 'win' : u.os === 'mac' ? 'mac' : u.os === 'linux' ? 'linux' : '';
+      usersTable += '<tr>';
+      usersTable += '<td><span class="device-id" data-full="' + (u.device_id || '') + '" title="点击复制完整 ID">' + short + '… <svg class="copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></span></td>';
+      usersTable += '<td>' + (osLabel === '—' ? '<span style="color:var(--text-dim)">—</span>' : '<span class="os-tag ' + osClass + '">' + osLabel + '</span>') + '</td>';
+      usersTable += '<td>' + (u.version ? '<span class="ver-tag">' + u.version + '</span>' : '<span style="color:var(--text-dim)">—</span>') + '</td>';
+      usersTable += '<td>' + (u.first_date || '—') + '</td>';
+      usersTable += '<td>' + (u.last_date || '—') + '</td>';
+      usersTable += '<td class="num">' + (u.active_days || 0) + '</td>';
+      usersTable += '<td class="num">' + fmt(u.total_msgs || 0) + '</td>';
+      usersTable += '</tr>';
+    }
+    usersTable += '</tbody></table>';
+    html += '<div class="grid full">';
+    html += card({
+      title: '用户列表',
+      desc: '最近活跃的前 ' + data.recentUsers.length + ' 个设备(按最近一次活跃排序)',
+      body: usersTable,
+    });
+    html += '</div>';
+  }
+
   document.getElementById('content').innerHTML = html;
   drawCharts(data, trends);
+  bindCopyButtons();
 
   document.getElementById('updated').textContent = new Date().toTimeString().slice(0, 8) + ' 已更新';
+}
+
+function bindCopyButtons() {
+  document.querySelectorAll('.device-id').forEach(el => {
+    el.addEventListener('click', () => {
+      const full = el.dataset.full;
+      if (!full) return;
+      navigator.clipboard?.writeText(full).then(() => {
+        el.classList.add('copied');
+        setTimeout(() => el.classList.remove('copied'), 1200);
+      }).catch(() => {});
+    });
+  });
 }
 
 function miniCard(label, value, sub) {

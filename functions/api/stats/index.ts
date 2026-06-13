@@ -62,6 +62,22 @@ export const onRequest = async (context) => {
     // ── 平均留存率(D1/D7/D30) ──
     const avgRetention = computeAvgRetention(retention.cohorts);
 
+    // ── 最近活跃用户列表(按设备聚合,展示首次出现/最近活跃/累计消息) ──
+    const recentUsers = await DB.prepare(
+      `SELECT
+         device_id,
+         MIN(date)      AS first_date,
+         MAX(date)      AS last_date,
+         SUM(msg_count) AS total_msgs,
+         COUNT(*)       AS active_days,
+         (SELECT version FROM pings p2 WHERE p2.device_id = p.device_id ORDER BY date DESC LIMIT 1) AS version,
+         (SELECT os      FROM pings p2 WHERE p2.device_id = p.device_id ORDER BY date DESC LIMIT 1) AS os
+       FROM pings p
+       GROUP BY device_id
+       ORDER BY last_date DESC, total_msgs DESC
+       LIMIT 50`
+    ).all();
+
     return new Response(JSON.stringify({
       trends: (trends.results ?? []).reverse(),
       wau, mau,
@@ -79,6 +95,7 @@ export const onRequest = async (context) => {
       avgRetention,
       versions: versions.results ?? [],
       retention,
+      recentUsers: recentUsers.results ?? [],
     }), {
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
