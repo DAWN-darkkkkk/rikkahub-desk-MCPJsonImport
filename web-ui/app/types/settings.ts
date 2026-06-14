@@ -281,5 +281,7 @@ export interface Settings {
   searchServices: SearchServiceOption[];
   quickMessages?: QuickMessage[];
   searchServiceSelected: number;
+  /** Preferred local server port (null = auto, default 8080). PC-only; restart required. */
+  preferredPort?: number | null;
   [key: string]: unknown;
 }

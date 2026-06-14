@@ -197,7 +197,7 @@ const navItems: Array<{ id: Section; label: string; icon: React.ComponentType<{ 
   { id: "data", label: "数据设置", icon: Database },
   { id: "stats", label: "统计", icon: Database },
   { id: "logs", label: "请求日志", icon: FileClock },
-  { id: "proxy", label: "代理", icon: Globe },
+  { id: "proxy", label: "代理与端口", icon: Globe },
   { id: "about", label: "关于", icon: CheckCircle2 },
 ];
 
@@ -5754,6 +5754,46 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
     }
   };
 
+  // ── 服务端口 ──────────────────────────────────────────────────────────
+  // 端口是启动期配置：写入后要重启应用才生效。这里沿用代理的 600ms 防抖自动保存，
+  // 但走独立的 settings/port 端点（它需要做范围校验并返回 requiresRestart 提示）。
+  const initialPort = settings.preferredPort ?? null;
+  const [portDraft, setPortDraft] = React.useState<string>(initialPort == null ? "" : String(initialPort));
+  const portDirtyRef = React.useRef(false);
+
+  React.useEffect(() => {
+    // 同代理 draft 的保护：用户正在输入时不让 SSE 回推覆盖，避免吞掉刚敲的字符。
+    if (portDirtyRef.current) return;
+    setPortDraft(initialPort == null ? "" : String(initialPort));
+  }, [initialPort]);
+
+  const savePort = React.useCallback(async (announce = false) => {
+    const trimmed = portDraft.trim();
+    const parsed = trimmed === "" ? null : Number(trimmed);
+    if (
+      parsed !== null &&
+      (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1 || parsed > 65535)
+    ) {
+      toast.error("端口必须是 1–65535 之间的整数");
+      return;
+    }
+    if (!announce && !portDirtyRef.current) return;
+    try {
+      await api.post<{ preferredPort: number | null }>("settings/port", { port: parsed });
+      portDirtyRef.current = false;
+      onSettings({ ...settings, preferredPort: parsed } as Settings);
+      if (announce) toast.success("端口设置已保存，重启应用后生效");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "保存端口设置失败");
+    }
+  }, [portDraft, onSettings, settings]);
+
+  React.useEffect(() => {
+    if (!portDirtyRef.current) return;
+    const timer = window.setTimeout(() => void savePort(false), 600);
+    return () => window.clearTimeout(timer);
+  }, [portDraft, savePort]);
+
   const activeDisplay = status?.activeUrl
     ? status.source === "system"
       ? `${status.activeUrl}（来自系统代理）`
@@ -5762,7 +5802,7 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
 
   return (
     <>
-      <SectionHeader icon={Globe} title="代理" subtitle="为 AI API、搜索、MCP 等所有出站请求统一指定 HTTP 代理。留空将自动跟随系统代理。" />
+      <SectionHeader icon={Globe} title="代理与端口" subtitle="为 AI API、搜索、MCP 等所有出站请求统一指定 HTTP 代理，以及本地服务的监听端口。代理留空将自动跟随系统代理，端口留空将自动选择。" />
       <div className="space-y-5 rounded-lg border bg-card p-6">
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -5816,6 +5856,36 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
 
         <div className="rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
           当前代理：<span className="font-mono text-foreground">{activeDisplay}</span>
+        </div>
+      </div>
+
+      <div className="space-y-4 rounded-lg border bg-card p-6">
+        <div>
+          <div className="text-base font-medium">服务端口</div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            应用本地服务监听的端口，默认 8080。留空将自动选择；填写后优先使用该端口，被占用时自动顺延到下一个可用端口。修改后需重启应用生效。
+          </div>
+        </div>
+        <label className="block space-y-2">
+          <span className="text-sm font-medium">
+            端口号 <span className="text-xs font-normal text-muted-foreground">（留空 = 自动，默认 8080）</span>
+          </span>
+          <Input
+            type="number"
+            inputMode="numeric"
+            value={portDraft}
+            onChange={(event) => {
+              portDirtyRef.current = true;
+              setPortDraft(event.target.value);
+            }}
+            placeholder="8080"
+            min={1}
+            max={65535}
+            step={1}
+          />
+        </label>
+        <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+          修改端口后需要重启应用才能生效。当前运行中的实例仍使用原端口。
         </div>
       </div>
     </>
