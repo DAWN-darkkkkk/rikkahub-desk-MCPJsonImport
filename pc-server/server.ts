@@ -188,6 +188,9 @@ interface Settings {
   s3Config: S3Config;
   proxyConfig: ProxyConfig;
   webServerJwtEnabled: boolean;
+  // Preferred local port for the embedded HTTP server. null = auto (8080, walking up on
+  // conflict). Only read at startup, so changing it requires a restart to take effect.
+  preferredPort: number | null;
 }
 
 interface AsrProvider {
@@ -973,6 +976,7 @@ function defaultSettings(): Settings {
       password: "",
     },
     webServerJwtEnabled: false,
+    preferredPort: null,
   };
 }
 
@@ -1076,6 +1080,7 @@ function normalizeState(input: Partial<State>): State {
   normalized.settings.webDavConfig = normalizeWebDavConfig(normalized.settings.webDavConfig);
   normalized.settings.s3Config = normalizeS3Config(normalized.settings.s3Config);
   normalized.settings.proxyConfig = normalizeProxyConfig(normalized.settings.proxyConfig);
+  normalized.settings.preferredPort = normalizePreferredPort(normalized.settings.preferredPort);
   if (!normalized.settings.searchServices.some((service) => String((service as Record<string, JsonValue>).type ?? "").toLowerCase() === "tinyfish")) {
     normalized.settings.searchServices = [
       ...normalized.settings.searchServices,
@@ -2370,6 +2375,16 @@ function normalizeProxyConfig(value: unknown): ProxyConfig {
   };
 }
 
+// Port setting: integer in [1, 65535] or null (auto). Anything out of range / wrong type
+// normalizes back to null so a corrupt state.json can never wedge the server on an invalid port.
+function normalizePreferredPort(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const n = Math.trunc(value);
+    if (n >= 1 && n <= 65535) return n;
+  }
+  return null;
+}
+
 function hasJsonItemId(items: unknown, idValue: string) {
   return Array.isArray(items) && items.some((item) => isRecord(item) && String(item.id ?? "") === idValue);
 }
@@ -3204,6 +3219,7 @@ function rewriteAvatarsInSettings(settings: any, mapping: Record<string, string>
   }
   // Strip PC-only top-level fields
   delete copy.proxyConfig;
+  delete copy.preferredPort;
   // Fix empty-string UUID fields — Android's Uuid deserializer rejects ""
   const uuidFields = ["chatModelId", "titleModelId", "translateModeId", "suggestionModelId", "imageGenerationModelId", "ocrModelId", "compressModelId", "assistantId", "selectedTTSProviderId", "selectedASRProviderId"];
   for (const field of uuidFields) {
@@ -13916,6 +13932,17 @@ async function routeApi(request: Request, url: URL) {
     applyEffectiveProxy();
     return json({ status: "ok", config: proxyConfig, ...proxyStatusPayload() });
   }
+  if (path === "settings/port" && request.method === "POST") {
+    const body = await readJson<{ port?: number | null }>(request).catch(
+      () => ({}) as { port?: number | null },
+    );
+    const preferredPort = normalizePreferredPort(body?.port);
+    updateSettings({ ...state.settings, preferredPort });
+    // The port is only consulted at startup, so this change takes effect on the next launch.
+    // The running server keeps its current port; we return requiresRestart so the UI can tell
+    // the user to restart.
+    return json({ status: "ok", preferredPort, requiresRestart: true });
+  }
   if (path === "settings/proxy/detect" && request.method === "POST") {
     const detected = readWindowsSystemProxy();
     return json({ detected: detected ?? null });
@@ -14617,7 +14644,6 @@ const args = new Set(Bun.argv.slice(1));
 const portIndex = Bun.argv.findIndex((arg) => arg === "--port");
 const portEqualsArg = Bun.argv.find((arg) => arg.startsWith("--port="));
 const portValue = portEqualsArg?.split("=")[1] ?? (portIndex >= 0 ? Bun.argv[portIndex + 1] : undefined);
-const port = Number(portValue ?? process.env.PORT ?? "8080");
 
 if (process.platform === "linux") {
   const missing: string[] = [];
@@ -14632,69 +14658,111 @@ if (process.platform === "linux") {
   }
 }
 
-const server = (() => {
-  try {
-    return Bun.serve({
-      port,
-      idleTimeout: 0,
-      // Default is 128 MB — way too small. Users have reported backup zips of 10+ GB
-      // (months of conversations + image attachments). The streaming `data/import` path
-      // never holds the full body in memory anyway (pipes request.body directly to disk),
-      // so this just acts as a sanity-check ceiling against truly absurd uploads.
-      maxRequestBodySize: 64 * 1024 * 1024 * 1024,
-      async fetch(request, server) {
-        server.timeout(request, 0);
-        const url = new URL(request.url);
-        try {
-          if (url.pathname === "/api/asr/realtime" && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
-            const upgraded = server.upgrade(request, { data: { kind: "asr" } });
-            return upgraded ? undefined : error("WebSocket upgrade failed", 400);
-          }
-          if (url.pathname.startsWith("/api/")) return await routeApi(request, url);
-          return await routeStatic(url);
-        } catch (err) {
-          console.error(err);
-          return error(err instanceof Error ? err.message : String(err), 500);
-        }
-      },
-      websocket: {
-        message(ws, data) {
-          if ((ws.data as { kind?: string } | undefined)?.kind !== "asr") return;
-          if (typeof data === "string") {
-            const payload = JSON.parse(data || "{}") as { type?: string; providerId?: string };
-            if (payload.type === "start") startAsrRealtimeSession(ws, payload.providerId);
-            if (payload.type === "stop") stopAsrRealtimeSession(ws);
-            return;
-          }
-      const session = asrRealtimeSessions.get(ws);
-      if (!session) return;
-      const buffer = data instanceof ArrayBuffer
-        ? data
-        : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-      sendAsrAudio(session, buffer);
-    },
-    close(ws) {
-      if ((ws.data as { kind?: string } | undefined)?.kind === "asr") stopAsrRealtimeSession(ws);
-    },
-  },
-});
-  } catch (err) {
-    // The most common failure here is EADDRINUSE — i.e. another Rikkahub instance (or some
-    // unrelated app) is already bound to this port. We print a clear, single-line marker that
-    // the Tauri shell's spawn-monitor parses out (`port_in_use:<port>`) so it can surface a
-    // user-friendly dialog instead of silently loading whatever stale orphan is on the port.
-    const message = err instanceof Error ? err.message : String(err);
-    if (/EADDRINUSE|address already in use|in use/i.test(message)) {
-      console.error(`[rikkahub-server] port_in_use:${port}`);
-      console.error(
-        `Port ${port} is already in use. Another Rikkahub instance may still be running — close it from Task Manager and try again.`,
-      );
-      process.exit(2);
-    }
-    console.error(`[rikkahub-server] Failed to start on port ${port}: ${message}`);
-    process.exit(1);
+// Resolve the preferred port by priority: explicit `--port` flag > `PORT` env > user setting
+// > 8080. Containerized deploys skip the user setting — inside a container the port is fixed
+// by the image / `docker -p` mapping, so honoring a UI change there would be misleading.
+function resolvePreferredPort(): number {
+  if (portValue) {
+    const cli = Number(portValue);
+    if (cli > 0 && cli <= 65535) return cli;
   }
+  if (process.env.PORT) {
+    const envPort = Number(process.env.PORT);
+    if (envPort > 0 && envPort <= 65535) return envPort;
+  }
+  if (!RUNNING_IN_CONTAINER && state.settings.preferredPort) {
+    return state.settings.preferredPort;
+  }
+  return 8080;
+}
+
+const preferredPort = resolvePreferredPort();
+// Try the preferred port first; on EADDRINUSE walk upward. Containers don't walk — a port
+// collision inside a container is unexpected, and silently hopping would hide a real problem.
+const MAX_PORT_ATTEMPTS = RUNNING_IN_CONTAINER ? 1 : 20;
+
+const { server, port } = (() => {
+  for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt += 1) {
+    const tryPort = preferredPort + attempt;
+    if (tryPort > 65535) break;
+    try {
+      return {
+        server: Bun.serve({
+          port: tryPort,
+          idleTimeout: 0,
+          // Default is 128 MB — way too small. Users have reported backup zips of 10+ GB
+          // (months of conversations + image attachments). The streaming `data/import` path
+          // never holds the full body in memory anyway (pipes request.body directly to disk),
+          // so this just acts as a sanity-check ceiling against truly absurd uploads.
+          maxRequestBodySize: 64 * 1024 * 1024 * 1024,
+          async fetch(request, server) {
+            server.timeout(request, 0);
+            const url = new URL(request.url);
+            try {
+              if (url.pathname === "/api/asr/realtime" && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+                const upgraded = server.upgrade(request, { data: { kind: "asr" } });
+                return upgraded ? undefined : error("WebSocket upgrade failed", 400);
+              }
+              if (url.pathname.startsWith("/api/")) return await routeApi(request, url);
+              return await routeStatic(url);
+            } catch (err) {
+              console.error(err);
+              return error(err instanceof Error ? err.message : String(err), 500);
+            }
+          },
+          websocket: {
+            message(ws, data) {
+              if ((ws.data as { kind?: string } | undefined)?.kind !== "asr") return;
+              if (typeof data === "string") {
+                const payload = JSON.parse(data || "{}") as { type?: string; providerId?: string };
+                if (payload.type === "start") startAsrRealtimeSession(ws, payload.providerId);
+                if (payload.type === "stop") stopAsrRealtimeSession(ws);
+                return;
+              }
+              const session = asrRealtimeSessions.get(ws);
+              if (!session) return;
+              const buffer = data instanceof ArrayBuffer
+                ? data
+                : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+              sendAsrAudio(session, buffer);
+            },
+            close(ws) {
+              if ((ws.data as { kind?: string } | undefined)?.kind === "asr") stopAsrRealtimeSession(ws);
+            },
+          },
+        }),
+        port: tryPort,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Non-port-conflict errors (permission denied, bad config, etc.) must not silently hop
+      // to the next port — surface them and stop.
+      if (!/EADDRINUSE|address already in use|in use/i.test(message)) {
+        console.error(`[rikkahub-server] Failed to start on port ${tryPort}: ${message}`);
+        process.exit(1);
+      }
+      if (attempt === 0) {
+        console.warn(
+          `[startup] Port ${tryPort} busy, trying alternatives up to ${Math.min(preferredPort + MAX_PORT_ATTEMPTS - 1, 65535)}...`,
+        );
+      }
+    }
+  }
+  // Exhausted the whole range. Emit the single-line marker the Tauri shell parses
+  // (`port_in_use:<port>`) so it shows a friendly dialog instead of hanging silently.
+  const top = Math.min(preferredPort + MAX_PORT_ATTEMPTS - 1, 65535);
+  console.error(`[rikkahub-server] port_in_use:${preferredPort}`);
+  console.error(
+    `No available port in range ${preferredPort}-${top}. Close other apps using these ports, ` +
+      `or change the preferred port in 设置 → 代理与端口.`,
+  );
+  process.exit(2);
 })();
+
+// Machine-readable marker parsed by the Tauri shell (src-tauri/src/lib.rs) to learn which port
+// the sidecar actually bound to — the shell navigates the webview here when 8080 was taken.
+// Keep it a single line with the exact `RIKKAHUB_PORT:<port>` prefix.
+console.log(`RIKKAHUB_PORT:${port}`);
 
 console.log(`RikkaHub PC server running at http://localhost:${port}`);
 console.log(`Data directory: ${dataDir}`);

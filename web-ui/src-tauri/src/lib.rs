@@ -9,7 +9,6 @@
 
 use std::{
     fs,
-    net::TcpStream,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -101,37 +100,51 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Probe localhost:8080 until the sidecar accepts a connection or we time out. Also
-/// short-circuits if the spawned child process died — this prevents the silent-orphan
-/// scenario where a separate Rikkahub instance owns the port, our spawn fails with
-/// EADDRINUSE and exits, but the TCP probe still succeeds because the orphan responds.
-fn wait_for_sidecar_ready(timeout: Duration, child_dead: &AtomicBool) -> Result<(), String> {
+/// Block until the sidecar prints its `RIKKAHUB_PORT:<n>` marker (meaning Bun.serve bound
+/// successfully), or until the child dies / we time out. Polling the channel with a short
+/// timeout lets us notice a dead child promptly instead of waiting the full duration — this
+/// also covers the silent-orphan case where another app already owns the port range and our
+/// spawn exits on EADDRINUSE before ever printing a port marker.
+fn wait_for_sidecar_port(
+    port_rx: std::sync::mpsc::Receiver<u16>,
+    child_dead: &AtomicBool,
+    timeout: Duration,
+) -> Result<u16, String> {
     let started = Instant::now();
-    let addr = format!("127.0.0.1:{SIDECAR_PORT}");
-    while started.elapsed() < timeout {
+    loop {
         if child_dead.load(Ordering::Acquire) {
             return Err(format!(
-                "Rikkahub 启动失败：端口 {SIDECAR_PORT} 已被占用。\n\n\
-                请打开任务管理器，关闭已有的 rikkahub-server.exe 或 rikkahub-pc.exe 进程，\
-                然后重新启动 Rikkahub。"
+                "Rikkahub 启动失败：后端进程已退出。\n\n\
+                端口 {SIDECAR_PORT} 附近可能被其他程序占用。请关闭占用该端口的程序，\
+                或在 设置 → 代理与端口 中更换端口后重新启动 Rikkahub。"
             ));
         }
-        if TcpStream::connect_timeout(
-            &addr.parse().expect("valid loopback addr"),
-            Duration::from_millis(200),
-        )
-        .is_ok()
-        {
-            return Ok(());
+        match port_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(port) => return Ok(port),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if started.elapsed() >= timeout {
+                    return Err(format!(
+                        "Rikkahub 后端服务在 {timeout:?} 内未启动完成，请重试。"
+                    ));
+                }
+                // otherwise keep looping and re-check child_dead
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // stdout pump task ended without ever emitting a port marker — the sidecar
+                // process has exited. Treat it the same as child_dead.
+                return Err(format!(
+                    "Rikkahub 启动失败：后端进程意外退出。\n\n\
+                    端口 {SIDECAR_PORT} 附近可能被其他程序占用。请关闭占用该端口的程序，\
+                    或在 设置 → 代理与端口 中更换端口后重新启动 Rikkahub。"
+                ));
+            }
         }
-        thread::sleep(Duration::from_millis(150));
     }
-    Err(format!(
-        "Rikkahub 后端服务在 {SIDECAR_READY_TIMEOUT:?} 内未启动完成，请重试。"
-    ))
 }
 
-fn spawn_sidecar(app: &AppHandle) -> Result<(CommandChild, Arc<AtomicBool>), String> {
+fn spawn_sidecar(
+    app: &AppHandle,
+) -> Result<(CommandChild, Arc<AtomicBool>, std::sync::mpsc::Receiver<u16>), String> {
     let data_dir = resolve_data_dir(app);
     fs::create_dir_all(&data_dir)
         .map_err(|e| format!("Failed to create data dir {}: {e}", data_dir.display()))?;
@@ -144,8 +157,12 @@ fn spawn_sidecar(app: &AppHandle) -> Result<(CommandChild, Arc<AtomicBool>), Str
         // meant for portable / standalone use. Inside the Tauri shell the webview already
         // navigates to the same URL, so a second browser window would just be noise.
         .args(["--no-open"])
-        .env("RIKKAHUB_PC_DATA_DIR", &data_dir)
-        .env("PORT", SIDECAR_PORT.to_string());
+        .env("RIKKAHUB_PC_DATA_DIR", &data_dir);
+        // NOTE: we deliberately do NOT pass PORT here. The sidecar now picks its own port
+        // (8080 by default, walking up on conflict) and reports the actual value via the
+        // `RIKKAHUB_PORT:<n>` stdout marker parsed below. Hardcoding 8080 would make the
+        // auto-port feature impossible, since the env override has higher priority than the
+        // user's preferred-port setting.
 
     let (mut rx, child) = cmd
         .spawn()
@@ -154,15 +171,21 @@ fn spawn_sidecar(app: &AppHandle) -> Result<(CommandChild, Arc<AtomicBool>), Str
     // Tie the sidecar's lifetime to the shell process via a Windows Job Object so that even
     // if the user kills `rikkahub.exe` from Task Manager (or it crashes), the kernel reaps
     // `rikkahub-server.exe` along with it. Without this the sidecar would linger as an orphan
-    // listening on :8080 and the next launch would fail to bind.
+    // holding its port and the next launch would fail to bind.
     #[cfg(windows)]
     bind_to_kill_on_close_job(child.pid());
 
     // Tracks whether the sidecar process terminated. Used by the readiness loop to detect
-    // the "another instance owns :8080, our spawn died on EADDRINUSE" failure mode, which
-    // otherwise looks like a successful start because the orphan responds to TCP probes.
+    // the "port already owned, our spawn died on EADDRINUSE" failure mode.
     let dead = Arc::new(AtomicBool::new(false));
     let dead_clone = dead.clone();
+
+    // The sidecar prints a single `RIKKAHUB_PORT:<n>` line on stdout once Bun.serve binds.
+    // We parse it here and forward the value over a channel so the setup routine can navigate
+    // the webview to the correct port — the static window URL is still 8080, so when the
+    // sidecar hopped to another port we re-navigate after this resolves.
+    let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
+    let port_tx_clone = port_tx.clone();
 
     // Pipe sidecar stdout/stderr to the host stdout so `cargo tauri dev` users see logs.
     // In release this is silent because of the `windows_subsystem = "windows"` attribute.
@@ -171,7 +194,15 @@ fn spawn_sidecar(app: &AppHandle) -> Result<(CommandChild, Arc<AtomicBool>), Str
             match event {
                 CommandEvent::Stdout(line) => {
                     if let Ok(text) = String::from_utf8(line) {
-                        eprintln!("[sidecar] {}", text.trim_end());
+                        let trimmed = text.trim_end();
+                        eprintln!("[sidecar] {}", trimmed);
+                        // `RIKKAHUB_PORT:8082` → Some(8082). Only the first hit matters; the
+                        // channel is consumed once by the setup wait.
+                        if let Some(rest) = trimmed.strip_prefix("RIKKAHUB_PORT:") {
+                            if let Ok(p) = rest.trim().parse::<u16>() {
+                                let _ = port_tx_clone.send(p);
+                            }
+                        }
                     }
                 }
                 CommandEvent::Stderr(line) => {
@@ -194,7 +225,7 @@ fn spawn_sidecar(app: &AppHandle) -> Result<(CommandChild, Arc<AtomicBool>), Str
         dead_clone.store(true, Ordering::Release);
     });
 
-    Ok((child, dead))
+    Ok((child, dead, port_rx))
 }
 
 /// On Windows, putting the sidecar into a Job Object with `KILL_ON_JOB_CLOSE` ensures the OS
@@ -339,18 +370,17 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
-            // Start the sidecar before the webview loads, then wait for the port to come up
-            // so the initial page navigation hits a live server. If the sidecar dies early
-            // (most commonly: EADDRINUSE because another rikkahub-pc.exe / rikkahub-server.exe
-            // is already on port 8080), show an error dialog and quit — otherwise the webview
-            // would silently load the orphan's UI without Tauri's internals injected, leaving
-            // the user with a window that has no titlebar and a non-functional app.
-            let child_dead = match spawn_sidecar(&handle) {
-                Ok((child, dead)) => {
+            // Start the sidecar, then wait for it to print its `RIKKAHUB_PORT:<n>` marker. The
+            // sidecar now picks its own port (8080 by default, walking up on conflict) and we
+            // can't know which one until that line arrives. If the sidecar dies early — most
+            // commonly EADDRINUSE because the whole candidate range is busy — show an error
+            // dialog and quit; otherwise the webview would sit on a dead/orphan URL.
+            let (port_rx, child_dead) = match spawn_sidecar(&handle) {
+                Ok((child, dead, port_rx)) => {
                     if let Some(state) = handle.try_state::<SidecarState>() {
                         *state.child.lock().unwrap() = Some(child);
                     }
-                    dead
+                    (port_rx, dead)
                 }
                 Err(err) => {
                     show_startup_error(&handle, &format!("Rikkahub 后端启动失败：\n\n{err}"));
@@ -359,14 +389,34 @@ pub fn run() {
                 }
             };
 
-            match wait_for_sidecar_ready(SIDECAR_READY_TIMEOUT, &child_dead) {
-                Ok(()) => {
-                    handle.emit("sidecar://ready", true).ok();
-                }
-                Err(msg) => {
-                    show_startup_error(&handle, &msg);
-                    handle.exit(1);
-                    return Ok(());
+            let actual_port =
+                match wait_for_sidecar_port(port_rx, &child_dead, SIDECAR_READY_TIMEOUT) {
+                    Ok(port) => port,
+                    Err(msg) => {
+                        show_startup_error(&handle, &msg);
+                        handle.exit(1);
+                        return Ok(());
+                    }
+                };
+
+            handle.emit("sidecar://ready", true).ok();
+
+            // The window's static URL (tauri.conf.json) is http://localhost:8080. When the
+            // sidecar had to use a different port, re-navigate the webview there. The eval'd
+            // script guards with an "already on this port" check so repeated attempts don't
+            // interrupt a navigation that has already succeeded; the short retry loop covers
+            // the case where the initial load landed on a connection-refused error page and
+            // the very first eval didn't take effect immediately.
+            if actual_port != SIDECAR_PORT {
+                if let Some(window) = handle.get_webview_window("main") {
+                    let js = format!(
+                        "(function(){{var t='http://localhost:{p}';try{{if(location.href.indexOf(':{p}')===-1)location.replace(t)}}catch(e){{}}}})()",
+                        p = actual_port
+                    );
+                    for _ in 0..6 {
+                        let _ = window.eval(&js);
+                        thread::sleep(Duration::from_millis(250));
+                    }
                 }
             }
 
