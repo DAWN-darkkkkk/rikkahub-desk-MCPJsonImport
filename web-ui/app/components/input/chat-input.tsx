@@ -11,6 +11,7 @@ import {
   Plus,
   Scissors,
   Send,
+  Sparkles,
   Square,
   Video,
   X,
@@ -361,6 +362,10 @@ function ChatInputInner({
   const asrFrameRef = React.useRef<Int16Array[]>([]);
   const asrFrameSamplesRef = React.useRef(0);
   const dragDepthRef = React.useRef(0);
+  // 提示词优化:点击后把输入框原文发给"提示词优化模型",返回的优化版直接替换输入框。
+  // originalRef 保留原文几秒,供"撤销"toast 一键恢复(优化结果不满意时不丢原文)。
+  const [optimizing, setOptimizing] = React.useState(false);
+  const originalBeforeOptimizeRef = React.useRef<string | null>(null);
 
   const isEmpty = value.trim().length === 0 && attachments.length === 0;
 
@@ -499,6 +504,42 @@ function ChatInputInner({
       setSubmitting(false);
     }
   }, [actionDisabled, canSend, canStop, onSend, onStop, t]);
+
+  const handleOptimize = React.useCallback(async () => {
+    const original = value.trim();
+    if (!original || optimizing) return;
+    setOptimizing(true);
+    try {
+      const res = await api.post<{ text: string }>(
+        "prompt/optimize",
+        { text: value },
+        { timeout: false },
+      );
+      const optimized = String(res.text ?? "").trim();
+      if (!optimized) {
+        toast.error("优化结果为空");
+        return;
+      }
+      onValueChange(optimized);
+      originalBeforeOptimizeRef.current = original;
+      toast.success("已优化提示词", {
+        duration: 8000,
+        action: {
+          label: "撤销",
+          onClick: () => {
+            if (originalBeforeOptimizeRef.current !== null) {
+              onValueChange(originalBeforeOptimizeRef.current);
+              originalBeforeOptimizeRef.current = null;
+            }
+          },
+        },
+      });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "提示词优化失败");
+    } finally {
+      setOptimizing(false);
+    }
+  }, [value, optimizing, onValueChange]);
 
   const handleTextChange = React.useCallback(
     (event: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -1032,6 +1073,19 @@ function ChatInputInner({
                 {asrListening ? <LoaderCircle className="size-4 animate-spin" /> : <Mic className="size-4" />}
               </Button>
             </div>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              disabled={isEmpty || optimizing || isGenerating || disabled}
+              onClick={() => {
+                void handleOptimize();
+              }}
+              className="size-8 rounded-full text-muted-foreground hover:text-foreground"
+              title="优化提示词"
+            >
+              {optimizing ? <LoaderCircle className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
+            </Button>
             <Button
               onClick={() => {
                 void handlePrimaryAction();

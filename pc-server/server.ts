@@ -163,6 +163,8 @@ interface Settings {
   imageGenerationModelId: string;
   ocrModelId: string;
   compressModelId: string;
+  // 模型 ID,用于对话界面"优化提示词"按钮。空串 = 未配置(按钮会提示去设置页配置)。
+  promptOptimizeModelId: string;
   translateThinkingBudget?: number;
   titlePrompt: string;
   translatePrompt: string;
@@ -415,6 +417,36 @@ Requirements:
 <conversation>
 {content}
 </conversation>`;
+
+// 提示词优化 meta-prompt —— 用户在对话界面点"优化提示词"时,把输入框原文 + 本提示词
+// 一起发给"提示词优化模型"。模型返回的优化版会直接替换输入框内容,所以输出必须纯净
+// (无前言/解释/引号)。核心设计目标:把混乱口语化的草稿打磨成清晰专业的版本,同时严格
+// 不改原意、不膨胀简单请求、不改写代码块、保留占位符。
+const DEFAULT_PROMPT_OPTIMIZE_PROMPT = `你是一位资深提示词工程专家。下面会给你一段用户写给 AI 助手的提示词草稿,你的任务是把它优化成清晰、专业、结构合理的版本,让 AI 能更准确地理解意图、给出更高质量的回复。
+
+## 优化原则
+
+1. **严格保留原意** —— 不增加用户没有提出的诉求,不删减用户已经表达的内容,不擅自改变核心意图。你的职责是打磨表达,不是替用户重新定义需求。如果原文已经清晰专业,原样输出即可,不要为了"优化"而画蛇添足。
+
+2. **消除歧义** —— 用户常用模糊词("弄好看点""优化一下""处理那个问题")。请结合上下文推断最可能的具体含义并明确写出;实在无法推断时,给出最通用的合理解读,而不是留白。
+
+3. **专业化用词** —— 把口语化、不精确的说法替换为对应的专业或技术术语。例如:"帮我弄下那个东西" → 指明"那个东西"具体指什么;"让代码好看一点" → "重构代码,提升可读性与命名规范";"画个图" → 明确是"流程图 / 架构图 / 数据图表"中的哪一种。
+
+4. **适度结构化** —— 当请求包含多个要点(背景、需求、约束、期望的输出格式)时,用分节或编号列表清晰组织。但如果只是一句话的简单请求,保持简洁,不要用多余的框架稀释重点——简洁本身就是专业。
+
+5. **补全隐含上下文** —— 如果提示词隐含了目标读者、语气、输出格式或希望 AI 扮演的角色,将其显式写出。例如"写个周报" → 点明是面向团队的工作周报、周频、含本周总结与下周计划。
+
+6. **保持原文语言** —— 中文保持中文,英文保持英文,不要翻译,不要自行添加用户未要求的外语。
+
+7. **保留占位符与模板变量** —— 如果原文包含 {{name}}、{topic}、<url>、[日期] 之类的占位符,原样保留,它们可能由系统填充。
+
+8. **不改写代码** —— 原文中的代码块(用三反引号或缩进标记)原样保留,不修改、不"改进"代码本身,只优化代码之外的说明性文字。
+
+## 输出要求
+
+只输出优化后的提示词本身。不要写任何前言、解释、"以下是优化版本"之类的引导语,不要用引号包裹结果,不要在末尾追加说明。用户会把你的输出直接读入输入框——任何提示词以外的文字都是噪音。
+
+请优化以下提示词,直接输出优化后的版本:`;
 
 const sourceRootDir = resolve(import.meta.dir, "..");
 const executableDir = dirname(process.execPath);
@@ -901,6 +933,7 @@ function defaultSettings(): Settings {
     imageGenerationModelId: "",
     ocrModelId: "",
     compressModelId: DEFAULT_AUTO_MODEL_ID,
+    promptOptimizeModelId: "",
     titlePrompt: DEFAULT_TITLE_PROMPT,
     translatePrompt: DEFAULT_TRANSLATION_PROMPT,
     suggestionPrompt: DEFAULT_SUGGESTION_PROMPT,
@@ -13162,6 +13195,7 @@ async function routeApi(request: Request, url: URL) {
       imageGenerationModelId: String(body.imageGenerationModelId ?? state.settings.imageGenerationModelId),
       ocrModelId: String(body.ocrModelId ?? state.settings.ocrModelId),
       compressModelId: String(body.compressModelId ?? state.settings.compressModelId),
+      promptOptimizeModelId: String(body.promptOptimizeModelId ?? state.settings.promptOptimizeModelId ?? ""),
       titlePrompt: String(body.titlePrompt ?? state.settings.titlePrompt ?? DEFAULT_TITLE_PROMPT),
       translatePrompt: String(body.translatePrompt ?? state.settings.translatePrompt ?? DEFAULT_TRANSLATION_PROMPT),
       suggestionPrompt: String(body.suggestionPrompt ?? state.settings.suggestionPrompt ?? DEFAULT_SUGGESTION_PROMPT),
@@ -13373,6 +13407,29 @@ async function routeApi(request: Request, url: URL) {
     await loadModelsDev();
     if (!modelsDevCache) return json({ contextLimit: null });
     return json({ contextLimit: lookupContextLimit(modelsDevCache, ptype, mid) });
+  }
+  if (path === "prompt/optimize" && request.method === "POST") {
+    // 用户在对话输入框点"优化提示词":把原文 + meta-prompt 发给"提示词优化模型",
+    // 返回优化后的文本由前端直接替换输入框内容。未配置模型时返回 400,前端引导去设置页。
+    const body = await readJson<{ text: string }>(request);
+    const text = String(body.text ?? "").trim();
+    if (!text) return error("没有可优化的文本", 400);
+    const modelId = state.settings.promptOptimizeModelId;
+    if (!modelId) {
+      return error("未配置提示词优化模型,请在「设置 - 默认模型与提示词」中指定一个模型", 400);
+    }
+    const prompt = `${DEFAULT_PROMPT_OPTIMIZE_PROMPT}\n\n<original_prompt>\n${text}\n</original_prompt>`;
+    try {
+      // temperature 0.5:既要能找到更好的措辞,又不能偏离原意乱发挥。
+      // maxTokens 2048:优化后的提示词通常比原文略长(结构化),但不会成倍膨胀。
+      const optimized = await fetchAuxiliaryText(modelId, prompt, "prompt-optimize", {
+        maxTokens: 2048,
+        temperature: 0.5,
+      });
+      return json({ text: optimized });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
   }
   if (path === "settings/provider/models" && request.method === "POST") {
     const body = await readJson<{ providerId: string; save?: boolean }>(request);

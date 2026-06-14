@@ -32,6 +32,7 @@ import {
   UserRound,
   Volume2,
   Square,
+  Sparkles,
   WandSparkles,
 } from "lucide-react";
 import { Link } from "react-router";
@@ -2565,13 +2566,14 @@ function DefaultModelsSection({ settings, onSettings }: { settings: Settings; on
     imageGenerationModelId: string;
     ocrModelId: string;
     compressModelId: string;
+    promptOptimizeModelId: string;
     titlePrompt: string;
     translatePrompt: string;
     suggestionPrompt: string;
     ocrPrompt: string;
     compressPrompt: string;
   };
-  type ModelKey = "chatModelId" | "titleModelId" | "translateModeId" | "suggestionModelId" | "imageGenerationModelId" | "ocrModelId" | "compressModelId";
+  type ModelKey = "chatModelId" | "titleModelId" | "translateModeId" | "suggestionModelId" | "imageGenerationModelId" | "ocrModelId" | "compressModelId" | "promptOptimizeModelId";
   type PromptKey = "titlePrompt" | "translatePrompt" | "suggestionPrompt" | "ocrPrompt" | "compressPrompt";
   const [draft, setDraft] = React.useState({
     chatModelId: textValue(settings.chatModelId),
@@ -2581,6 +2583,7 @@ function DefaultModelsSection({ settings, onSettings }: { settings: Settings; on
     imageGenerationModelId: textValue(settings.imageGenerationModelId),
     ocrModelId: textValue(settings.ocrModelId),
     compressModelId: textValue(settings.compressModelId),
+    promptOptimizeModelId: textValue(settings.promptOptimizeModelId),
     titlePrompt: textValue(settings.titlePrompt),
     translatePrompt: textValue(settings.translatePrompt),
     suggestionPrompt: textValue(settings.suggestionPrompt),
@@ -2631,6 +2634,7 @@ function DefaultModelsSection({ settings, onSettings }: { settings: Settings; on
     description: string;
   }> = [
     { modelKey: "chatModelId", icon: Bot, title: "默认聊天模型", description: "首页未手动选择模型时使用。" },
+    { modelKey: "promptOptimizeModelId", icon: Sparkles, title: "提示词优化", description: "对话输入框「优化提示词」按钮使用这个模型,把你的草稿改写得更清晰专业。" },
     { modelKey: "titleModelId", promptKey: "titlePrompt", icon: NotebookText, title: "标题生成", description: "对话首次回复后读取最近消息自动生成会话标题。" },
     { modelKey: "translateModeId", promptKey: "translatePrompt", icon: Globe, title: "翻译", description: "AI 回复下方翻译按钮使用这个模型和 Prompt。" },
     { modelKey: "suggestionModelId", promptKey: "suggestionPrompt", icon: MessageSquareText, title: "建议回复", description: "回复完成后生成 3 到 5 条用户可点选建议。" },
