@@ -59,6 +59,9 @@ export interface ChatInputProps {
   onSuggestionClick?: (suggestion: string) => void;
   onExportConversation?: (includeReasoning: boolean) => void;
   onCompressConversation?: () => void;
+  // 提示词优化时,返回最近几轮对话的纯文本作为上下文(让优化模型理解模糊指代)。
+  // 无对话(首条消息)时返回空串。只在用户点击"优化提示词"时调用。
+  getOptimizeContext?: () => string;
   className?: string;
 }
 
@@ -268,6 +271,7 @@ function ChatInputInner({
   onSuggestionClick,
   onExportConversation,
   onCompressConversation,
+  getOptimizeContext,
   className,
 }: ChatInputProps) {
   const { t } = useTranslation("input");
@@ -364,7 +368,9 @@ function ChatInputInner({
   const dragDepthRef = React.useRef(0);
   // 提示词优化:点击后把输入框原文发给"提示词优化模型",返回的优化版直接替换输入框。
   // originalRef 保留原文几秒,供"撤销"toast 一键恢复(优化结果不满意时不丢原文)。
+  // optimizeHint:超过 8s 还在转时显示"模型响应较慢",让用户知道不是卡死了(配合 60s 超时)。
   const [optimizing, setOptimizing] = React.useState(false);
+  const [optimizeHint, setOptimizeHint] = React.useState<string | null>(null);
   const originalBeforeOptimizeRef = React.useRef<string | null>(null);
 
   const isEmpty = value.trim().length === 0 && attachments.length === 0;
@@ -509,15 +515,20 @@ function ChatInputInner({
     const original = value.trim();
     if (!original || optimizing) return;
     setOptimizing(true);
+    setOptimizeHint(null);
+    // 8s 后还在转 → 显示"模型响应较慢",给用户感知(不然一直转圈不知道是卡死还是在想)。
+    // 完成或出错时在 finally 里清掉。配合下方的 60s 超时,保证不会无限转。
+    const slowTimer = setTimeout(() => setOptimizeHint("优化模型响应较慢,正在等待…"), 8_000);
     try {
+      const context = getOptimizeContext?.() ?? "";
       const res = await api.post<{ text: string }>(
         "prompt/optimize",
-        { text: value },
-        { timeout: false },
+        { text: value, context },
+        { timeout: 60_000 },
       );
       const optimized = String(res.text ?? "").trim();
       if (!optimized) {
-        toast.error("优化结果为空");
+        toast.error("优化结果为空,请重试或更换优化模型");
         return;
       }
       onValueChange(optimized);
@@ -535,11 +546,21 @@ function ChatInputInner({
         },
       });
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "提示词优化失败");
+      // 区分超时和其他错误,给更可操作的提示。AbortError/TimeoutError 是 ky 超时抛的。
+      const isTimeout = err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError");
+      toast.error(
+        isTimeout
+          ? "优化超时,请稍后重试或检查优化模型是否可用"
+          : err instanceof Error
+            ? err.message
+            : "提示词优化失败",
+      );
     } finally {
+      clearTimeout(slowTimer);
+      setOptimizeHint(null);
       setOptimizing(false);
     }
-  }, [value, optimizing, onValueChange]);
+  }, [value, optimizing, onValueChange, getOptimizeContext]);
 
   const handleTextChange = React.useCallback(
     (event: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -1114,6 +1135,9 @@ function ChatInputInner({
         </p>
         {error ? (
           <p className="mt-1 text-center text-xs text-destructive">{error}</p>
+        ) : null}
+        {optimizeHint ? (
+          <p className="mt-1 animate-pulse text-center text-xs text-muted-foreground">{optimizeHint}</p>
         ) : null}
       </div>
     </div>

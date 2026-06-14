@@ -1206,6 +1206,27 @@ function ConversationsPageInner() {
     setCompressDialogOpen(true);
   }, [activeId]);
 
+  // 提示词优化时提取最近 3 轮对话(6 条消息)的纯文本,让优化模型理解"那个""上次的"等指代。
+  // 只取 text part —— 图片(image)、文件(document)、工具调用(tool)、思维链(reasoning)全部被
+  // filter 排除,不会发给优化模型。截断到 4000 字符避免吃掉 token 预算。首条消息时返回空。
+  const getOptimizeContext = React.useCallback((): string => {
+    if (selectedNodeMessages.length === 0) return "";
+    const recent = selectedNodeMessages.slice(-6);
+    const lines: string[] = [];
+    for (const { message } of recent) {
+      if (!message) continue;
+      if (message.role !== "USER" && message.role !== "ASSISTANT") continue;
+      const text = message.parts
+        .filter((p) => p.type === "text")
+        .map((p) => String((p as { text?: string }).text ?? ""))
+        .join("")
+        .trim();
+      if (!text) continue;
+      lines.push(`${message.role === "USER" ? "用户" : "助手"}: ${text}`);
+    }
+    return lines.join("\n\n").slice(0, 4000);
+  }, [selectedNodeMessages]);
+
   const handleConfirmCompressConversation = React.useCallback(async () => {
     if (!activeId) return;
     setCompressing(true);
@@ -1351,6 +1372,7 @@ function ConversationsPageInner() {
               : undefined
           }
           onCompressConversation={detail && detail.messages.length > 0 ? handleCompressConversation : undefined}
+          getOptimizeContext={getOptimizeContext}
         />
       </div>
     </div>
