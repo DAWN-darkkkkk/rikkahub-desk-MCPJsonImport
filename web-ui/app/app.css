@@ -23,6 +23,9 @@
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
   --ring: oklch(0.708 0 0);
+  /* 板块分界线专用:比 --border 更淡,用于侧边栏边界、正文顶栏下沿等"区域分隔",
+     让大区块之间的界线退到背景里,不抢视觉。输入框/卡片等仍用 --border。 */
+  --divider: oklch(0.95 0 0);
   --chart-1: oklch(0.81 0.1 252);
   --chart-2: oklch(0.62 0.19 260);
   --chart-3: oklch(0.55 0.22 263);
@@ -83,6 +86,7 @@
   --border: oklch(0.275 0 0);
   --input: oklch(0.325 0 0);
   --ring: oklch(0.556 0 0);
+  --divider: oklch(0.245 0 0);
   --chart-1: oklch(0.81 0.1 252);
   --chart-2: oklch(0.62 0.19 260);
   --chart-3: oklch(0.55 0.22 263);
@@ -606,6 +610,7 @@
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
   --color-border: var(--border);
+  --color-divider: var(--divider);
   --color-input: var(--input);
   --color-ring: var(--ring);
   --color-chart-1: var(--chart-1);

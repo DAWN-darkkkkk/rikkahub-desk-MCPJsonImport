@@ -432,6 +432,19 @@ function defaultPathForKind(kind: ProviderKind, responseApi = false): string {
   return "/models/{model}:generateContent";
 }
 
+// 预置供应商的"获取 API Key"官网映射。按 baseUrl 子串匹配(大小写无关)。
+// 供应商表单的 API Key 标签旁,命中即显示一个靠右的"获取 API Key"链接,跳转官网。
+// 新增预置供应商时只需在这里加一行 { 子串: 官网 URL }。
+const PROVIDER_GET_KEY_URLS: Array<{ match: RegExp; url: string }> = [
+  { match: /naapi\.cc/i, url: "https://naapi.cc/" },
+];
+function providerGetKeyUrl(baseUrl: string): string | null {
+  for (const entry of PROVIDER_GET_KEY_URLS) {
+    if (entry.match.test(baseUrl)) return entry.url;
+  }
+  return null;
+}
+
 function endpointPreview(provider: ProviderProfile): string {
   const kind = providerKind(provider) as ProviderKind;
   const base = textValue(provider.baseUrl).replace(/\/+$/, "");
@@ -575,9 +588,10 @@ export default function SettingsPage() {
 
   return (
     <div className="flex h-svh overflow-hidden bg-background">
-      <aside className="flex w-64 flex-col border-r bg-sidebar text-sidebar-foreground">
-        {/* pt-9 让出沉浸式标题栏高度,标题栏透明后内容仍顶到窗口顶但不会被盖住。 */}
-        <div className="flex items-center gap-2 border-b px-4 pb-3 pt-9">
+      <aside className="flex w-64 flex-col border-r border-divider bg-sidebar text-sidebar-foreground">
+        {/* pt-9 让出沉浸式标题栏高度,标题栏透明后内容仍顶到窗口顶但不会被盖住。
+            border-divider:用比 --border 更淡的分界色,让区域分隔退到背景里。 */}
+        <div className="flex items-center gap-2 border-b border-divider px-4 pb-3 pt-9">
           <Button asChild size="icon-sm" variant="ghost">
             <Link to="/">
               <ArrowLeft className="size-4" />
@@ -1296,12 +1310,12 @@ function ProvidersSection({ settings, onSettings }: { settings: Settings; onSett
             <label className="space-y-2 md:col-span-2">
               <div className="flex items-center gap-2">
                 <span className="text-sm font-medium">API Key</span>
-                {/naapi\.cc/i.test(textValue(draft.baseUrl)) ? (
+                {providerGetKeyUrl(textValue(draft.baseUrl)) ? (
                   <button
                     type="button"
-                    onClick={() => void openExternal("https://naapi.cc/")}
-                    className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
-                    title="前往钠 API 官网获取 API Key"
+                    onClick={() => void openExternal(providerGetKeyUrl(textValue(draft.baseUrl))!)}
+                    className="ml-auto inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                    title="前往官网获取 API Key"
                   >
                     <ExternalLink className="size-3" />
                     获取 API Key
