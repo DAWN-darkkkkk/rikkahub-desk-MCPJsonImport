@@ -52,10 +52,35 @@ const GENERIC_FONTS: GenericFontOption[] = [
 
 const FONT_ACCEPT = ".ttf,.otf,.woff,.woff2,.ttc";
 
+// 把中文字体插入英文字体 family 链(插在主字体之后)。与 root.tsx 的 mergeCjkIntoFamily 保持一致。
+function mergeCjkIntoFamily(enFamily: string, cjkFamily: string): string {
+  if (!cjkFamily.trim()) return enFamily.trim();
+  const en = enFamily.trim();
+  if (!en) return cjkFamily.trim();
+  const idx = en.indexOf(",");
+  return idx < 0 ? `${en}, ${cjkFamily}` : `${en.slice(0, idx)}, ${cjkFamily}${en.slice(idx)}`;
+}
+
 // 宽松匹配:容忍老版本存下来的 value(可能是 family 名、cssName 或旧 id)。
 function entryMatches(entry: { id: string; label: string; cssName?: string }, value: string): boolean {
   if (!value) return false;
   return entry.id === value || entry.label === value || (entry.cssName != null && entry.cssName === value);
+}
+
+// 由当前选中的 value(可能是 id / cssName / 旧 family 名)解析出实际 CSS family 链。
+// 未命中任何字体 → 返回 fallback。供 FontPickerPair 的预览复用。
+function resolveFamilyForValue(
+  value: string,
+  catalog: { builtin: FontEntry[]; custom: FontEntry[]; system: FontEntry[] } | undefined,
+  fallbackFamily: string,
+): string {
+  const generic = GENERIC_FONTS.find((g) => entryMatches(g, value));
+  if (generic) return generic.family || fallbackFamily;
+  if (catalog) {
+    const entry = [...catalog.builtin, ...catalog.custom, ...catalog.system].find((e) => entryMatches(e, value));
+    if (entry) return entry.family;
+  }
+  return fallbackFamily;
 }
 
 interface FontPickerProps {
@@ -63,9 +88,11 @@ interface FontPickerProps {
   value: string;
   fallbackFamily: string;
   onChange: (value: string, family: string) => void;
+  /** 单选器是否自带单行预览。被 FontPickerPair 包裹时设 false,预览由 Pair 统一渲染。 */
+  showPreview?: boolean;
 }
 
-export function FontPicker({ label, value, fallbackFamily, onChange }: FontPickerProps) {
+export function FontPicker({ label, value, fallbackFamily, onChange, showPreview = true }: FontPickerProps) {
   const { data, isLoading } = useFontCatalog();
   const invalidate = useInvalidateFontCatalog();
   const [open, setOpen] = React.useState(false);
@@ -224,9 +251,11 @@ export function FontPicker({ label, value, fallbackFamily, onChange }: FontPicke
         </PopoverContent>
       </Popover>
 
-      <div className="rounded-md border bg-muted/30 px-3 py-2 text-sm" style={{ fontFamily: previewFamily }}>
-        RikkaHub 字体预览：你好，Hello 123
-      </div>
+      {showPreview && (
+        <div className="rounded-md border bg-muted/30 px-3 py-2 text-sm" style={{ fontFamily: previewFamily }}>
+          RikkaHub 字体预览：你好，Hello 123
+        </div>
+      )}
 
       <FontManagerDialog open={managerOpen} onClose={() => setManagerOpen(false)} onChanged={invalidate} />
     </div>
@@ -338,5 +367,48 @@ export function FontManagerDialog({ open, onClose, onChanged }: FontManagerDialo
         </div>
       </DialogContent>
     </Dialog>
+  );
+}
+
+// 中英文分别设置(Word 式):英文字体 + 中文字体双栏,中文可选;下方分项预览。
+// 预览三行:纯英文(用英文字体)、纯中文(用合并链,没设中文时回退)、中英混排(真实场景)。
+interface FontPickerPairProps {
+  label: string;
+  enValue: string;
+  cjkValue: string;
+  fallbackFamily: string;
+  onChangeEn: (value: string, family: string) => void;
+  onChangeCjk: (value: string, family: string) => void;
+}
+
+export function FontPickerPair({ label, enValue, cjkValue, fallbackFamily, onChangeEn, onChangeCjk }: FontPickerPairProps) {
+  const { data } = useFontCatalog();
+  const enFamily = resolveFamilyForValue(enValue, data, fallbackFamily);
+  const cjkFamily = resolveFamilyForValue(cjkValue, data, "");
+  // 合并链(供混排行和中文行):英文主字体 + 中文字体 + 兜底。与 root.tsx 的合并逻辑一致。
+  const merged = mergeCjkIntoFamily(enFamily, cjkFamily);
+  // 中文行:有中文字体时用合并链(英文部分会回退,但中文行内容是纯中文,实际渲染中文字体);
+  // 没设中文字体时,中文行用合并链=纯英文链,中文字形落到兜底——真实反映"不分开"的效果。
+  const previewRows = [
+    { tag: "英文", text: "The quick brown fox jumps 0123456789", family: enFamily },
+    { tag: "中文", text: "你好,世界。春江潮水连海平,海上明月共潮生。", family: merged },
+    { tag: "混排", text: "Hello 你好,这是 RikkaHub 2026 年的测试 Test 测试。", family: merged },
+  ];
+  return (
+    <div className="block space-y-2">
+      <span className="text-sm font-medium">{label}</span>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <FontPicker label="英文" value={enValue} fallbackFamily={fallbackFamily} onChange={onChangeEn} showPreview={false} />
+        <FontPicker label="中文" value={cjkValue} fallbackFamily="" onChange={onChangeCjk} showPreview={false} />
+      </div>
+      <div className="space-y-1 rounded-md border bg-muted/30 px-3 py-2">
+        {previewRows.map((row) => (
+          <div key={row.tag} className="flex items-baseline gap-2 text-sm">
+            <span className="w-8 shrink-0 text-[11px] text-muted-foreground">{row.tag}</span>
+            <span style={{ fontFamily: row.family }} className="min-w-0 truncate">{row.text}</span>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }

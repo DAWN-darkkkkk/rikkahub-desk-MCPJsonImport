@@ -74,16 +74,42 @@ function SilentUpdateChecker() {
   );
 }
 
+// 把中文字体插入英文字体 family 链:插在主字体之后、其余 fallback 之前。
+// '"HarmonyOS Sans", system-ui, sans-serif' + '"思源宋体", serif'
+//   → '"HarmonyOS Sans", "思源宋体", serif, system-ui, sans-serif'
+// 思路:英文字体通常只有一个主字体(在链首),其余是 generic 兜底。把中文字体族插在
+// 链首之后,既保证英文字形优先用英文字体,又让中文字形在落到 generic 兜底前先尝试中文字体。
+// 中文字体族自带的 fallback(如 "思源宋体", serif)原样保留在中间。
+// 没设中文字体(cjk 空)→ 返回原始 family,行为同前。
+function mergeCjkIntoFamily(enFamily: string, cjkFamily: string): string {
+  if (!cjkFamily.trim()) return enFamily.trim();
+  const en = enFamily.trim();
+  if (!en) return cjkFamily.trim();
+  const idx = en.indexOf(",");
+  return idx < 0 ? `${en}, ${cjkFamily}` : `${en.slice(0, idx)}, ${cjkFamily}${en.slice(idx)}`;
+}
+
 function AppContent() {
   useSettingsSubscription();
   const displaySetting = useSettingsStore((state) => state.settings?.displaySetting);
   React.useEffect(() => {
     if (typeof document === "undefined") return;
-    const uiFont = String(displaySetting?.uiFontFamilyCss ?? displaySetting?.uiFontFamily ?? "").trim();
-    const chatFont = String(displaySetting?.chatFontFamilyCss ?? displaySetting?.chatFontFamily ?? "").trim();
-    document.body.style.setProperty("--rikkahub-ui-font", uiFont || "\"Noto Sans SC\", \"Microsoft YaHei\", var(--font-sans)");
-    document.body.style.setProperty("--rikkahub-chat-font", chatFont || "inherit");
-  }, [displaySetting?.chatFontFamily, displaySetting?.chatFontFamilyCss, displaySetting?.uiFontFamily, displaySetting?.uiFontFamilyCss]);
+    // 中英文分别设置(Word 式):把中文字体插到英文字体 family 链的"主字体之后、兜底之前"。
+    // 效果:英文字形用英文字体,中文字形英文字体没有 → 落到中文字体,再落到兜底。
+    // 没设中文字体时 cjkInsert 为空,拼接退化为纯英文链,行为同前(向后兼容)。
+    const uiEn = String(displaySetting?.uiFontFamilyCss ?? displaySetting?.uiFontFamily ?? "").trim();
+    const chatEn = String(displaySetting?.chatFontFamilyCss ?? displaySetting?.chatFontFamily ?? "").trim();
+    const uiCjk = String(displaySetting?.uiFontFamilyCjkCss ?? "").trim();
+    const chatCjk = String(displaySetting?.chatFontFamilyCjkCss ?? "").trim();
+    const uiFont = mergeCjkIntoFamily(uiEn, uiCjk) || "\"Noto Sans SC\", \"Microsoft YaHei\", var(--font-sans)";
+    const chatFont = mergeCjkIntoFamily(chatEn, chatCjk) || "inherit";
+    document.body.style.setProperty("--rikkahub-ui-font", uiFont);
+    document.body.style.setProperty("--rikkahub-chat-font", chatFont);
+  }, [
+    displaySetting?.chatFontFamily, displaySetting?.chatFontFamilyCss,
+    displaySetting?.uiFontFamily, displaySetting?.uiFontFamilyCss,
+    displaySetting?.uiFontFamilyCjkCss, displaySetting?.chatFontFamilyCjkCss,
+  ]);
 
   // Tauri's WebView2 swallows `window.open` and ignores `<a target="_blank">` by default —
   // links to external pages would do nothing. Intercept every left-click on an anchor that

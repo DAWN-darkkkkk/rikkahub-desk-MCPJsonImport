@@ -39,7 +39,7 @@ import { Link } from "react-router";
 import { toast } from "sonner";
 
 import { AvatarCropper } from "~/components/avatar-cropper";
-import { FontPicker } from "~/components/font-picker";
+import { FontPickerPair } from "~/components/font-picker";
 import { AIIcon } from "~/components/ui/ai-icon";
 import { Button } from "~/components/ui/button";
 import { Checkbox } from "~/components/ui/checkbox";
@@ -747,17 +747,21 @@ function GeneralSection({ settings, onSettings }: { settings: Settings; onSettin
             />
           </label>
           <div className="grid gap-3 md:grid-cols-2">
-            <FontPicker
+            <FontPickerPair
               label="界面字体"
-              value={textValue(display.uiFontFamily)}
+              enValue={textValue(display.uiFontFamily)}
+              cjkValue={textValue(display.uiFontFamilyCjk)}
               fallbackFamily={"\"Noto Sans SC\", \"Microsoft YaHei\", ui-sans-serif, system-ui, sans-serif"}
-              onChange={(value, family) => void patchDisplay({ uiFontFamily: value, uiFontFamilyCss: family })}
+              onChangeEn={(value, family) => void patchDisplay({ uiFontFamily: value, uiFontFamilyCss: family })}
+              onChangeCjk={(value, family) => void patchDisplay({ uiFontFamilyCjk: value, uiFontFamilyCjkCss: family })}
             />
-            <FontPicker
+            <FontPickerPair
               label="对话字体"
-              value={textValue(display.chatFontFamily)}
+              enValue={textValue(display.chatFontFamily)}
+              cjkValue={textValue(display.chatFontFamilyCjk)}
               fallbackFamily={textValue(display.uiFontFamilyCss) || "\"Noto Sans SC\", \"Microsoft YaHei\", ui-sans-serif, system-ui, sans-serif"}
-              onChange={(value, family) => void patchDisplay({ chatFontFamily: value, chatFontFamilyCss: family })}
+              onChangeEn={(value, family) => void patchDisplay({ chatFontFamily: value, chatFontFamilyCss: family })}
+              onChangeCjk={(value, family) => void patchDisplay({ chatFontFamilyCjk: value, chatFontFamilyCjkCss: family })}
             />
           </div>
           <div className="grid gap-3 md:grid-cols-2">

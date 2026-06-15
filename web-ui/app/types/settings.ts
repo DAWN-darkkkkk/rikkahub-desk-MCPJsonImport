@@ -21,6 +21,12 @@ export interface DisplaySetting {
   chatFontFamily?: string;
   uiFontFamilyCss?: string;
   chatFontFamilyCss?: string;
+  // 中英文分别设置(Word 式):中文栏可选,为空则中文走英文字体的 fallback 链。
+  // 字段透传字符串,后端 normalize 不需感知;老数据无这些字段 = 不分开,行为同前。
+  uiFontFamilyCjk?: string;
+  uiFontFamilyCjkCss?: string;
+  chatFontFamilyCjk?: string;
+  chatFontFamilyCjkCss?: string;
   pasteLongTextAsFile: boolean;
   pasteLongTextThreshold: number;
   /** User-resizable chat input min-height in px (null = default). PC-only. */
