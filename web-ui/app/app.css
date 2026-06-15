@@ -779,27 +779,20 @@
   pointer-events: none;
 }
 
-/* When running inside the Tauri shell the TitleBar absolutely overlays the top 36px of
-   the viewport. Pages that pin to `h-svh` / `h-screen` would otherwise extend under the
-   bar (covering the conversation page's avatar, for example) — shrink those utilities so
-   layouts fit between the bar and the viewport bottom. The selector relies on the data
-   attribute the TitleBar component sets, so this is a no-op in a regular browser. */
-:root:has([data-tauri-drag-region]) body {
+/* 沉浸式标题栏:TitleBar 是浮在窗口顶部的透明拖拽层(z-50, 高 36px),不再往下推
+   内容——侧边栏和正文都顶到窗口最顶端(y=0),让各自的背景色从底到顶连续不断。
+   代价:标题栏那 36px 会盖住侧边栏顶部和正文顶部的一截。所以给两者的顶部内边距
+   各加 36px,让实际内容(用户按钮 / 顶栏)落在标题栏下方,不被遮挡,同时背景色仍顶到顶。 */
+:root:has([data-tauri-drag-region]) [data-slot="sidebar-header"] {
   padding-top: 2.25rem;
 }
 :root:has([data-tauri-drag-region]) .h-screen,
 :root:has([data-tauri-drag-region]) .h-svh {
-  height: calc(100svh - 2.25rem);
+  height: 100svh;
 }
 :root:has([data-tauri-drag-region]) .min-h-screen,
 :root:has([data-tauri-drag-region]) .min-h-svh {
-  min-height: calc(100svh - 2.25rem);
+  min-height: 100svh;
 }
-/* shadcn `Sidebar` mounts as a `fixed inset-y-0 h-svh` element so it anchors to the
-   viewport edges, bypassing the body padding above. Snap its top down by 36px and
-   shorten its height by the same amount so it tucks under the titlebar instead of
-   under-running the bottom of the window. */
-:root:has([data-tauri-drag-region]) [data-slot="sidebar-container"] {
-  top: 2.25rem;
-  height: calc(100svh - 2.25rem);
-}
+/* shadcn `Sidebar` 挂成 fixed inset-y-0,默认顶到 viewport 边——正是我们要的(顶到窗口顶)。
+   不再像之前那样把它往下 snap 36px。 */

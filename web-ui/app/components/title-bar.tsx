@@ -113,7 +113,11 @@ export function TitleBar({ className }: { className?: string }) {
       onMouseDown={handleDragMouseDown}
       onDoubleClick={handleDragDoubleClick}
       className={cn(
-        "fixed inset-x-0 top-0 z-50 flex h-9 select-none items-center justify-between border-b border-border/40 bg-background/70 backdrop-blur supports-[backdrop-filter]:bg-background/50",
+        // 沉浸式:不画背景、不留边框。窗口按钮和"Rikkahub"文字只是浮在透明拖拽区上,
+        // 让 Mica 云母背景(或纯背景色)从窗口顶到底连续不断,没有灰条和接缝。
+        // 内容区由 app.css 的 padding-top:2.25rem 往下让出 36px,所以这里下面是空的,
+        // 无需毛玻璃(原来 bg-background/70 + backdrop-blur 就是制造"磨砂条"观感的元凶)。
+        "fixed inset-x-0 top-0 z-50 flex h-9 select-none items-center justify-between",
         className,
       )}
     >

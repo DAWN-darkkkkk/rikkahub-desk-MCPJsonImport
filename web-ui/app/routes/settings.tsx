@@ -576,7 +576,8 @@ export default function SettingsPage() {
   return (
     <div className="flex h-svh overflow-hidden bg-background">
       <aside className="flex w-64 flex-col border-r bg-sidebar text-sidebar-foreground">
-        <div className="flex items-center gap-2 border-b px-4 py-3">
+        {/* pt-9 让出沉浸式标题栏高度,标题栏透明后内容仍顶到窗口顶但不会被盖住。 */}
+        <div className="flex items-center gap-2 border-b px-4 pb-3 pt-9">
           <Button asChild size="icon-sm" variant="ghost">
             <Link to="/">
               <ArrowLeft className="size-4" />

@@ -1406,7 +1406,9 @@ function ConversationsPageInner() {
         webAuthEnabled={settings?.webServerJwtEnabled === true}
       />
       <SidebarInset className="flex min-h-svh flex-col overflow-hidden">
-        <div className="flex items-center gap-2 border-b px-4 py-3">
+        {/* pt-9 (36px) 让出沉浸式标题栏的高度,避免 SidebarTrigger / 标题被透明标题栏盖住。
+            背景色仍由 SidebarInset 继承(--background),顶到窗口顶,和透明标题栏无缝衔接。 */}
+        <div className="flex items-center gap-2 border-b px-4 pb-3 pt-9">
           <SidebarTrigger />
           <div className="min-w-0 flex-1">
             <div className="truncate text-sm text-muted-foreground">
