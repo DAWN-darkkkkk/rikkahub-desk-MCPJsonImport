@@ -165,6 +165,9 @@ interface Settings {
   compressModelId: string;
   // 模型 ID,用于对话界面"优化提示词"按钮。空串 = 未配置(按钮会提示去设置页配置)。
   promptOptimizeModelId: string;
+  // "优化提示词"按钮使用的 meta-prompt。用户可在「设置 - 默认模型与提示词」编辑;
+  // 空串 = 用 DEFAULT_PROMPT_OPTIMIZE_PROMPT 默认模板。
+  promptOptimizePrompt: string;
   translateThinkingBudget?: number;
   titlePrompt: string;
   translatePrompt: string;
@@ -561,7 +564,7 @@ function startAnalytics(): void {
 // MUST be kept in sync with web-ui/src-tauri/tauri.conf.json's `version` field. The update
 // checker compares this against the latest GitHub release tag and the version is also shown
 // verbatim in the About page. If you bump tauri.conf.json's version, bump this too.
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.1.1";
 
 type GithubRelease = {
   tag_name?: string;
@@ -944,6 +947,7 @@ function defaultSettings(): Settings {
     ocrModelId: "",
     compressModelId: DEFAULT_AUTO_MODEL_ID,
     promptOptimizeModelId: "",
+    promptOptimizePrompt: DEFAULT_PROMPT_OPTIMIZE_PROMPT,
     titlePrompt: DEFAULT_TITLE_PROMPT,
     translatePrompt: DEFAULT_TRANSLATION_PROMPT,
     suggestionPrompt: DEFAULT_SUGGESTION_PROMPT,
@@ -1107,6 +1111,7 @@ function normalizeState(input: Partial<State>): State {
   normalized.settings.suggestionPrompt = normalized.settings.suggestionPrompt || DEFAULT_SUGGESTION_PROMPT;
   normalized.settings.ocrPrompt = normalized.settings.ocrPrompt || DEFAULT_OCR_PROMPT;
   normalized.settings.compressPrompt = normalized.settings.compressPrompt || DEFAULT_COMPRESS_PROMPT;
+  normalized.settings.promptOptimizePrompt = normalized.settings.promptOptimizePrompt || DEFAULT_PROMPT_OPTIMIZE_PROMPT;
   normalized.settings.titlePrompt = normalized.settings.titlePrompt.replace(/not exceed 10 characters/gi, "not exceed 15 characters");
   normalized.settings.suggestionPrompt = normalized.settings.suggestionPrompt.replace(/not exceed 10 characters/gi, "not exceed 18 characters");
   // Backfill REASONING ability for previously-saved models (e.g. claude-opus-4-6) whose
@@ -13529,6 +13534,7 @@ async function routeApi(request: Request, url: URL) {
       ocrModelId: String(body.ocrModelId ?? state.settings.ocrModelId),
       compressModelId: String(body.compressModelId ?? state.settings.compressModelId),
       promptOptimizeModelId: String(body.promptOptimizeModelId ?? state.settings.promptOptimizeModelId ?? ""),
+      promptOptimizePrompt: String(body.promptOptimizePrompt ?? state.settings.promptOptimizePrompt ?? DEFAULT_PROMPT_OPTIMIZE_PROMPT),
       titlePrompt: String(body.titlePrompt ?? state.settings.titlePrompt ?? DEFAULT_TITLE_PROMPT),
       translatePrompt: String(body.translatePrompt ?? state.settings.translatePrompt ?? DEFAULT_TRANSLATION_PROMPT),
       suggestionPrompt: String(body.suggestionPrompt ?? state.settings.suggestionPrompt ?? DEFAULT_SUGGESTION_PROMPT),
@@ -13754,7 +13760,7 @@ async function routeApi(request: Request, url: URL) {
       return error("未配置提示词优化模型,请在「设置 - 默认模型与提示词」中指定一个模型", 400);
     }
     const context = String(body.context ?? "").trim();
-    let prompt = DEFAULT_PROMPT_OPTIMIZE_PROMPT;
+    let prompt = String(state.settings.promptOptimizePrompt ?? "").trim() || DEFAULT_PROMPT_OPTIMIZE_PROMPT;
     if (context) {
       // 条件式上下文:明确告诉模型"只在提示词承接对话时才用,否则忽略",防止无关背景
       // 污染独立提示词。同时禁止把背景内容写进优化结果(防止泄漏/跑题)。

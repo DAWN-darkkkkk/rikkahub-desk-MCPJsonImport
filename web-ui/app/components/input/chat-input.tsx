@@ -13,6 +13,7 @@ import {
   Send,
   Sparkles,
   Square,
+  Undo2,
   Video,
   X,
   Zap,
@@ -367,11 +368,13 @@ function ChatInputInner({
   const asrFrameSamplesRef = React.useRef(0);
   const dragDepthRef = React.useRef(0);
   // 提示词优化:点击后把输入框原文发给"提示词优化模型",返回的优化版直接替换输入框。
-  // originalRef 保留原文几秒,供"撤销"toast 一键恢复(优化结果不满意时不丢原文)。
-  // optimizeHint:超过 8s 还在转时显示"模型响应较慢",让用户知道不是卡死了(配合 60s 超时)。
+  // 优化成功后在优化按钮旁显示常驻"撤销"按钮(不走 toast —— toast 几秒就消失,用户来不及点
+  // 或事后想反悔就没机会了)。originalBeforeOptimize 保存原文,点撤销即恢复;重新优化 / 发送
+  // 消息时清空。optimizeHint:超过 8s 还在转时以小字内嵌在优化按钮旁显示"模型响应较慢"
+  // (原方案放页面底部会把整个输入区往下挤,破坏布局)。
   const [optimizing, setOptimizing] = React.useState(false);
   const [optimizeHint, setOptimizeHint] = React.useState<string | null>(null);
-  const originalBeforeOptimizeRef = React.useRef<string | null>(null);
+  const [originalBeforeOptimize, setOriginalBeforeOptimize] = React.useState<string | null>(null);
 
   const isEmpty = value.trim().length === 0 && attachments.length === 0;
 
@@ -498,6 +501,7 @@ function ChatInputInner({
       }
 
       if (canSend) {
+        setOriginalBeforeOptimize(null);
         await onSend();
       }
     } catch (submitError) {
@@ -532,19 +536,8 @@ function ChatInputInner({
         return;
       }
       onValueChange(optimized);
-      originalBeforeOptimizeRef.current = original;
-      toast.success("已优化提示词", {
-        duration: 8000,
-        action: {
-          label: "撤销",
-          onClick: () => {
-            if (originalBeforeOptimizeRef.current !== null) {
-              onValueChange(originalBeforeOptimizeRef.current);
-              originalBeforeOptimizeRef.current = null;
-            }
-          },
-        },
-      });
+      setOriginalBeforeOptimize(original);
+      toast.success("已优化提示词");
     } catch (err) {
       // 区分超时和其他错误,给更可操作的提示。AbortError/TimeoutError 是 ky 超时抛的。
       const isTimeout = err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError");
@@ -568,8 +561,12 @@ function ChatInputInner({
       if (error) {
         setError(null);
       }
+      // 用户开始编辑后,撤销入口就不再有意义(原文已和当前内容脱节)——收起撤销按钮。
+      if (originalBeforeOptimize !== null) {
+        setOriginalBeforeOptimize(null);
+      }
     },
-    [error, onValueChange],
+    [error, onValueChange, originalBeforeOptimize],
   );
 
   const handleQuickMessageSelect = React.useCallback(
@@ -1094,40 +1091,64 @@ function ChatInputInner({
                 {asrListening ? <LoaderCircle className="size-4 animate-spin" /> : <Mic className="size-4" />}
               </Button>
             </div>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              disabled={isEmpty || optimizing || isGenerating || disabled}
-              onClick={() => {
-                void handleOptimize();
-              }}
-              className="size-8 rounded-full text-muted-foreground hover:text-foreground"
-              title="优化提示词"
-            >
-              {optimizing ? <LoaderCircle className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
-            </Button>
-            <Button
-              onClick={() => {
-                void handlePrimaryAction();
-              }}
-              disabled={actionDisabled}
-              size="icon"
-              className={cn(
-                "size-9 rounded-full shadow-sm",
-                isGenerating && !submitting
-                  ? "bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                  : "bg-primary text-primary-foreground hover:bg-primary/90",
-              )}
-            >
-              {submitting || uploading ? (
-                <LoaderCircle className="size-4 animate-spin" />
-              ) : isGenerating ? (
-                <Square className="size-4" />
-              ) : (
-                <ArrowUp className="size-4" />
-              )}
-            </Button>
+            <div className="relative flex items-center gap-1.5">
+              {/* 优化较慢提示:浮在按钮组上方,绝对定位不挤占布局(原方案放底部会把整个输入区往下顶)。 */}
+              {optimizeHint ? (
+                <span className="animate-pulse absolute -top-8 right-0 z-10 whitespace-nowrap rounded-md border bg-popover px-2 py-1 text-[11px] text-muted-foreground shadow-sm">
+                  {optimizeHint}
+                </span>
+              ) : null}
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                disabled={isEmpty || optimizing || isGenerating || disabled}
+                onClick={() => {
+                  void handleOptimize();
+                }}
+                className="size-8 rounded-full text-muted-foreground hover:text-foreground"
+                title="优化提示词"
+              >
+                {optimizing ? <LoaderCircle className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
+              </Button>
+              {originalBeforeOptimize !== null ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
+                  title="撤销本次优化,恢复原文"
+                  onClick={() => {
+                    onValueChange(originalBeforeOptimize);
+                    setOriginalBeforeOptimize(null);
+                  }}
+                >
+                  <Undo2 className="size-3.5" />
+                  撤销
+                </Button>
+              ) : null}
+              <Button
+                onClick={() => {
+                  void handlePrimaryAction();
+                }}
+                disabled={actionDisabled}
+                size="icon"
+                className={cn(
+                  "size-9 rounded-full shadow-sm",
+                  isGenerating && !submitting
+                    ? "bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                    : "bg-primary text-primary-foreground hover:bg-primary/90",
+                )}
+              >
+                {submitting || uploading ? (
+                  <LoaderCircle className="size-4 animate-spin" />
+                ) : isGenerating ? (
+                  <Square className="size-4" />
+                ) : (
+                  <ArrowUp className="size-4" />
+                )}
+              </Button>
+            </div>
           </div>
         </div>
         <p className="mt-2 text-center text-xs text-muted-foreground">
@@ -1135,9 +1156,6 @@ function ChatInputInner({
         </p>
         {error ? (
           <p className="mt-1 text-center text-xs text-destructive">{error}</p>
-        ) : null}
-        {optimizeHint ? (
-          <p className="mt-1 animate-pulse text-center text-xs text-muted-foreground">{optimizeHint}</p>
         ) : null}
       </div>
     </div>

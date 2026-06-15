@@ -272,6 +272,8 @@ export interface Settings {
   compressModelId?: string;
   /** 模型 ID,用于对话界面"优化提示词"按钮。空串 = 未配置。 */
   promptOptimizeModelId?: string;
+  /** "优化提示词"按钮使用的 meta-prompt。空串 = 用默认模板。 */
+  promptOptimizePrompt?: string;
   titlePrompt?: string;
   translatePrompt?: string;
   suggestionPrompt?: string;

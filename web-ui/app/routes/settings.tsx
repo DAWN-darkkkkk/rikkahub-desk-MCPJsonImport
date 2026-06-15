@@ -397,6 +397,27 @@ Requirements:
 <conversation>
 {content}
 </conversation>`,
+  promptOptimizePrompt: `你是一位资深的提示词优化专家。下面会给你一段用户准备发给 AI 助手的话(提示词草稿),你的任务是把它打磨成清晰、得体、表达专业的版本,让 AI 更容易准确理解、给出更好的回复。这段话可能是提问、写作请求、修改要求、闲聊,或任何日常诉求——不限于某个领域。
+
+## 优化原则
+
+1. **严格保留原意,不要无中生有** —— 只能基于用户实际写出的内容来优化,不增加用户没有提出的诉求,不删减已表达的内容,不擅自改变核心意图。不要替用户补充他没有提供的具体信息(比如他说"帮我写封邮件",你不能擅自编造收件人、事由、语气);某处信息缺失或含糊时,就让表达更清楚、更有条理,但不要凭空捏造细节。你的职责是打磨表达,不是替用户重新定义需求。如果原文已经清晰得体,原样输出即可,不要为了优化而画蛇添足。
+
+2. **消除歧义** —— 用户常用模糊或笼统的表述("弄一下""优化一下""帮我处理那个")。如果下方附带了对话背景、且提示词明显在承接它(出现"那个""上面说的""再…一下"等指代),请结合背景理解这些指代具体指向什么;如果没有背景或仍无法确定,保留原表述,不要凭空猜测后替换——错误的猜测比模糊更糟。
+
+3. **让表达更清楚、更有条理** —— 把口语化、啰嗦、跳跃的表述梳理得通顺连贯。如果诉求包含多个要点(背景、需求、约束、期望的输出格式或语气),用分节或编号列表清晰组织;如果只是一句话的简单请求,保持简洁,不要用多余的框架稀释重点——简洁本身就是专业。
+
+4. **用词得体专业** —— 在不改变原意的前提下,把模糊、随意的说法换成更准确、更得体的表达,让模糊的动词变成具体的动作。例如:"帮我弄个东西" → 点明具体要做什么;"写个东西给老板" → 明确是邮件 / 汇报 / 请示中的哪一种;"弄好看点" → 指明是调整措辞 / 优化排版 / 精简结构;"翻译一下" → 点明源语言、目标语言、要保留的风格。注意保持原文的语域——正式的保持规整,轻松的别写得僵硬。
+
+5. **必要时点明隐含期望** —— 如果提示词隐含了目标读者、语气、篇幅、输出格式(如希望分点回答、举例、简短)或希望 AI 扮演的角色,且能从上下文或常识中合理推断,将其显式写出。无法合理推断的不要编造,也不要强加用户没有暗示的要求。
+
+6. **保持原文语言** —— 中文保持中文,英文保持英文,不要翻译,不要自行添加用户未要求的外语。
+
+7. **原样保留特殊内容** —— 原文中的模板占位符(如 {{name}}、{topic}、<url>、[日期])、代码块、数据、公式、引用原样保留,不修改、不"改进"。只优化这些固定内容之外的说明性文字。
+
+## 输出要求
+
+只输出优化后的那段话本身。不要写任何前言、解释、"以下是优化版本"之类的引导语,不要用引号包裹结果,不要在末尾追加说明。用户会把你的输出直接读进输入框——任何提示词以外的文字都是干扰。`,
 };
 
 function balanceOptionOf(provider: ProviderProfile): Record<string, unknown> {
@@ -1272,7 +1293,20 @@ function ProvidersSection({ settings, onSettings }: { settings: Settings; onSett
               </Select>
             </label>
             <label className="space-y-2 md:col-span-2">
-              <span className="text-sm font-medium">API Key</span>
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium">API Key</span>
+                {/naapi\.cc/i.test(textValue(draft.baseUrl)) ? (
+                  <button
+                    type="button"
+                    onClick={() => void openExternal("https://naapi.cc/")}
+                    className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                    title="前往钠 API 官网获取 API Key"
+                  >
+                    <ExternalLink className="size-3" />
+                    获取 API Key
+                  </button>
+                ) : null}
+              </div>
               <PasswordInput value={textValue(draft.apiKey)} onChange={(apiKey) => patchDraft({ apiKey })} />
             </label>
             <label className="space-y-2 md:col-span-2">
@@ -2505,6 +2539,7 @@ function DefaultModelsSection({ settings, onSettings }: { settings: Settings; on
     ocrModelId: string;
     compressModelId: string;
     promptOptimizeModelId: string;
+    promptOptimizePrompt: string;
     titlePrompt: string;
     translatePrompt: string;
     suggestionPrompt: string;
@@ -2512,7 +2547,7 @@ function DefaultModelsSection({ settings, onSettings }: { settings: Settings; on
     compressPrompt: string;
   };
   type ModelKey = "chatModelId" | "titleModelId" | "translateModeId" | "suggestionModelId" | "imageGenerationModelId" | "ocrModelId" | "compressModelId" | "promptOptimizeModelId";
-  type PromptKey = "titlePrompt" | "translatePrompt" | "suggestionPrompt" | "ocrPrompt" | "compressPrompt";
+  type PromptKey = "titlePrompt" | "translatePrompt" | "suggestionPrompt" | "ocrPrompt" | "compressPrompt" | "promptOptimizePrompt";
   const [draft, setDraft] = React.useState({
     chatModelId: textValue(settings.chatModelId),
     titleModelId: textValue(settings.titleModelId),
@@ -2522,6 +2557,7 @@ function DefaultModelsSection({ settings, onSettings }: { settings: Settings; on
     ocrModelId: textValue(settings.ocrModelId),
     compressModelId: textValue(settings.compressModelId),
     promptOptimizeModelId: textValue(settings.promptOptimizeModelId),
+    promptOptimizePrompt: textValue(settings.promptOptimizePrompt),
     titlePrompt: textValue(settings.titlePrompt),
     translatePrompt: textValue(settings.translatePrompt),
     suggestionPrompt: textValue(settings.suggestionPrompt),
@@ -2563,6 +2599,7 @@ function DefaultModelsSection({ settings, onSettings }: { settings: Settings; on
     suggestionPrompt: { title: "建议回复 Prompt", variables: "{locale}, {content}", defaultValue: DEFAULT_PROMPTS.suggestionPrompt },
     ocrPrompt: { title: "OCR Prompt", variables: "图片输入", defaultValue: DEFAULT_PROMPTS.ocrPrompt },
     compressPrompt: { title: "上下文压缩 Prompt", variables: "{content}, {target_tokens}, {additional_context}, {locale}", defaultValue: DEFAULT_PROMPTS.compressPrompt },
+    promptOptimizePrompt: { title: "提示词优化 Prompt", variables: "用户草稿 + 可选对话背景", defaultValue: DEFAULT_PROMPTS.promptOptimizePrompt },
   };
   const features: Array<{
     modelKey: ModelKey;
@@ -2572,7 +2609,7 @@ function DefaultModelsSection({ settings, onSettings }: { settings: Settings; on
     description: string;
   }> = [
     { modelKey: "chatModelId", icon: Bot, title: "默认聊天模型", description: "首页未手动选择模型时使用。" },
-    { modelKey: "promptOptimizeModelId", icon: Sparkles, title: "提示词优化", description: "对话输入框「优化提示词」按钮使用这个模型,把你的草稿改写得更清晰专业。" },
+    { modelKey: "promptOptimizeModelId", promptKey: "promptOptimizePrompt", icon: Sparkles, title: "提示词优化", description: "对话输入框「优化提示词」按钮使用这个模型,把你的草稿改写得更清晰专业。" },
     { modelKey: "titleModelId", promptKey: "titlePrompt", icon: NotebookText, title: "标题生成", description: "对话首次回复后读取最近消息自动生成会话标题。" },
     { modelKey: "translateModeId", promptKey: "translatePrompt", icon: Globe, title: "翻译", description: "AI 回复下方翻译按钮使用这个模型和 Prompt。" },
     { modelKey: "suggestionModelId", promptKey: "suggestionPrompt", icon: MessageSquareText, title: "建议回复", description: "回复完成后生成 3 到 5 条用户可点选建议。" },
@@ -5745,6 +5782,7 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
   return (
     <>
       <SectionHeader icon={Globe} title="代理与端口" subtitle="为 AI API、搜索、MCP 等所有出站请求统一指定 HTTP 代理，以及本地服务的监听端口。代理留空将自动跟随系统代理，端口留空将自动选择。" />
+      <div className="space-y-4">
       <div className="space-y-5 rounded-lg border bg-card p-6">
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -5830,6 +5868,7 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
           修改端口后需要重启应用才能生效。当前运行中的实例仍使用原端口。
         </div>
       </div>
+      </div>
     </>
   );
 }
@@ -5838,7 +5877,7 @@ function AboutSection() {
   // Hard-coded current version — must match pc-server/server.ts:APP_VERSION and
   // web-ui/src-tauri/tauri.conf.json:version. The update checker compares this against
   // the latest GitHub release.
-  const APP_VERSION = "1.1.0";
+  const APP_VERSION = "1.1.1";
 
   const [checking, setChecking] = React.useState(false);
   const [updateInfo, setUpdateInfo] = React.useState<UpdateInfo | null>(null);
