@@ -1401,36 +1401,6 @@ function ProvidersSection({ settings, onSettings }: { settings: Settings; onSett
                 </label>
               </div>
             ) : null}
-            <label className="space-y-2">
-              <span className="text-sm font-medium">余额 API Path</span>
-              <Input
-                value={textValue(balanceOption.apiPath) || "/credits"}
-                onChange={(event) => patchDraft({ balanceOption: { ...balanceOptionOf(draft), apiPath: event.target.value } })}
-              />
-            </label>
-            <label className="space-y-2">
-              <span className="text-sm font-medium">余额结果路径</span>
-              <Input
-                value={textValue(balanceOption.resultPath)}
-                onChange={(event) => patchDraft({ balanceOption: { ...balanceOptionOf(draft), resultPath: event.target.value } })}
-              />
-            </label>
-            <div className="flex items-end justify-between gap-3 rounded-md border px-3 py-2">
-              <div>
-                <div className="text-sm font-medium">余额查询</div>
-                <div className="text-xs text-muted-foreground">按下方接口路径 GET 余额，并按指定 JSON 字段读取数值。</div>
-              </div>
-              <div className="flex items-center gap-2">
-                <Switch
-                  checked={balanceOption.enabled === true}
-                  onCheckedChange={(enabled) => patchDraft({ balanceOption: { ...balanceOptionOf(draft), enabled } })}
-                />
-                <Button type="button" variant="outline" size="sm" onClick={() => void checkBalance()} disabled={checkingBalance || balanceOption.enabled !== true}>
-                  {checkingBalance ? <Loader2 className="size-4 animate-spin" /> : <Database className="size-4" />}
-                  查询
-                </Button>
-              </div>
-            </div>
           </div>
           <div className="space-y-3 rounded-md border p-3">
             <div className="flex items-center justify-between gap-3">
@@ -1572,6 +1542,40 @@ function ProvidersSection({ settings, onSettings }: { settings: Settings; onSett
               删除
             </Button>
             <div className="flex items-center px-2 text-xs text-muted-foreground">已自动保存</div>
+          </div>
+          <div className="space-y-3 rounded-md border p-3">
+            <div className="flex items-end justify-between gap-3">
+              <div>
+                <div className="text-sm font-medium">余额查询</div>
+                <div className="text-xs text-muted-foreground">按下方接口路径 GET 余额，并按指定 JSON 字段读取数值。</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <Switch
+                  checked={balanceOption.enabled === true}
+                  onCheckedChange={(enabled) => patchDraft({ balanceOption: { ...balanceOptionOf(draft), enabled } })}
+                />
+                <Button type="button" variant="outline" size="sm" onClick={() => void checkBalance()} disabled={checkingBalance || balanceOption.enabled !== true}>
+                  {checkingBalance ? <Loader2 className="size-4 animate-spin" /> : <Database className="size-4" />}
+                  查询
+                </Button>
+              </div>
+            </div>
+            <div className="grid gap-3 md:grid-cols-2">
+              <label className="space-y-2">
+                <span className="text-sm font-medium">余额 API Path</span>
+                <Input
+                  value={textValue(balanceOption.apiPath) || "/credits"}
+                  onChange={(event) => patchDraft({ balanceOption: { ...balanceOptionOf(draft), apiPath: event.target.value } })}
+                />
+              </label>
+              <label className="space-y-2">
+                <span className="text-sm font-medium">余额结果路径</span>
+                <Input
+                  value={textValue(balanceOption.resultPath)}
+                  onChange={(event) => patchDraft({ balanceOption: { ...balanceOptionOf(draft), resultPath: event.target.value } })}
+                />
+              </label>
+            </div>
           </div>
           {(testing || testChecks.length > 0 || testInfo) && !isImageTestMode && !imageTestResult ? (
             <div className="rounded-md border bg-muted/40 p-3">
