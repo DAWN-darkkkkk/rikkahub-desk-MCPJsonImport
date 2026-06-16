@@ -41,7 +41,7 @@ export function AIIcon({
   return (
     <span
       className={cn(
-        "inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-secondary",
+        "inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-ai-icon-bg",
         loading && "animate-pulse",
         className,
       )}
