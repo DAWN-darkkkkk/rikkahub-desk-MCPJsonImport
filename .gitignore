@@ -29,3 +29,6 @@ node_modules/
 
 # Logs
 *.log
+
+# Android source (separate repo, checked out locally)
+Rikkahub-Android/
