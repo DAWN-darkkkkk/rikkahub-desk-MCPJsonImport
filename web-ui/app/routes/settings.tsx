@@ -378,6 +378,7 @@ function PasswordInput({
   onChange: (value: string) => void;
   placeholder?: string;
 }) {
+  const { t } = useTranslation();
   const [visible, setVisible] = React.useState(false);
   return (
     <div className="relative">
@@ -394,8 +395,8 @@ function PasswordInput({
         size="icon-xs"
         className="absolute top-1/2 right-1 -translate-y-1/2"
         onClick={() => setVisible((current) => !current)}
-        aria-label={visible ? "隐藏 API Key" : "显示 API Key"}
-        title={visible ? "隐藏 API Key" : "显示 API Key"}
+        aria-label={visible ? t("settings:common.hide_key") : t("settings:common.show_key")}
+        title={visible ? t("settings:common.hide_key") : t("settings:common.show_key")}
       >
         {visible ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
       </Button>
@@ -661,7 +662,7 @@ export default function SettingsPage() {
     return (
       <div className="flex h-svh items-center justify-center text-muted-foreground">
         <Loader2 className="mr-2 size-4 animate-spin" />
-        加载 PC 设置
+        {t("settings:providers.loading")}
       </div>
     );
   }
@@ -1478,6 +1479,8 @@ function ProvidersSection({
   };
   const addProvider = async () => {
     const next = createProvider();
+    next.name = t("settings:providers.custom_name");
+    next.shortDescription = t("settings:providers.custom_desc");
     await api.post("settings/provider", next);
     onSettings({ ...settings, providers: [...settings.providers, next] });
     setSelectedId(next.id);
@@ -6053,6 +6056,7 @@ function PromptItemEditor({
   createItem: () => Record<string, unknown>;
   title: string;
 }) {
+  const { t } = useTranslation();
   const dirtyRef = React.useRef(false);
   const promptVariables = [
     "{{cur_datetime}}",
@@ -6080,7 +6084,7 @@ function PromptItemEditor({
       await api.post(savePath, draft);
       dirtyRef.current = false;
       await pullSettings(onSettings);
-      if (announce) toast.success(`${title} 已保存`);
+      if (announce) toast.success(t("settings:mcp.item_saved", { title }));
     },
     [draft, onSettings, savePath, title],
   );
@@ -6113,7 +6117,7 @@ function PromptItemEditor({
     <EditorShell
       items={items}
       selectedId={selectedId}
-      emptyLabel={`还没有 ${title}`}
+      emptyLabel={t("settings:mcp.empty_item", { title })}
       onSelect={setSelectedId}
       titleOf={(item) => textValue(item.name) || title}
       onMove={async (from, to) => {
@@ -6140,13 +6144,13 @@ function PromptItemEditor({
           setDraft(next);
           dirtyRef.current = false;
         } catch (error) {
-          toast.error(error instanceof Error ? error.message : `新增${title}失败`);
+          toast.error(error instanceof Error ? error.message : t("settings:mcp.item_create_failed", { title }));
         }
       }}
     >
       <div className="space-y-4">
         <div className="flex items-center justify-between">
-          <div className="text-sm font-medium">{title} 详情</div>
+          <div className="text-sm font-medium">{t("settings:mcp.item_detail", { title })}</div>
           <Switch
             checked={(assistant[bindKey] ?? []).includes(String(draft.id))}
             onCheckedChange={(checked) => void bind(checked)}
@@ -6155,11 +6159,11 @@ function PromptItemEditor({
         <Input
           value={textValue(draft.name)}
           onChange={(event) => patchDraft({ name: event.target.value })}
-          placeholder="名称"
+          placeholder={t("settings:mcp.name_ph")}
         />
         <div className="grid gap-3 md:grid-cols-2">
           <label className="space-y-1">
-            <span className="text-xs font-medium text-muted-foreground">优先级</span>
+            <span className="text-xs font-medium text-muted-foreground">{t("settings:mcp.priority")}</span>
             <Input
               type="number"
               value={numberText(draft.priority)}
@@ -6168,23 +6172,23 @@ function PromptItemEditor({
             />
           </label>
           <label className="space-y-1">
-            <span className="text-xs font-medium text-muted-foreground">注入位置</span>
+            <span className="text-xs font-medium text-muted-foreground">{t("settings:mcp.position")}</span>
             <Select value={position} onValueChange={(value) => patchDraft({ position: value })}>
               <SelectTrigger>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="before_system_prompt">系统前</SelectItem>
-                <SelectItem value="after_system_prompt">系统后</SelectItem>
-                <SelectItem value="top_of_chat">对话顶部</SelectItem>
-                <SelectItem value="bottom_of_chat">对话底部</SelectItem>
-                <SelectItem value="at_depth">指定深度</SelectItem>
+                <SelectItem value="before_system_prompt">{t("settings:mcp.pos.before")}</SelectItem>
+                <SelectItem value="after_system_prompt">{t("settings:mcp.pos.after")}</SelectItem>
+                <SelectItem value="top_of_chat">{t("settings:mcp.pos.top")}</SelectItem>
+                <SelectItem value="bottom_of_chat">{t("settings:mcp.pos.bottom")}</SelectItem>
+                <SelectItem value="at_depth">{t("settings:mcp.pos.depth")}</SelectItem>
               </SelectContent>
             </Select>
           </label>
           {usesStandaloneMessage ? (
             <label className="space-y-1">
-              <span className="text-xs font-medium text-muted-foreground">角色</span>
+              <span className="text-xs font-medium text-muted-foreground">{t("settings:mcp.role")}</span>
               <Select
                 value={textValue(draft.role) || "USER"}
                 onValueChange={(value) => patchDraft({ role: value })}
@@ -6202,7 +6206,7 @@ function PromptItemEditor({
           {position === "at_depth" ? (
             <label className="space-y-1">
               <span className="text-xs font-medium text-muted-foreground">
-                注入深度（从最新消息往前数）
+                {t("settings:mcp.inject_depth_msg")}
               </span>
               <Input
                 type="number"
@@ -6217,7 +6221,7 @@ function PromptItemEditor({
           ) : null}
         </div>
         <div className="flex items-center justify-between rounded-md border px-3 py-2">
-          <span className="text-sm">启用</span>
+          <span className="text-sm">{t("settings:mcp.enabled")}</span>
           <Switch
             checked={draft.enabled !== false}
             onCheckedChange={(checked) => patchDraft({ enabled: checked })}
@@ -6225,7 +6229,7 @@ function PromptItemEditor({
         </div>
         <div className="space-y-2">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-xs text-muted-foreground">模板变量</span>
+            <span className="text-xs text-muted-foreground">{t("settings:mcp.template_vars")}</span>
             {promptVariables.map((variable) => (
               <Button
                 key={variable}
@@ -6242,12 +6246,12 @@ function PromptItemEditor({
             value={textValue(draft.content)}
             onChange={(event) => patchDraft({ content: event.target.value })}
             className="min-h-64 font-mono text-xs leading-relaxed"
-            placeholder="注入内容，支持 {{cur_datetime}} 等模板变量"
+            placeholder={t("settings:mcp.inject_content_template_ph", { cur_datetime: "{{cur_datetime}}" })}
           />
         </div>
         <div className="flex justify-end gap-2">
           <div className="mr-auto flex items-center px-2 text-xs text-muted-foreground">
-            已自动保存
+            {t("settings:mcp.autosaved")}
           </div>
           <Button
             variant="destructive"
@@ -6257,7 +6261,7 @@ function PromptItemEditor({
             }}
           >
             <Trash2 className="size-4" />
-            删除
+            {t("settings:mcp.delete")}
           </Button>
         </div>
       </div>
@@ -6274,6 +6278,7 @@ function SkillsEditor({
   assistant: AssistantProfile;
   onSettings: (settings: Settings) => void;
 }) {
+  const { t } = useTranslation();
   const [skills, setSkills] = React.useState<SkillProfile[]>([]);
   const [selected, setSelected] = React.useState("");
   const [content, setContent] = React.useState("");
@@ -6326,9 +6331,9 @@ function SkillsEditor({
         dirtyRef.current = false;
         await load();
         setSelected(name);
-        if (announce) toast.success("Skill 已保存");
+        if (announce) toast.success(t("settings:mcp.skill_saved"));
       } catch (error) {
-        if (announce) toast.error(error instanceof Error ? error.message : "保存失败");
+        if (announce) toast.error(error instanceof Error ? error.message : t("settings:mcp.save_failed"));
         else console.warn("Skill auto-save failed", error);
       } finally {
         setSaving(false);
@@ -6344,7 +6349,7 @@ function SkillsEditor({
     return () => window.clearTimeout(timer);
   }, [content, save]);
   const remove = async () => {
-    if (!selected || !window.confirm("删除这个 Skill？")) return;
+    if (!selected || !window.confirm(t("settings:mcp.delete_skill_confirm"))) return;
     await api.delete(`skills/${encodeURIComponent(selected)}`);
     setSelected("");
     setContent("");
@@ -6365,9 +6370,9 @@ function SkillsEditor({
       setContent(result.skill.content ?? "");
       dirtyRef.current = false;
       setGithubUrl("");
-      toast.success(`Skill 已导入：${result.skill.name}`);
+      toast.success(t("settings:mcp.skill_imported", { name: result.skill.name }));
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "导入失败");
+      toast.error(error instanceof Error ? error.message : t("settings:mcp.import_failed"));
     } finally {
       setImporting(false);
     }
@@ -6389,7 +6394,7 @@ function SkillsEditor({
         skills?: SkillProfile[];
         error?: string;
       };
-      if (!res.ok) throw new Error(data.error || "导入失败");
+      if (!res.ok) throw new Error(data.error || t("settings:mcp.import_failed"));
       await load();
       const first = data.skills?.[0];
       if (first) {
@@ -6398,9 +6403,9 @@ function SkillsEditor({
         dirtyRef.current = false;
       }
       const names = (data.imported ?? []).join("、");
-      toast.success(`Skill 已导入：${names || file.name}`);
+      toast.success(t("settings:mcp.skill_imported", { name: names || file.name }));
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "导入失败");
+      toast.error(error instanceof Error ? error.message : t("settings:mcp.import_failed"));
     } finally {
       setImportingFile(false);
     }
@@ -6426,7 +6431,7 @@ function SkillsEditor({
     <EditorShell
       items={skills as unknown as Array<Record<string, unknown>>}
       selectedId={selected}
-      emptyLabel="还没有 Skill"
+      emptyLabel={t("settings:mcp.empty_skill")}
       onSelect={setSelected}
       titleOf={(item) => textValue(item.name)}
       renderItem={(item) => {
@@ -6445,7 +6450,7 @@ function SkillsEditor({
         const name = "new-skill";
         setSelected(name);
         setContent(
-          `---\nname: ${name}\ndescription: 描述何时应使用这个 skill\n---\n\n写入 Skill 指令。\n`,
+          `---\nname: ${name}\ndescription: ${t("settings:mcp.skill_desc_default")}\n---\n\n${t("settings:mcp.skill_body_default")}\n`,
         );
         setFiles([]);
         dirtyRef.current = true;
@@ -6453,12 +6458,12 @@ function SkillsEditor({
     >
       <div className="space-y-4">
         <div className="rounded-md border p-3">
-          <div className="mb-2 text-sm font-medium">从 GitHub 导入</div>
+          <div className="mb-2 text-sm font-medium">{t("settings:mcp.import_github")}</div>
           <div className="flex gap-2">
             <Input
               value={githubUrl}
               onChange={(event) => setGithubUrl(event.target.value)}
-              placeholder="https://github.com/owner/repo 或 /tree/branch/sub/path"
+              placeholder={t("settings:mcp.github_url_ph")}
               onKeyDown={(event) => {
                 if (event.key === "Enter") void importFromGitHub();
               }}
@@ -6474,15 +6479,16 @@ function SkillsEditor({
               ) : (
                 <Download className="size-4" />
               )}
-              导入
+              {t("settings:mcp.import_btn")}
             </Button>
           </div>
         </div>
         <div className="rounded-md border p-3">
-          <div className="mb-2 text-sm font-medium">从文件导入</div>
-          <div className="mb-2 text-xs text-muted-foreground">
-            支持单个 <code>SKILL.md</code>，或包含多个技能的 <code>.zip</code> 压缩包。
-          </div>
+          <div className="mb-2 text-sm font-medium">{t("settings:mcp.import_file")}</div>
+          <div
+            className="mb-2 text-xs text-muted-foreground"
+            dangerouslySetInnerHTML={{ __html: t("settings:mcp.import_file_desc") }}
+          />
           <input
             ref={fileInputRef}
             type="file"
@@ -6501,7 +6507,7 @@ function SkillsEditor({
             ) : (
               <Upload className="size-4" />
             )}
-            选择文件…
+            {t("settings:mcp.select_file")}
           </Button>
         </div>
         <div className="space-y-2 rounded-md border p-3">
@@ -6527,10 +6533,10 @@ function SkillsEditor({
           </div>
         ) : null}
         <div className="rounded-md border">
-          <div className="border-b px-3 py-2 text-sm font-medium">文件列表</div>
+          <div className="border-b px-3 py-2 text-sm font-medium">{t("settings:mcp.file_list")}</div>
           <div className="max-h-40 overflow-auto p-2">
             {files.length === 0 ? (
-              <div className="p-2 text-sm text-muted-foreground">暂无文件</div>
+              <div className="p-2 text-sm text-muted-foreground">{t("settings:mcp.no_files")}</div>
             ) : null}
             {files.map((file) => (
               <div
@@ -6539,7 +6545,7 @@ function SkillsEditor({
               >
                 <span className={file.type === "directory" ? "font-medium" : ""}>{file.path}</span>
                 <span className="text-muted-foreground">
-                  {file.type === "directory" ? "目录" : `${file.size} B`}
+                  {file.type === "directory" ? t("settings:mcp.directory") : `${file.size} B`}
                 </span>
               </div>
             ))}
@@ -6558,11 +6564,11 @@ function SkillsEditor({
         </label>
         <div className="flex justify-end gap-2">
           <div className="mr-auto flex items-center px-2 text-xs text-muted-foreground">
-            {saving ? "正在自动保存..." : "已自动保存"}
+            {saving ? t("settings:mcp.autosaving") : t("settings:mcp.autosaved")}
           </div>
           <Button variant="destructive" onClick={() => void remove()} disabled={!selected}>
             <Trash2 className="size-4" />
-            删除
+            {t("settings:mcp.delete")}
           </Button>
         </div>
       </div>

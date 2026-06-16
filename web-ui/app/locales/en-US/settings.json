@@ -27,7 +27,9 @@
     "save_failed": "Save failed",
     "autosaving": "Auto-saving...",
     "autosaved": "Saved automatically",
-    "delete": "Delete"
+    "delete": "Delete",
+    "hide_key": "Hide API Key",
+    "show_key": "Show API Key"
   },
   "general": {
     "title": "General",
@@ -60,6 +62,9 @@
     "deleted": "Provider deleted",
     "delete": "Delete",
     "delete_confirm": "Delete the provider \"{{name}}\"?",
+    "custom_name": "Custom provider",
+    "custom_desc": "User-added OpenAI-compatible API",
+    "loading": "Loading settings",
     "get_key": "Get API Key",
     "get_key_title": "Go to the provider's website to get an API key",
     "chat_url": "Chat endpoint URL: {{url}}",

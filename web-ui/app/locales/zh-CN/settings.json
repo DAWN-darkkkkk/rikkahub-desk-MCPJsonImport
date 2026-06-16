@@ -27,7 +27,9 @@
     "save_failed": "保存失败",
     "autosaving": "正在自动保存...",
     "autosaved": "已自动保存",
-    "delete": "删除"
+    "delete": "删除",
+    "hide_key": "隐藏 API Key",
+    "show_key": "显示 API Key"
   },
   "general": {
     "title": "通用设置",
@@ -60,6 +62,9 @@
     "deleted": "供应商已删除",
     "delete": "删除",
     "delete_confirm": "删除供应商「{{name}}」？",
+    "custom_name": "自定义供应商",
+    "custom_desc": "用户添加的 OpenAI-compatible API",
+    "loading": "加载 PC 设置",
     "get_key": "获取 API Key",
     "get_key_title": "前往官网获取 API Key",
     "chat_url": "聊天完整 URL：{{url}}",
