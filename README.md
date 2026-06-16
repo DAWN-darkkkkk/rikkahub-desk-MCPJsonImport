@@ -65,7 +65,7 @@ else needed.
 
 ## 💎 Sponsors
 
-These organizations sponsor Rikkahub's ongoing development. Please pay them a visit.
+The following organizations sponsor Rikkahub's ongoing development. Our thanks to them.
 
 <div align="center">
   <a href="https://naapi.cc">
