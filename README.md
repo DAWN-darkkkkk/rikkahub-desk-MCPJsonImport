@@ -3,7 +3,9 @@
   <h1>Rikkahub</h1>
 
   A native Windows desktop LLM chat client that supports switching between different
-  providers for conversations 🤖💬 — also runs on Linux (native binary or Docker).
+  providers for conversations 🤖💬
+  
+  — also runs on Linux (native binary or Docker).
 
   Reconstructed on top of [Android edition of Rikkahub](https://github.com/rikkahub/rikkahub) by RE.
 
@@ -20,7 +22,6 @@ Grab the latest installer from the
   **no admin rights required**)
 - Asks where to keep your data — conversations, settings, uploaded files (default:
   `<install dir>\pc-data\`; freely movable later from the in-app settings)
-- Optionally creates Start Menu / Desktop shortcuts
 - Ships a WebView2 bootstrapper so the app works on any Win10 1809+ / Win11 machine,
   even without WebView2 pre-installed
 
@@ -28,26 +29,27 @@ Uninstall via Windows "Apps & features". `pc-data/` is yours — back it up if y
 
 No telemetry, no admin, no cloud account required. Everything is local.
 
+Prefer no installer? Each release also ships a portable **.zip** — unzip and run, nothing
+else needed.
+
 > **On Linux?** There's no prebuilt download yet — build a native binary from source or run
 > the Docker image. See [Linux binary](#linux-binary) and [Docker](#docker) below.
 
 ## ✨ Features
 
 - 🎨 Multiple theme palettes (Claude / RikkaHub / Mono / Custom) + 🌙 dark mode
-- 🪟 Native desktop app with a custom titlebar that follows the theme
 - 🐧 Runs on Linux too — self-contained native binary or multi-arch Docker image (amd64 / arm64)
 - 🔄 Multi-provider support: OpenAI / Anthropic / Google Gemini + any OpenAI-compatible endpoint
 - 🦙 Local model support via [Ollama](https://ollama.com/) /
   [LM Studio](https://lmstudio.ai/) /
   [llama.cpp server](https://github.com/ggerganov/llama.cpp) — just point an
   OpenAI-compatible provider at `http://localhost:11434/v1`
-- 🖼️ Multimodal input: image, PDF, DOCX, plain text
+- 🖼️ Multimodal input: image, PDF, DOCX, PPTX, EPUB, plain text
 - 🛠️ MCP (Model Context Protocol) Streamable HTTP support
 - 📝 Markdown rendering with code highlighting, LaTeX formulas, tables, Mermaid diagrams
 - 🪾 Message branching, regeneration, per-branch model switching
 - 🔍 17 web-search engines: Tavily, Exa, Brave, Perplexity, Bocha, 智谱, 秘塔, Firecrawl,
   Grok, Ollama, Jina, SearXNG, custom JS, …
-- 🔎 Per-model built-in search toggle (Gemini Search Grounding, OpenAI `web_search`)
 - 🧠 Per-assistant or global memory tool, plus recent-chat awareness and a time-gap reminder
 - 🧩 Prompt template variables (model name, current time, locale, device info, …)
 - 🤖 Multiple customizable assistants with their own system prompts, prompt injections,
@@ -55,24 +57,40 @@ No telemetry, no admin, no cloud account required. Everything is local.
 - 🛠️ Granular per-model configuration: manually add models, set custom request headers /
   custom request bodies / provider overwrite (per-model baseUrl + API Key)
 - 🎨 Image generation: gpt-image-2, DALL·E 3, Imagen, Qwen-Image, FLUX, …
-- 🎙️ TTS and ASR via system speech (Windows SAPI / Linux espeak-ng), OpenAI, Gemini, Qwen, Groq, MiniMax, MiMo, **with built-in test buttons**
+- 🎙️ TTS and ASR via system speech (Windows SAPI / Linux espeak-ng), OpenAI, Gemini, Qwen, Groq, MiniMax, MiMo
 - 📥 One-click import from Android .zip backups: conversation history, settings, attachments,
   Skills, MCP, prompt injections, world books, quick messages
 - 📤 WebDAV and S3-compatible cloud backup, plus JSON import/export
-- 🔄 In-app update check: auto-download and install new versions, with full data preservation on upgrade
 - 📊 Request log and usage statistics with a daily activity heatmap
+
+## 💎 Sponsors
+
+These organizations sponsor Rikkahub's ongoing development. Please pay them a visit.
+
+<table>
+  <tr>
+    <td width="120" align="center">
+      <a href="https://naapi.cc">
+        <img src="icons/naapi.jpg" width="100" alt="钠API" />
+      </a>
+    </td>
+    <td>
+      <a href="https://naapi.cc"><b>钠API</b></a><br/>
+      One-stop access to 100+ top global models — ChatGPT, Claude, Gemini and more —
+      with competitive pricing and superior stability.
+    </td>
+  </tr>
+</table>
 
 ## 🏗️ Build from source
 
-Building the installer locally requires:
+Building the installer locally requires the following — **for developers only**:
 
 - [Bun](https://bun.sh/) 1.1+
 - [Rust](https://rustup.rs/) toolchain (stable, MSVC target — picked automatically by rustup
   on Windows)
 - [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
   with the **"Desktop development with C++"** workload (provides MSVC linker + Windows SDK)
-
-End-user installation requires none of the above — the resulting `.exe` is self-contained.
 
 ```powershell
 # 1. Compile the embedded backend (Bun --compile → single Windows exe)
@@ -193,8 +211,7 @@ not available inside a headless container.
 
 This project is a Windows port built on top of the product design, brand, and concepts
 of [RikkaHub](https://github.com/rikkahub/rikkahub) by
-[@re-ovo](https://github.com/re-ovo). All product direction, naming, and visual identity
-belong to the original project.
+[@re-ovo](https://github.com/re-ovo).
 
 ## ⭐ Star History
 

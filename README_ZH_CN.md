@@ -3,6 +3,7 @@
   <h1>Rikkahub</h1>
 
   Rikkahub 是一个原生 Windows 桌面 LLM 聊天客户端，支持切换不同的供应商进行聊天 🤖💬
+  
   —— 同时也能在 Linux 上运行（原生二进制或 Docker）。
 
   依赖作者 RE 构建的 [Android 版 Rikkahub](https://github.com/rikkahub/rikkahub) 重构而成。
@@ -18,48 +19,64 @@
 - 程序安装路径（默认 `%LOCALAPPDATA%\Rikkahub\`，**无需管理员权限**）
 - 数据保存目录——会话、配置、上传文件（默认 `<安装目录>\pc-data\`，安装完后也可以在应用内
   「设置 → 数据设置」里随时换位置）
-- 是否创建开始菜单 / 桌面快捷方式
 - 自带 WebView2 引导器：Win10 1809+ / Win11 即使没装 WebView2 也能跑
 
 卸载从 Windows「应用与功能」走。`pc-data/` 里的内容是你的，需要可以自行备份。
 
 无遥测、无管理员权限、无云端账号，**一切在本地完成**。
 
+不想用安装包？每个版本同时提供**便携版 .zip**——解压即用，无需安装。
+
 > **用 Linux？** 目前还没有预编译的下载包——可以从源码编译原生二进制，或直接跑 Docker 镜像。
 > 详见下方 [Linux 二进制](#-linux-二进制) 与 [Docker](#docker) 两节。
 
 ## ✨ 功能特色
 
-- 🎨 多套主题色（Claude / RikkaHub / Mono / 自定义）+ 🌙 深色模式
-- 🪟 原生桌面应用 + 自定义标题栏，跟着主题走
+- 🎨 多套主题色（Claude / RikkaHub / Mono / 自定义） + 🌙 深色模式
 - 🐧 同样支持 Linux —— 自带依赖的原生二进制，或多架构 Docker 镜像（amd64 / arm64）
 - 🔄 多种供应商支持：OpenAI / Anthropic / Google Gemini + 任意 OpenAI 兼容接口
 - 🦙 开箱即用的本地模型支持：通过 [Ollama](https://ollama.com/) /
   [LM Studio](https://lmstudio.ai/) /
   [llama.cpp server](https://github.com/ggerganov/llama.cpp)，
   把 OpenAI 兼容供应商指向 `http://localhost:11434/v1` 即可
-- 🖼️ 多模态输入：图片、PDF、DOCX、纯文本
+- 🖼️ 多模态输入：图片、PDF、DOCX、PPTX、EPUB、纯文本
 - 🛠️ MCP（Model Context Protocol）Streamable HTTP 支持
 - 📝 Markdown 渲染：代码高亮、LaTeX 数学公式、表格、Mermaid 图
 - 🪾 消息分支、重新生成、分支独立换模型
 - 🔍 17 种联网搜索：Tavily、Exa、Brave、Perplexity、博查、智谱、秘塔、Firecrawl、Grok、
   Ollama、Jina、SearXNG、自定义 JS、…
-- 🔎 模型内置搜索开关（Gemini Search Grounding、OpenAI `web_search`）
 - 🧠 助手级或全局共享的记忆工具，支持参考最近聊天 + 长时间无消息后自动注入时间提醒
 - 🧩 Prompt 模板变量（模型名称、当前时间、地区、设备信息……）
 - 🤖 多助手自定义：独立 System Prompt、提示词注入、世界书、快捷消息
 - 🛠️ 模型精细化配置：手动添加模型，每个模型可设自定义请求头 / 请求体 / 供应商覆盖（per-model
   baseUrl + API Key）
 - 🎨 图像生成：gpt-image-2、DALL·E 3、Imagen、Qwen-Image、FLUX、…
-- 🎙️ TTS 与 ASR：系统语音（Windows SAPI / Linux espeak-ng）、OpenAI、Gemini、Qwen、Groq、MiniMax、MiMo，**带测试按钮**
+- 🎙️ TTS 与 ASR：系统语音（Windows SAPI / Linux espeak-ng）、OpenAI、Gemini、Qwen、Groq、MiniMax、MiMo
 - 📥 一键导入 Android 端 .zip 备份：对话历史、设置、附件、Skills、MCP、提示词注入、世界书、快捷消息
 - 📤 WebDAV 与 S3 兼容云端备份，JSON 导入导出
-- 🔄 应用内检查更新：自动下载安装新版本，覆盖安装保留所有数据
 - 📊 请求日志与每日活动热力图统计
+
+## 💎 赞助商
+
+以下组织赞助了 Rikkahub 的持续开发，在此致谢。
+
+<table>
+  <tr>
+    <td width="120" align="center">
+      <a href="https://naapi.cc">
+        <img src="icons/naapi.jpg" width="100" alt="钠API" />
+      </a>
+    </td>
+    <td>
+      <a href="https://naapi.cc"><b>钠API</b></a><br/>
+      提供 ChatGPT、Claude、Gemini 等 100+ 全球顶级模型的统一接口，主打有竞争力的价格与出色的稳定性。
+    </td>
+  </tr>
+</table>
 
 ## 🏗️ 从源码构建
 
-本地打包安装器需要以下工具——**只是给开发者用的，终端用户装 exe 完全不需要这些**：
+本地打包安装器需要以下工具——**供开发者使用**：
 
 - [Bun](https://bun.sh/) 1.1+
 - [Rust](https://rustup.rs/) 工具链（stable，Windows 下 rustup 默认选 MSVC target）
@@ -180,7 +197,7 @@ docker run -d \
 
 本项目是基于 [@re-ovo](https://github.com/re-ovo) 的
 [RikkaHub](https://github.com/rikkahub/rikkahub) 产品设计、品牌与理念在 Windows 平台上的
-移植版。所有产品方向、名称与视觉资产归原项目所有。
+移植版。
 
 ## ⭐ Star History
 
