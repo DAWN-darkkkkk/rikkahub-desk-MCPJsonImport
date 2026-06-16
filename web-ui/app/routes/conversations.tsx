@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import { useNavigate, useParams } from "react-router";
+import { motion } from "motion/react";
 
 import {
   ConversationQuickJump,
@@ -852,10 +853,18 @@ const ConversationTimeline = React.memo(
                 : fallbackModel;
 
               return (
-                <div
+                <motion.div
                   key={message.id}
                   id={getConversationMessageAnchorId(message.id)}
                   className="scroll-mt-24"
+                  initial={{
+                    opacity: 0,
+                    y: message.role === "USER" ? 12 : 8,
+                    x: message.role === "USER" ? 16 : -8,
+                    scale: 0.98,
+                  }}
+                  animate={{ opacity: 1, y: 0, x: 0, scale: 1 }}
+                  transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
                 >
                   <ChatMessage
                     node={node}
@@ -872,7 +881,7 @@ const ConversationTimeline = React.memo(
                     onTranslate={onTranslate}
                     onToolApproval={onToolApproval}
                   />
-                </div>
+                </motion.div>
               );
             })}
           {!detailLoading &&
@@ -1446,12 +1455,14 @@ function ConversationsPageInner() {
       <div>
         {isNewChat && (
           <div className="mb-4 text-center">
-            <div className="mb-3 flex justify-center">
-              <div className="[&>svg]:size-16">
+            <div className="mb-4 flex justify-center">
+              <div className="[animation:rikkahub-breathe_4s_ease-in-out_infinite] [&>svg]:size-16">
                 <Logo className="size-16 text-primary" />
               </div>
             </div>
-            <p className="text-lg text-muted-foreground">{t("conversations.welcome_prompt")}</p>
+            <p className="text-xl font-medium leading-relaxed text-foreground">
+              {t("conversations.welcome_prompt")}
+            </p>
           </div>
         )}
         {/* Floating chunked-TTS play bar — pops in only while a message is being read out
@@ -1522,16 +1533,16 @@ function ConversationsPageInner() {
         {/* pt-9 (36px) 让出沉浸式标题栏的高度,避免 SidebarTrigger / 标题被透明标题栏盖住。
             背景色仍由 SidebarInset 继承(--background),顶到窗口顶,和透明标题栏无缝衔接。
             border-divider:用比 --border 更淡的分界色,让区域分隔退到背景里。 */}
-        <div className="flex items-center gap-2 border-b border-divider px-4 pb-3 pt-9">
+        <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-divider bg-background/95 px-4 pb-3 pt-9 shadow-sm backdrop-blur supports-backdrop-filter:bg-background/60">
           <SidebarTrigger />
           <div className="min-w-0 flex-1">
-            <div className="truncate text-sm text-muted-foreground">
+            <div className="truncate text-sm font-medium text-muted-foreground">
               {activeConversation
                 ? activeConversation.title
                 : t("conversations.header.select_conversation")}
             </div>
             {currentModel && currentProvider ? (
-              <div className="truncate text-xs text-muted-foreground/80">
+              <div className="truncate text-xs text-muted-foreground/70">
                 {`${getAssistantDisplayName(currentAssistant?.name)} / ${getModelDisplayName(currentModel.displayName, currentModel.modelId)} (${currentProvider.name})`}
               </div>
             ) : null}

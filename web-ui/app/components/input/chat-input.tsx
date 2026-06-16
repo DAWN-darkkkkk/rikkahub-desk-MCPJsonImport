@@ -863,7 +863,7 @@ function ChatInputInner({
         </div>
         <div
           className={cn(
-            "relative flex flex-col gap-2 rounded-lg border bg-muted/50 p-2 shadow-sm transition-shadow focus-within:shadow-md focus-within:ring-1 focus-within:ring-ring",
+            "relative flex flex-col gap-2 rounded-2xl border bg-card p-3 shadow-lg transition-shadow focus-within:shadow-elevated focus-within:ring-1 focus-within:ring-ring",
             dragActive && "border-primary/40 bg-primary/5 ring-2 ring-primary/30",
           )}
           onDragEnter={handleDragEnter}

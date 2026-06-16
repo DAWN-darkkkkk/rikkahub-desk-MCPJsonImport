@@ -1003,7 +1003,7 @@ export const ChatMessage = React.memo(
 
     return (
       <div
-        className={cn("flex flex-col gap-4", isUser ? "items-end" : "items-start")}
+        className={cn("group/message flex flex-col gap-4", isUser ? "items-end" : "items-start")}
         data-message-role={message.role.toLowerCase()}
         data-message-loading={loading || undefined}
       >
@@ -1020,12 +1020,12 @@ export const ChatMessage = React.memo(
             <div
               data-message-bubble
               className={cn(
-                "flex flex-col gap-2 text-sm leading-6",
+                "flex flex-col gap-2 text-sm leading-6 transition-all duration-200",
                 isUser
-                  ? "max-w-[85%] rounded-2xl bg-muted px-4 py-3 shadow-sm ring-1 ring-border/40"
+                  ? "max-w-[85%] rounded-2xl rounded-tr-md bg-primary/90 px-4 py-3 text-primary-foreground shadow-card hover:-translate-x-0.5 hover:shadow-elevated"
                   : showAssistantBubble
-                    ? "w-fit max-w-[92%] rounded-2xl border border-border/70 bg-muted/55 px-3 py-2 shadow-sm"
-                    : "w-full",
+                    ? "w-fit max-w-[92%] rounded-2xl border border-border/40 bg-muted/40 px-3 py-2 shadow-sm hover:bg-muted/60"
+                    : "w-full hover:bg-muted/20",
               )}
             >
               <MessageParts
@@ -1042,7 +1042,10 @@ export const ChatMessage = React.memo(
         </div>
 
         {showActions && (
-          <div data-message-actions>
+          <div
+            data-message-actions
+            className="opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover/message:opacity-100"
+          >
             <ChatMessageActionsRow
               node={node}
               message={message}
