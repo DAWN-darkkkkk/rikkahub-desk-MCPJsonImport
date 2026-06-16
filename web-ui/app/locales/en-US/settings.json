@@ -22,5 +22,28 @@
     "website": "Website",
     "check_update": "Check for updates",
     "check_failed": "Failed to check for updates"
+  },
+  "common": {
+    "save_failed": "Save failed",
+    "autosaving": "Auto-saving...",
+    "autosaved": "Saved automatically"
+  },
+  "general": {
+    "title": "General",
+    "subtitle": "Color & display, user profile, assistant and extension entries.",
+    "nickname": "Nickname",
+    "ui_font": "UI font",
+    "chat_font": "Chat font",
+    "profile_saved": "Profile saved",
+    "opt": {
+      "show_user_avatar": "Show user avatar",
+      "show_assistant_bubble": "Show assistant bubble",
+      "show_model_icon": "Show model icon",
+      "show_model_name": "Show model name",
+      "show_token_usage": "Show token usage",
+      "show_thinking": "Show thinking content",
+      "send_on_enter": "Send on Enter",
+      "auto_scroll": "Auto-scroll"
+    }
   }
 }

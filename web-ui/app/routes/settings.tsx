@@ -719,6 +719,7 @@ function SortableRow({
 }
 
 function GeneralSection({ settings, onSettings }: { settings: Settings; onSettings: (settings: Settings) => void }) {
+  const { t } = useTranslation();
   const display = settings.displaySetting;
   const [name, setName] = React.useState(textValue(display.userNickname));
   const [avatar, setAvatar] = React.useState<AssistantAvatar>(display.userAvatar ?? { type: "dummy" });
@@ -743,9 +744,9 @@ function GeneralSection({ settings, onSettings }: { settings: Settings; onSettin
     try {
       await patchDisplay({ userNickname: name.trim(), userAvatar: avatar });
       profileDirtyRef.current = false;
-      if (announce) toast.success("用户资料已保存");
+      if (announce) toast.success(t("settings:general.profile_saved"));
     } catch (error) {
-      if (announce) toast.error(error instanceof Error ? error.message : "保存失败");
+      if (announce) toast.error(error instanceof Error ? error.message : t("settings:common.save_failed"));
       else console.warn("Profile auto-save failed", error);
     } finally {
       setSaving(false);
@@ -762,7 +763,7 @@ function GeneralSection({ settings, onSettings }: { settings: Settings; onSettin
 
   return (
     <>
-      <SectionHeader icon={UserRound} title="通用设置" subtitle="管理颜色与显示、用户资料、助手与拓展入口。" />
+      <SectionHeader icon={UserRound} title={t("settings:general.title")} subtitle={t("settings:general.subtitle")} />
       <div className="grid gap-6">
         <div className="space-y-4 rounded-lg border bg-card p-5">
           <AvatarCropper
@@ -777,7 +778,7 @@ function GeneralSection({ settings, onSettings }: { settings: Settings; onSettin
           />
           <Separator />
           <label className="block space-y-2">
-            <span className="text-sm font-medium">昵称</span>
+            <span className="text-sm font-medium">{t("settings:general.nickname")}</span>
             <Input
               value={name}
               onChange={(event) => {
@@ -788,7 +789,7 @@ function GeneralSection({ settings, onSettings }: { settings: Settings; onSettin
           </label>
           <div className="grid gap-3 md:grid-cols-2">
             <FontPickerPair
-              label="界面字体"
+              label={t("settings:general.ui_font")}
               enValue={textValue(display.uiFontFamily)}
               cjkValue={textValue(display.uiFontFamilyCjk)}
               fallbackFamily={"\"Noto Sans SC\", \"Microsoft YaHei\", ui-sans-serif, system-ui, sans-serif"}
@@ -796,7 +797,7 @@ function GeneralSection({ settings, onSettings }: { settings: Settings; onSettin
               onChangeCjk={(value, family) => void patchDisplay({ uiFontFamilyCjk: value, uiFontFamilyCjkCss: family })}
             />
             <FontPickerPair
-              label="对话字体"
+              label={t("settings:general.chat_font")}
               enValue={textValue(display.chatFontFamily)}
               cjkValue={textValue(display.chatFontFamilyCjk)}
               fallbackFamily={textValue(display.uiFontFamilyCss) || "\"Noto Sans SC\", \"Microsoft YaHei\", ui-sans-serif, system-ui, sans-serif"}
@@ -806,17 +807,17 @@ function GeneralSection({ settings, onSettings }: { settings: Settings; onSettin
           </div>
           <div className="grid gap-3 md:grid-cols-2">
             {[
-              ["showUserAvatar", "显示用户头像"],
-              ["showAssistantBubble", "显示助手气泡"],
-              ["showModelIcon", "显示模型图标"],
-              ["showModelName", "显示模型名称"],
-              ["showTokenUsage", "显示 Token 用量"],
-              ["showThinkingContent", "显示思考内容"],
-              ["sendOnEnter", "Enter 发送"],
-              ["enableAutoScroll", "自动滚动"],
-            ].map(([key, label]) => (
+              ["showUserAvatar", "settings:general.opt.show_user_avatar"],
+              ["showAssistantBubble", "settings:general.opt.show_assistant_bubble"],
+              ["showModelIcon", "settings:general.opt.show_model_icon"],
+              ["showModelName", "settings:general.opt.show_model_name"],
+              ["showTokenUsage", "settings:general.opt.show_token_usage"],
+              ["showThinkingContent", "settings:general.opt.show_thinking"],
+              ["sendOnEnter", "settings:general.opt.send_on_enter"],
+              ["enableAutoScroll", "settings:general.opt.auto_scroll"],
+            ].map(([key, labelKey]) => (
               <label key={key} className="flex items-center justify-between rounded-md border px-3 py-2">
-                <span className="text-sm">{label}</span>
+                <span className="text-sm">{t(labelKey)}</span>
                 <Switch
                   checked={display[key] !== false}
                   onCheckedChange={(checked) => void patchDisplay({ [key]: checked })}
@@ -825,7 +826,7 @@ function GeneralSection({ settings, onSettings }: { settings: Settings; onSettin
             ))}
           </div>
           <div className="flex justify-end text-xs text-muted-foreground">
-            {saving ? "正在自动保存..." : "已自动保存"}
+            {saving ? t("settings:common.autosaving") : t("settings:common.autosaved")}
           </div>
         </div>
       </div>

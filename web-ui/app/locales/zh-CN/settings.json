@@ -22,5 +22,28 @@
     "website": "官网",
     "check_update": "检查更新",
     "check_failed": "检查更新失败"
+  },
+  "common": {
+    "save_failed": "保存失败",
+    "autosaving": "正在自动保存...",
+    "autosaved": "已自动保存"
+  },
+  "general": {
+    "title": "通用设置",
+    "subtitle": "管理颜色与显示、用户资料、助手与拓展入口。",
+    "nickname": "昵称",
+    "ui_font": "界面字体",
+    "chat_font": "对话字体",
+    "profile_saved": "用户资料已保存",
+    "opt": {
+      "show_user_avatar": "显示用户头像",
+      "show_assistant_bubble": "显示助手气泡",
+      "show_model_icon": "显示模型图标",
+      "show_model_name": "显示模型名称",
+      "show_token_usage": "显示 Token 用量",
+      "show_thinking": "显示思考内容",
+      "send_on_enter": "Enter 发送",
+      "auto_scroll": "自动滚动"
+    }
   }
 }
