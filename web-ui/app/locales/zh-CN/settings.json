@@ -45,5 +45,34 @@
       "send_on_enter": "Enter 发送",
       "auto_scroll": "自动滚动"
     }
+  },
+  "proxy": {
+    "title": "代理与端口",
+    "subtitle": "为 AI API、搜索、MCP 等所有出站请求统一指定 HTTP 代理，以及本地服务的监听端口。代理留空将自动跟随系统代理，端口留空将自动选择。",
+    "http_title": "HTTP 代理设置",
+    "http_desc": "所有 AI API 请求均通过此代理转发",
+    "detect": "自动检测系统代理",
+    "address": "代理地址",
+    "address_ph": "http://127.0.0.1:7890（留空 = 跟随系统代理）",
+    "username": "用户名",
+    "password": "密码",
+    "optional": "（可选）",
+    "current": "当前代理",
+    "saved": "代理设置已保存",
+    "save_failed": "保存代理设置失败",
+    "detected": "检测到系统代理：{{url}}",
+    "none_detected": "未检测到系统代理",
+    "none_detected_desc": "系统代理当前未开启，或代理工具尚未启动。",
+    "detect_failed": "检测失败",
+    "port_title": "服务端口",
+    "port_desc": "应用本地服务监听的端口，默认 8080。留空将自动选择；填写后优先使用该端口，被占用时自动顺延到下一个可用端口。修改后需重启应用生效。",
+    "port_number": "端口号",
+    "port_number_hint": "（留空 = 自动，默认 8080）",
+    "port_invalid": "端口必须是 1–65535 之间的整数",
+    "port_saved": "端口设置已保存，重启应用后生效",
+    "port_save_failed": "保存端口设置失败",
+    "port_restart_note": "修改端口后需要重启应用才能生效。当前运行中的实例仍使用原端口。",
+    "active_from_system": "{{url}}（来自系统代理）",
+    "not_active": "未启用（所有请求直连）"
   }
 }

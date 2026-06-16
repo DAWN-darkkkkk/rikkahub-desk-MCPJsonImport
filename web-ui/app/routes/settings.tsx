@@ -5691,6 +5691,7 @@ interface ProxyStatus {
 }
 
 function ProxySection({ settings, onSettings }: { settings: Settings; onSettings: (settings: Settings) => void }) {
+  const { t } = useTranslation();
   const initial = (settings.proxyConfig ?? { url: "", username: "", password: "" }) as ProxyConfig;
   const [draft, setDraft] = React.useState<ProxyConfig>(initial);
   const [showPassword, setShowPassword] = React.useState(false);
@@ -5736,9 +5737,9 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
       dirtyRef.current = false;
       onSettings({ ...settings, proxyConfig: result.config } as Settings);
       setStatus({ activeUrl: result.activeUrl, source: result.source, detectedSystemProxy: result.detectedSystemProxy });
-      if (announce) toast.success("代理设置已保存");
+      if (announce) toast.success(t("settings:proxy.saved"));
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "保存代理设置失败");
+      toast.error(err instanceof Error ? err.message : t("settings:proxy.save_failed"));
     }
   }, [draft, onSettings, settings]);
 
@@ -5754,12 +5755,12 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
       const result = await api.post<{ detected: string | null }>("settings/proxy/detect", {});
       if (result.detected) {
         patch({ url: result.detected });
-        toast.success(`检测到系统代理：${result.detected}`);
+        toast.success(t("settings:proxy.detected", { url: result.detected }));
       } else {
-        toast.message("未检测到系统代理", { description: "系统代理当前未开启，或代理工具尚未启动。" });
+        toast.message(t("settings:proxy.none_detected"), { description: t("settings:proxy.none_detected_desc") });
       }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "检测失败");
+      toast.error(err instanceof Error ? err.message : t("settings:proxy.detect_failed"));
     } finally {
       setDetecting(false);
     }
@@ -5785,7 +5786,7 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
       parsed !== null &&
       (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1 || parsed > 65535)
     ) {
-      toast.error("端口必须是 1–65535 之间的整数");
+      toast.error(t("settings:proxy.port_invalid"));
       return;
     }
     if (!announce && !portDirtyRef.current) return;
@@ -5793,9 +5794,9 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
       await api.post<{ preferredPort: number | null }>("settings/port", { port: parsed });
       portDirtyRef.current = false;
       onSettings({ ...settings, preferredPort: parsed } as Settings);
-      if (announce) toast.success("端口设置已保存，重启应用后生效");
+      if (announce) toast.success(t("settings:proxy.port_saved"));
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "保存端口设置失败");
+      toast.error(err instanceof Error ? err.message : t("settings:proxy.port_save_failed"));
     }
   }, [portDraft, onSettings, settings]);
 
@@ -5807,38 +5808,38 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
 
   const activeDisplay = status?.activeUrl
     ? status.source === "system"
-      ? `${status.activeUrl}（来自系统代理）`
+      ? t("settings:proxy.active_from_system", { url: status.activeUrl })
       : status.activeUrl
-    : "未启用（所有请求直连）";
+    : t("settings:proxy.not_active");
 
   return (
     <>
-      <SectionHeader icon={Globe} title="代理与端口" subtitle="为 AI API、搜索、MCP 等所有出站请求统一指定 HTTP 代理，以及本地服务的监听端口。代理留空将自动跟随系统代理，端口留空将自动选择。" />
+      <SectionHeader icon={Globe} title={t("settings:proxy.title")} subtitle={t("settings:proxy.subtitle")} />
       <div className="space-y-4">
       <div className="space-y-5 rounded-lg border bg-card p-6">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <div className="text-base font-medium">HTTP 代理设置</div>
-            <div className="mt-1 text-xs text-muted-foreground">所有 AI API 请求均通过此代理转发</div>
+            <div className="text-base font-medium">{t("settings:proxy.http_title")}</div>
+            <div className="mt-1 text-xs text-muted-foreground">{t("settings:proxy.http_desc")}</div>
           </div>
           <Button type="button" variant="outline" size="sm" onClick={() => void detectSystemProxy()} disabled={detecting}>
             {detecting ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-            自动检测系统代理
+            {t("settings:proxy.detect")}
           </Button>
         </div>
 
         <label className="block space-y-2">
-          <span className="text-sm font-medium">代理地址</span>
+          <span className="text-sm font-medium">{t("settings:proxy.address")}</span>
           <Input
             value={draft.url}
             onChange={(event) => patch({ url: event.target.value })}
-            placeholder="http://127.0.0.1:7890（留空 = 跟随系统代理）"
+            placeholder={t("settings:proxy.address_ph")}
           />
         </label>
 
         <label className="block space-y-2">
           <span className="text-sm font-medium">
-            用户名 <span className="text-xs font-normal text-muted-foreground">（可选）</span>
+            {t("settings:proxy.username")} <span className="text-xs font-normal text-muted-foreground">{t("settings:proxy.optional")}</span>
           </span>
           <Input
             value={draft.username}
@@ -5850,7 +5851,7 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
 
         <label className="block space-y-2">
           <span className="text-sm font-medium">
-            密码 <span className="text-xs font-normal text-muted-foreground">（可选）</span>
+            {t("settings:proxy.password")} <span className="text-xs font-normal text-muted-foreground">{t("settings:proxy.optional")}</span>
           </span>
           <div className="flex gap-2">
             <Input
@@ -5867,20 +5868,20 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
         </label>
 
         <div className="rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          当前代理：<span className="font-mono text-foreground">{activeDisplay}</span>
+          {t("settings:proxy.current")}:<span className="font-mono text-foreground">{activeDisplay}</span>
         </div>
       </div>
 
       <div className="space-y-4 rounded-lg border bg-card p-6">
         <div>
-          <div className="text-base font-medium">服务端口</div>
+          <div className="text-base font-medium">{t("settings:proxy.port_title")}</div>
           <div className="mt-1 text-xs text-muted-foreground">
-            应用本地服务监听的端口，默认 8080。留空将自动选择；填写后优先使用该端口，被占用时自动顺延到下一个可用端口。修改后需重启应用生效。
+            {t("settings:proxy.port_desc")}
           </div>
         </div>
         <label className="block space-y-2">
           <span className="text-sm font-medium">
-            端口号 <span className="text-xs font-normal text-muted-foreground">（留空 = 自动，默认 8080）</span>
+            {t("settings:proxy.port_number")} <span className="text-xs font-normal text-muted-foreground">{t("settings:proxy.port_number_hint")}</span>
           </span>
           <Input
             type="number"
@@ -5897,7 +5898,7 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
           />
         </label>
         <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-          修改端口后需要重启应用才能生效。当前运行中的实例仍使用原端口。
+          {t("settings:proxy.port_restart_note")}
         </div>
       </div>
       </div>

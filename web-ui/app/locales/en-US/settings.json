@@ -45,5 +45,34 @@
       "send_on_enter": "Send on Enter",
       "auto_scroll": "Auto-scroll"
     }
+  },
+  "proxy": {
+    "title": "Proxy & port",
+    "subtitle": "Set an HTTP proxy for all outbound traffic (AI APIs, search, MCP) and the local service port. Leave the proxy blank to follow the system proxy; leave the port blank to auto-select.",
+    "http_title": "HTTP proxy",
+    "http_desc": "All AI API requests are routed through this proxy",
+    "detect": "Detect system proxy",
+    "address": "Proxy address",
+    "address_ph": "http://127.0.0.1:7890 (blank = follow system proxy)",
+    "username": "Username",
+    "password": "Password",
+    "optional": "(optional)",
+    "current": "Current proxy",
+    "saved": "Proxy settings saved",
+    "save_failed": "Failed to save proxy settings",
+    "detected": "System proxy detected: {{url}}",
+    "none_detected": "No system proxy detected",
+    "none_detected_desc": "The system proxy is off, or the proxy tool hasn't started yet.",
+    "detect_failed": "Detection failed",
+    "port_title": "Service port",
+    "port_desc": "Port the local service listens on, default 8080. Leave blank to auto-select; a fixed port is used when set, walking up if occupied. Takes effect after restart.",
+    "port_number": "Port number",
+    "port_number_hint": "(blank = auto, default 8080)",
+    "port_invalid": "Port must be an integer between 1 and 65535",
+    "port_saved": "Port saved, effective after restart",
+    "port_save_failed": "Failed to save port settings",
+    "port_restart_note": "Port changes take effect after restarting. The running instance still uses the old port.",
+    "active_from_system": "{{url}} (from system proxy)",
+    "not_active": "Not enabled (direct connection)"
   }
 }
