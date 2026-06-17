@@ -207,6 +207,7 @@ const dashboardHtml = `<!DOCTYPE html>
         <button data-d="30" class="active">30 天</button>
         <button data-d="90">90 天</button>
         <button data-d="180">180 天</button>
+        <button data-d="all">全部</button>
         <button data-d="custom">自定义</button>
       </div>
       <div class="custom-range" id="custom-range">
@@ -217,6 +218,14 @@ const dashboardHtml = `<!DOCTYPE html>
   </div>
 
   <div class="filterbar fade-in">
+    <div class="filter-group">
+      <span class="filter-label">用户群</span>
+      <div class="seg" id="seg-seg">
+        <button data-seg="all" class="active">全部</button>
+        <button data-seg="new">本期新增</button>
+        <button data-seg="returning">存量回访</button>
+      </div>
+    </div>
     <div class="filter-group">
       <span class="filter-label">系统</span>
       <div class="seg" id="os-seg">
@@ -251,7 +260,7 @@ const BASE  = location.origin;
 const CSV_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
 
 // ── 状态(URL hash 持久化)──
-let currentDays = 30, currentOs = 'all', currentVer = 'all';
+let currentDays = 30, currentOs = 'all', currentVer = 'all', currentSegment = 'all';
 let currentStart = null, currentEnd = null;
 let activeSection = 'overview', activeRetTab = 'new';
 let showMA = false;          // 概览 DAU 趋势是否叠加 7 日均线
@@ -263,24 +272,27 @@ const fmtPct = n => (n != null ? n + '%' : '—');
 
 function readHash() {
   const h = new URLSearchParams(location.hash.replace(/^#/, ''));
-  currentDays = parseInt(h.get('d') || '30', 10);
-  currentOs = h.get('os') || 'all';
-  currentVer = h.get('v') || 'all';
+  const d = h.get('d');
   currentStart = h.get('start') || null;
   currentEnd = h.get('end') || null;
-  activeSection = h.get('s') || 'overview';
   if (currentStart && currentEnd) currentDays = 'custom';
+  else if (d === 'all') currentDays = 'all';
+  else currentDays = parseInt(d || '30', 10);
+  currentOs = h.get('os') || 'all';
+  currentVer = h.get('v') || 'all';
+  currentSegment = h.get('seg') || 'all';
+  activeSection = h.get('s') || 'overview';
 }
 function writeHash() {
   const p = new URLSearchParams();
   if (currentDays === 'custom') { p.set('start', currentStart); p.set('end', currentEnd); }
   else p.set('d', String(currentDays));
-  p.set('os', currentOs); p.set('v', currentVer); p.set('s', activeSection);
+  p.set('os', currentOs); p.set('v', currentVer); p.set('seg', currentSegment); p.set('s', activeSection);
   location.hash = p.toString();
 }
 
 async function fetchData() {
-  const p = new URLSearchParams({ token: TOKEN, os: currentOs, version: currentVer });
+  const p = new URLSearchParams({ token: TOKEN, os: currentOs, version: currentVer, segment: currentSegment });
   if (currentDays === 'custom' && currentStart && currentEnd) { p.set('start', currentStart); p.set('end', currentEnd); }
   else p.set('days', String(currentDays));
   const r = await fetch(BASE + '/api/stats?' + p.toString());
@@ -362,7 +374,7 @@ function renderOverview(d) {
   html += kpi('日均 DAU', fmt(Math.round(avgDau)), '本期 ' + t.length + ' 天均值' + info('日均活跃设备数(去重)。环比 = 本期均值 ÷ 等长上期均值。'), sparkline(dauArr,'#818cf8'), pctDelta(avgDau, (pop.prevUserDays||0)/Math.max(1,t.length)));
   html += kpi('新增用户', fmt(sumNew), '本期首次出现设备' + info('周期内 first_seen 设备总数。环比 = 本期 ÷ 等长上期。'), sparkline(newArr,'#f472b6'), pctDelta(sumNew, pop.prevNew||0));
   html += kpi('月活 MAU', fmt(d.mau), '近 30 天去重 · DAU/MAU ' + fmtPct(d.stickinessMau) + info('月活=最近 30 天出现过的去重设备;DAU/MAU 即"粘性比",越高说明月内回访越频繁。'), '', '');
-  html += kpi('累计用户', fmt(d.totalUsers), '本期净增 ' + fmt(netAdd) + info('历史出现过的不重复设备总数。'), '', '');
+  html += kpi('累计用户', fmt(d.totalUsers), (currentSegment==='all' ? '本期净增 ' + fmt(netAdd) : '所选用户群设备数') + info('历史出现过的不重复设备总数。用户群筛选下变为该群的设备数。'), '', '');
   html += '</div>';
 
   // 健康度二级指标
@@ -424,9 +436,10 @@ function renderRetention(d) {
   let html = '<div class="section' + (activeSection==='retention'?' on':'') + '" id="sec-retention">';
 
   // 留存衰减曲线(加权均值 D1/D3/D7/D14/D30)
+  const segNote = currentSegment !== 'all' ? ' · 用户群筛选不影响留存(留存本身就是 cohort 分析)' : '';
   const curvePts = [[1,ar.d1],[3,ar.d3],[7,ar.d7],[14,ar.d14],[30,ar.d30]].filter(p=>p[1]!=null);
   html += '<div class="grid full">';
-  html += card('留存衰减曲线', '新用户 cohort 在 D+N 的加权平均回访率' + info('把所有已满龄的新用户 cohort 按规模加权平均,得到一条整体留存衰减曲线,是衡量产品长期粘性的核心指标。'),
+  html += card('留存衰减曲线', '新用户 cohort 在 D+N 的加权平均回访率' + segNote + info('把所有已满龄的新用户 cohort 按规模加权平均,得到一条整体留存衰减曲线,是衡量产品长期粘性的核心指标。'),
     null, curvePts.length>=2 ? '<div class="chart-wrap short"><canvas id="ret-curve"></canvas></div>' : emptyState('满龄 cohort 不足'));
   html += '</div>';
 
@@ -563,11 +576,14 @@ function render(d) {
 
 function syncSummary(d) {
   const f = d.filter || {};
+  const segTxt = f.segment === 'new' ? '本期新增' : f.segment === 'returning' ? '存量回访' : '全部用户';
   const osTxt = f.os && f.os!=='all' ? ({win:'Windows',linux:'Linux',mac:'macOS'}[f.os]) : '全部系统';
   const verTxt = f.version && f.version!=='all' ? f.version : '全部版本';
-  document.getElementById('filter-summary').textContent = osTxt + ' · ' + verTxt + ' · 数据截至 ' + (f.asOf || '—');
+  const rangeTxt = (f.range === 'all') ? '全部历史' : (f.range === 'custom' ? '自定义' : ('近 ' + (d.trends||[]).length + ' 天'));
+  document.getElementById('filter-summary').textContent = segTxt + ' · ' + osTxt + ' · ' + verTxt + ' · ' + rangeTxt + ' · 截至 ' + (f.asOf || '—');
   document.getElementById('updated').textContent = new Date().toTimeString().slice(0,8) + ' 已更新';
-  if ((!f.version || f.version==='all') && d.versions && d.versions.length) { allVersions = d.versions; populateVersionSelect(); }
+  // 版本下拉缓存:仅在"全部用户群 + 全部版本"时取全集,避免被筛掉后下拉失真
+  if ((!f.segment || f.segment==='all') && (!f.version || f.version==='all') && d.versions && d.versions.length) { allVersions = d.versions; populateVersionSelect(); }
 }
 
 // ── 图表 ──
@@ -718,6 +734,7 @@ function syncControls() {
     document.getElementById('end-date').value = currentEnd || '';
   }
   document.querySelectorAll('#os-seg button').forEach(b => b.classList.toggle('active', b.dataset.os===currentOs));
+  document.querySelectorAll('#seg-seg button').forEach(b => b.classList.toggle('active', b.dataset.seg===currentSegment));
   document.querySelectorAll('.section-nav button').forEach(b => b.classList.toggle('active', b.dataset.sec===activeSection));
   populateVersionSelect();
 }
@@ -727,7 +744,8 @@ document.getElementById('range').addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
   const d = b.dataset.d;
   if (d === 'custom') { document.getElementById('custom-range').classList.add('on'); return; }
-  currentDays = parseInt(d,10); currentStart = null; currentEnd = null; writeHash(); syncControls(); reload();
+  currentDays = (d === 'all') ? 'all' : parseInt(d, 10);
+  currentStart = null; currentEnd = null; writeHash(); syncControls(); reload();
 });
 document.getElementById('apply-custom').addEventListener('click', () => {
   const s = document.getElementById('start-date').value, en = document.getElementById('end-date').value;
@@ -735,6 +753,7 @@ document.getElementById('apply-custom').addEventListener('click', () => {
   currentStart = s; currentEnd = en; currentDays = 'custom'; writeHash(); syncControls(); reload();
 });
 document.getElementById('os-seg').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; currentOs = b.dataset.os; writeHash(); syncControls(); reload(); });
+document.getElementById('seg-seg').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; currentSegment = b.dataset.seg; writeHash(); syncControls(); reload(); });
 document.getElementById('ver-select').addEventListener('change', e => { currentVer = e.target.value; writeHash(); reload(); });
 document.getElementById('refresh-btn').addEventListener('click', () => reload(true));
 document.querySelector('.section-nav').addEventListener('click', e => {
@@ -745,7 +764,8 @@ document.querySelector('.section-nav').addEventListener('click', e => {
 });
 
 readHash(); syncControls(); load();
-setInterval(load, 120000);
+// 不做自动刷新:这是单人低频管理后台,自动刷新只会白烧 D1 免费额度。
+// 想看最新数据点顶部"刷新"按钮,或切换任意筛选都会重新拉取。
 <\/script>
 </body>
 </html>`;
