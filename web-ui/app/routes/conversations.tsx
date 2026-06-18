@@ -856,7 +856,9 @@ const ConversationTimeline = React.memo(
 
     const virtuosoRef = React.useRef<VirtuosoHandle>(null);
     const [isAtBottom, setIsAtBottom] = React.useState(true);
+    const [isAtTop, setIsAtTop] = React.useState(false);
     const [topVisibleIndex, setTopVisibleIndex] = React.useState(0);
+    const [topEndIndex, setTopEndIndex] = React.useState(0);
     const didInitialScrollRef = React.useRef<string | null>(null);
 
     // 进入会话(或切换会话):首次数据就绪时滚到最后一条。Virtuoso 默认初始在顶部;
@@ -913,7 +915,11 @@ const ConversationTimeline = React.memo(
             computeItemKey={(_, item) => item.message.id}
             followOutput={(atBottom) => (atBottom ? "smooth" : false)}
             atBottomStateChange={setIsAtBottom}
-            rangeChanged={({ startIndex }) => setTopVisibleIndex(startIndex)}
+            atTopStateChange={setIsAtTop}
+            rangeChanged={({ startIndex, endIndex }) => {
+              setTopVisibleIndex(startIndex);
+              setTopEndIndex(endIndex);
+            }}
             increaseViewportBy={800}
             components={{
               Header: () => <div className="h-4" />,
@@ -980,7 +986,13 @@ const ConversationTimeline = React.memo(
                   role: message.role,
                   preview: getQuickJumpPreview(message, t),
                 }))}
-                activeIndex={topVisibleIndex}
+                activeIndex={
+                  isAtBottom
+                    ? selectedNodeMessages.length - 1
+                    : isAtTop
+                      ? 0
+                      : Math.round((topVisibleIndex + topEndIndex) / 2)
+                }
                 onItemClick={(index) =>
                   virtuosoRef.current?.scrollToIndex({ index, behavior: "smooth", align: "start" })
                 }
