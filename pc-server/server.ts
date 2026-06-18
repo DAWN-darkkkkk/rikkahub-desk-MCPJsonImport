@@ -11899,6 +11899,37 @@ function imageFileExtension(mime: string) {
   return ".png";
 }
 
+// 对齐安卓 toImageMimeType:output_format 字段 → MIME。
+function imageFormatToMime(format: string | undefined): string {
+  const f = (format ?? "").toLowerCase();
+  if (f === "jpg" || f === "jpeg") return "image/jpeg";
+  if (f === "webp") return "image/webp";
+  return "image/png";
+}
+
+// 对齐安卓 OpenAIProvider.parseImageResponse / downloadImageAsBase64:
+// 单条 data item 优先取 b64_json(按 output_format 推导 MIME);否则取 url,
+// 下载图片并 base64 编码,用响应 Content-Type 作 MIME。
+// 兼容部分 OpenAI 兼容代理(如腾讯云 COS)只返回 url、不返回 b64_json 的情况。
+async function parseImageDataItem(
+  item: Record<string, JsonValue> | undefined,
+  defaultFormat: string,
+): Promise<{ data: string; mime: string } | null> {
+  if (!item || typeof item !== "object") return null;
+  const b64 = String(item.b64_json ?? "");
+  if (b64) {
+    const format = typeof item.output_format === "string" ? item.output_format : defaultFormat;
+    return { data: b64, mime: imageFormatToMime(format) };
+  }
+  const url = String(item.url ?? "");
+  if (!url) return null;
+  const dlResp = await fetch(url);
+  if (!dlResp.ok) throw new Error(`Failed to download generated image: ${dlResp.status}`);
+  const buf = Buffer.from(await dlResp.arrayBuffer());
+  const contentType = dlResp.headers.get("content-type")?.split(";")[0]?.trim();
+  return { data: buf.toString("base64"), mime: contentType || imageFormatToMime(defaultFormat) };
+}
+
 async function saveGeneratedImage(
   data: string,
   mime: string,
@@ -12022,11 +12053,12 @@ async function callImageGeneration(input: {
     });
     if (!response.ok) throw new Error(`Failed to edit image: ${response.status} ${text.slice(0, 500)}`);
     const raw = JSON.parse(text || "{}");
+    const defaultFormat = String(raw.output_format ?? "png");
     const sourceFileIds = references.map((file) => file.id);
     const items = [];
     for (const item of Array.isArray(raw.data) ? raw.data : []) {
-      const data = String(item?.b64_json ?? "");
-      if (data) items.push(await saveGeneratedImage(data, "image/png", input.prompt, modelItem, "image_edit", sourceFileIds));
+      const parsed = await parseImageDataItem(item as Record<string, JsonValue> | undefined, defaultFormat);
+      if (parsed) items.push(await saveGeneratedImage(parsed.data, parsed.mime, input.prompt, modelItem, "image_edit", sourceFileIds));
     }
     return items;
   }
@@ -12053,10 +12085,11 @@ async function callImageGeneration(input: {
   });
   if (!response.ok) throw new Error(`Failed to generate image: ${response.status} ${text.slice(0, 500)}`);
   const raw = JSON.parse(text || "{}");
+  const defaultFormat = String(raw.output_format ?? "png");
   const items = [];
   for (const item of Array.isArray(raw.data) ? raw.data : []) {
-    const data = String(item?.b64_json ?? "");
-    if (data) items.push(await saveGeneratedImage(data, "image/png", input.prompt, modelItem, "image_generation"));
+    const parsed = await parseImageDataItem(item as Record<string, JsonValue> | undefined, defaultFormat);
+    if (parsed) items.push(await saveGeneratedImage(parsed.data, parsed.mime, input.prompt, modelItem, "image_generation"));
   }
   return items;
 }
