@@ -1,3 +1,5 @@
+import * as React from "react";
+
 import Markdown from "~/components/markdown/markdown";
 
 interface TextPartProps {
@@ -7,7 +9,9 @@ interface TextPartProps {
   citationOrdinalMap?: Map<string, number>;
 }
 
-export function TextPart({
+// memo:MessageParts 重渲染时,未变更的文本块跳过 reconciliation,避免重建 <Markdown>
+// 元素树。流式输出时只有正在生成的那条消息进 Markdown,其余文本块稳定不动。
+export const TextPart = React.memo(function TextPart({
   text,
   isAnimating,
   onClickCitation,
@@ -25,4 +29,4 @@ export function TextPart({
       />
     </div>
   );
-}
+});

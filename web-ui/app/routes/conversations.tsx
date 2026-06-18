@@ -8,13 +8,8 @@ import {
 } from "~/components/conversation-quick-jump";
 import { ConversationSidebar } from "~/components/conversation-sidebar";
 import { useTheme } from "~/components/theme-provider";
-import {
-  Conversation,
-  ConversationContent,
-  ConversationEmptyState,
-  ConversationScrollButton,
-} from "~/components/extended/conversation";
-import { useStickToBottomContext } from "use-stick-to-bottom";
+import { ConversationEmptyState } from "~/components/extended/conversation";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { ChatInput } from "~/components/input/chat-input";
 import { ChatMessage } from "~/components/message/chat-message";
 import { Button } from "~/components/ui/button";
@@ -70,7 +65,7 @@ import {
   type Settings,
   type UIMessagePart,
 } from "~/types";
-import { Loader2, MessageSquare, Moon, Pencil, Sun } from "lucide-react";
+import { ArrowDown, Loader2, MessageSquare, Moon, Pencil, Sun } from "lucide-react";
 import Logo from "~/components/logo";
 import type { PanelImperativeHandle } from "react-resizable-panels";
 import { useTranslation } from "react-i18next";
@@ -160,23 +155,6 @@ function ConversationSystemPromptButton({
 }
 
 type ConversationSummaryUpdater = (update: ReturnType<typeof toConversationSummaryUpdate>) => void;
-
-function ConversationAutoScroll({
-  conversationId,
-  messageCount,
-}: {
-  conversationId: string | null;
-  messageCount: number;
-}) {
-  const { scrollToBottom } = useStickToBottomContext();
-
-  React.useEffect(() => {
-    if (!conversationId) return;
-    window.requestAnimationFrame(() => scrollToBottom("instant"));
-  }, [conversationId, messageCount, scrollToBottom]);
-
-  return null;
-}
 
 const EDIT_DRAFT_ATTACHMENT_MARK = "__from_message_attachment";
 const EDIT_DRAFT_SOURCE_INDEX = "__from_message_source_index";
@@ -858,7 +836,6 @@ const ConversationTimeline = React.memo(
         null
       );
     }, [assistant?.chatModelId, modelById, settings]);
-    const lastMessageId = selectedNodeMessages.at(-1)?.message.id ?? null;
 
     // 仅对"进入会话(或切换会话)之后才新出现的消息"播放入场动画。首次加载的历史
     // 消息一律不动画——避免长会话进入时 N 条消息并发播 4 属性动画拖垮首屏 mount。
@@ -877,65 +854,81 @@ const ConversationTimeline = React.memo(
     }
     const knownMessageIds = knownIdsRef.current.ids;
 
+    const virtuosoRef = React.useRef<VirtuosoHandle>(null);
+    const [isAtBottom, setIsAtBottom] = React.useState(true);
+    const [topVisibleIndex, setTopVisibleIndex] = React.useState(0);
+    const didInitialScrollRef = React.useRef<string | null>(null);
+
+    // 进入会话(或切换会话):首次数据就绪时滚到最后一条。Virtuoso 默认初始在顶部;
+    // 流式新消息的自动跟底由 followOutput 处理,这里只负责"进入会话定位到底部"。
     React.useEffect(() => {
-      if (!activeId || detailLoading || detailError || !lastMessageId) return;
+      if (!activeId || detailLoading || detailError || selectedNodeMessages.length === 0) {
+        return;
+      }
+      if (didInitialScrollRef.current === activeId) return;
+      didInitialScrollRef.current = activeId;
+      const lastIndex = selectedNodeMessages.length - 1;
       const frame = window.requestAnimationFrame(() => {
-        document
-          .getElementById(getConversationMessageAnchorId(lastMessageId))
-          ?.scrollIntoView({ block: "end", inline: "nearest" });
+        virtuosoRef.current?.scrollToIndex({ index: lastIndex, behavior: "auto", align: "end" });
       });
       return () => window.cancelAnimationFrame(frame);
-    }, [activeId, detailError, detailLoading, lastMessageId]);
+    }, [activeId, detailError, detailLoading, selectedNodeMessages.length]);
 
     return (
-      <Conversation key={activeId ?? "home"} className="flex-1 min-h-0">
-        <ConversationAutoScroll
-          conversationId={activeId}
-          messageCount={selectedNodeMessages.length}
-        />
-        <ConversationContent
-          className={cn("mx-auto w-full max-w-3xl gap-4 px-4 py-6", contentClassName)}
-        >
-          {!activeId && !isHomeRoute && (
-            <ConversationEmptyState
-              icon={<MessageSquare className="size-10" />}
-              title={t("conversations.empty_state.select_title")}
-              description={t("conversations.empty_state.select_description")}
-            />
-          )}
-          {activeId && detailLoading && (
-            <ConversationEmptyState
-              title={t("conversations.empty_state.loading_title")}
-              description={t("conversations.empty_state.loading_description")}
-            />
-          )}
-          {activeId && detailError && (
-            <ConversationEmptyState
-              title={t("conversations.empty_state.error_title")}
-              description={detailError}
-            />
-          )}
-          {!detailLoading && !detailError && activeId && selectedNodeMessages.length === 0 && (
+      <div className="relative flex-1 min-h-0">
+        {!activeId && !isHomeRoute ? (
+          <ConversationEmptyState
+            icon={<MessageSquare className="size-10" />}
+            title={t("conversations.empty_state.select_title")}
+            description={t("conversations.empty_state.select_description")}
+          />
+        ) : detailLoading ? (
+          <ConversationEmptyState
+            title={t("conversations.empty_state.loading_title")}
+            description={t("conversations.empty_state.loading_description")}
+          />
+        ) : detailError ? (
+          <ConversationEmptyState
+            title={t("conversations.empty_state.error_title")}
+            description={detailError}
+          />
+        ) : selectedNodeMessages.length === 0 ? (
+          isGenerating ? (
+            <div className="flex items-start px-4 py-2">
+              <TypingIndicator className="px-1 py-2" />
+            </div>
+          ) : (
             <ConversationEmptyState
               icon={<MessageSquare className="size-10" />}
               title={t("conversations.empty_state.no_message_title")}
               description={t("conversations.empty_state.no_message_description")}
             />
-          )}
-          {!detailLoading &&
-            !detailError &&
-            activeId &&
-            selectedNodeMessages.map(({ node, message }, index) => {
+          )
+        ) : (
+          <Virtuoso
+            key={activeId ?? "home"}
+            ref={virtuosoRef}
+            className="h-full"
+            data={selectedNodeMessages}
+            computeItemKey={(_, item) => item.message.id}
+            followOutput={(atBottom) => (atBottom ? "smooth" : false)}
+            atBottomStateChange={setIsAtBottom}
+            rangeChanged={({ startIndex }) => setTopVisibleIndex(startIndex)}
+            increaseViewportBy={800}
+            components={{
+              Header: () => <div className="h-4" />,
+              Footer: () => <div className="h-4" />,
+            }}
+            itemContent={(index, { node, message }) => {
               const model = message.modelId
                 ? (modelById.get(message.modelId) ?? fallbackModel)
                 : fallbackModel;
-
               return (
                 <div
-                  key={message.id}
                   id={getConversationMessageAnchorId(message.id)}
                   className={cn(
-                    "scroll-mt-24",
+                    "mx-auto w-full max-w-3xl px-4 py-2 scroll-mt-24",
+                    contentClassName,
                     !knownMessageIds.has(message.id) && "rikkahub-animate-fade-in-up",
                   )}
                 >
@@ -956,30 +949,46 @@ const ConversationTimeline = React.memo(
                   />
                 </div>
               );
-            })}
-          {!detailLoading &&
-            !detailError &&
-            activeId &&
-            isGenerating &&
-            selectedNodeMessages.length === 0 && (
-              <div className="flex items-start py-2">
-                <TypingIndicator className="px-1 py-2" />
-              </div>
-            )}
-        </ConversationContent>
-
-        {canQuickJump ? (
-          <ConversationQuickJump
-            items={selectedNodeMessages.map(({ message }) => ({
-              id: message.id,
-              role: message.role,
-              preview: getQuickJumpPreview(message, t),
-            }))}
+            }}
           />
-        ) : null}
+        )}
 
-        <ConversationScrollButton />
-      </Conversation>
+        {!detailLoading && !detailError && activeId && selectedNodeMessages.length > 0 ? (
+          <>
+            {!isAtBottom ? (
+              <Button
+                aria-label={t("conversations.scroll_to_bottom", "滚动到底部")}
+                className="absolute bottom-4 left-1/2 z-10 -translate-x-1/2 rounded-full shadow-md transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg dark:bg-background dark:hover:bg-muted"
+                onClick={() =>
+                  virtuosoRef.current?.scrollToIndex({
+                    index: selectedNodeMessages.length - 1,
+                    behavior: "smooth",
+                    align: "end",
+                  })
+                }
+                size="icon"
+                type="button"
+                variant="outline"
+              >
+                <ArrowDown className="size-4" />
+              </Button>
+            ) : null}
+            {canQuickJump ? (
+              <ConversationQuickJump
+                items={selectedNodeMessages.map(({ message }) => ({
+                  id: message.id,
+                  role: message.role,
+                  preview: getQuickJumpPreview(message, t),
+                }))}
+                activeIndex={topVisibleIndex}
+                onItemClick={(index) =>
+                  virtuosoRef.current?.scrollToIndex({ index, behavior: "smooth", align: "start" })
+                }
+              />
+            ) : null}
+          </>
+        ) : null}
+      </div>
     );
   },
 );

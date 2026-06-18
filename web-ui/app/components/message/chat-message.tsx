@@ -220,45 +220,74 @@ function formatNumber(value: number): string {
   return new Intl.NumberFormat().format(value);
 }
 
-// 当前选中模型的 context limit 缓存(按 "providerType/modelId" 键,值是 Promise)。
-// 让统计行分母跟随"当前模型"而非"生成时模型"——切模型时分母立即更新,辅助用户判断
-// "换成这个模型容量够不够"。缓存 Promise 而非解析后的值,是为了同 tick 去重:一条对话
-// 50 条消息同时 mount 时只发 1 个请求(而不是 50 个),解析完的 Promise 复用即零开销。
+// 当前选中模型的 context limit。提升为 module 级共享状态(useSyncExternalStore):
+// 原实现每条消息各自 useState + useEffect,切模型时 N 条消息 = N 个 effect 重跑 + 2N 次
+// setState(undefined→v)抖动。改为单一 module 状态 + 订阅:切模型只在第一个消费者触发时
+// 算一次,结果广播给所有 NerdLineRow,避免 N 条消息各自抖动。
 const contextLimitCache = new Map<string, Promise<number | null>>();
+type ContextLimitState = {
+  modelId: string;
+  providerType: string;
+  limit: number | null | undefined;
+};
+let sharedContextLimit: ContextLimitState = { modelId: "", providerType: "", limit: undefined };
+const contextLimitListeners = new Set<() => void>();
+function notifyContextLimit() {
+  for (const listener of contextLimitListeners) listener();
+}
+function ensureContextLimit(modelId: string, providerType: string) {
+  if (
+    sharedContextLimit.modelId === modelId &&
+    sharedContextLimit.providerType === providerType
+  ) {
+    return;
+  }
+  // 切到新模型:分母先回退到 undefined(getNerdStats 回退到 usage.contextLimit 快照),避免
+  // 短暂显示上一个模型的 live 值。然后异步取新模型的 limit。
+  sharedContextLimit = { modelId, providerType, limit: undefined };
+  notifyContextLimit();
+  if (!modelId || !providerType) return;
+  const cacheKey = `${providerType}/${modelId}`;
+  // 首次查才发请求,后续(含同 tick 其他消息)复用同一 Promise。后端 context-limit 路由
+  // 会 await models.dev 加载完,所以 null 的语义是确定的"models.dev 里查不到"——可安全缓存。
+  let p = contextLimitCache.get(cacheKey);
+  if (!p) {
+    p = api
+      .get<{ contextLimit: number | null }>(
+        `context-limit?modelId=${encodeURIComponent(modelId)}&providerType=${encodeURIComponent(providerType)}`,
+      )
+      .then((res) => res.contextLimit ?? null)
+      .catch(() => null);
+    contextLimitCache.set(cacheKey, p);
+  }
+  void p.then((v) => {
+    // 结果到达时仍要确认没再切模型,否则会覆盖更新的查询。
+    if (
+      sharedContextLimit.modelId === modelId &&
+      sharedContextLimit.providerType === providerType
+    ) {
+      sharedContextLimit = { ...sharedContextLimit, limit: v };
+      notifyContextLimit();
+    }
+  });
+}
 function useCurrentContextLimit(): number | null | undefined {
   const { currentModel, currentProvider } = useCurrentModel();
-  const modelId = currentModel?.modelId;
+  const modelId = currentModel?.modelId ?? "";
   // currentProvider.type 经 ProviderProfile 的索引签名返回 unknown,显式窄化为 string。
   const providerType = typeof currentProvider?.type === "string" ? currentProvider.type : "";
-  const [limit, setLimit] = React.useState<number | null | undefined>(undefined);
   React.useEffect(() => {
-    if (!modelId || !providerType) {
-      setLimit(undefined);
-      return;
-    }
-    const cacheKey = `${providerType}/${modelId}`;
-    // 首次查才发请求,后续(含同 tick 其他消息)复用同一 Promise。后端 context-limit 路由
-    // 会 await models.dev 加载完,所以 null 的语义是确定的"models.dev 里查不到"——可安全缓存。
-    let p = contextLimitCache.get(cacheKey);
-    if (!p) {
-      p = api
-        .get<{ contextLimit: number | null }>(
-          `context-limit?modelId=${encodeURIComponent(modelId)}&providerType=${encodeURIComponent(providerType)}`,
-        )
-        .then((res) => res.contextLimit ?? null)
-        .catch(() => null);
-      contextLimitCache.set(cacheKey, p);
-    }
-    let cancelled = false;
-    setLimit(undefined); // loading:此时 getNerdStats 回退到 usage.contextLimit(不闪烁)
-    void p.then((v) => {
-      if (!cancelled) setLimit(v);
-    });
-    return () => {
-      cancelled = true;
-    };
+    ensureContextLimit(modelId, providerType);
   }, [modelId, providerType]);
-  return limit;
+  return React.useSyncExternalStore(
+    (onStoreChange) => {
+      contextLimitListeners.add(onStoreChange);
+      return () => {
+        contextLimitListeners.delete(onStoreChange);
+      };
+    },
+    () => sharedContextLimit.limit,
+  );
 }
 
 function getDurationMs(createdAt: string, finishedAt?: string | null): number | null {
@@ -1025,8 +1054,8 @@ export const ChatMessage = React.memo(
                 isUser
                   ? "max-w-[85%] rounded-2xl rounded-tr-md border border-border/30 bg-muted px-4 py-3 text-foreground shadow-card hover:-translate-x-0.5 hover:shadow-elevated"
                   : showAssistantBubble
-                    ? "w-fit max-w-[92%] rounded-2xl border border-border/40 bg-muted/40 px-3 py-2 shadow-sm hover:bg-muted/60"
-                    : "w-full hover:bg-muted/20",
+                    ? "w-fit max-w-[92%] rounded-2xl border border-border/40 bg-muted/40 px-3 py-2 shadow-sm"
+                    : "w-full",
               )}
             >
               <MessageParts
