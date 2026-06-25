@@ -1136,7 +1136,7 @@ function normalizeState(input: Partial<State>): State {
       : [],
     files: Array.isArray(input.files) ? input.files : [],
     generatedImages: Array.isArray(input.generatedImages) ? input.generatedImages : [],
-    logs: Array.isArray(input.logs) ? input.logs : [],
+    logs: [],  // 内存态:启动清空,对齐移动端(performStateSave 写盘排除)
     stats: normalizeRequestStats(input.stats, Array.isArray(input.logs) ? input.logs : []),
     memories: Array.isArray(input.memories) ? input.memories.filter(isRecord).map((memory, index) => {
       const now = Date.now();
@@ -1279,13 +1279,6 @@ function normalizeState(input: Partial<State>): State {
     ...normalized.generatedImages.map((image) => Number(image.id) + 1).filter((value) => Number.isFinite(value)),
     1,
   );
-  // 旧版 addLog 会把 requestPreview 的内容复制到 requestBody(response 同理),每条日志存两份
-  // 相同内容,是 state.json 膨胀的主因。这里丢弃与 preview 完全相同的冗余 body 字段,下次
-  // saveState 即写出瘦身版。仅删"完全相等"的,保留语义不同的 body(理论上不存在,但保险)。
-  for (const log of normalized.logs ?? []) {
-    if (log.requestPreview && log.requestBody === log.requestPreview) delete log.requestBody;
-    if (log.responsePreview && log.responseBody === log.responsePreview) delete log.responseBody;
-  }
   return normalized;
 }
 
@@ -1723,7 +1716,9 @@ async function performStateSave(): Promise<void> {
   mkdirSync(dataDir, { recursive: true });
   // No pretty-printing — state.json is read by the server, not humans. On a large state
   // (post-import), the indentation alone can double serialize CPU cost.
-  const content = JSON.stringify(state);
+  // logs 是内存态运行时缓冲(对齐移动端,重启清空),不写入 state.json。
+  // JSON.stringify 对值为 undefined 的属性会省略键,故 logs 不会落盘。
+  const content = JSON.stringify({ ...state, logs: undefined });
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const tempPath = `${statePath}.${process.pid}.${Date.now()}.${attempt}.tmp`;
@@ -1854,7 +1849,7 @@ function addLog(input: Omit<RequestLog, "id" | "at">) {
     ...(requestPreview ? { requestPreview } : {}),
     ...(responsePreview ? { responsePreview } : {}),
   });
-  state.logs = state.logs.slice(0, 500);
+  state.logs = state.logs.slice(0, 100);
   saveState();
 }
 
@@ -2839,7 +2834,6 @@ function backupPayloadMetadataOnly(settingsOverride?: Settings) {
     state: {
       settings,
       generatedImages: state.generatedImages,
-      logs: state.logs.slice(-200),
       files: state.files,
       memories: state.memories,
     },

@@ -1963,8 +1963,9 @@ async function runImageGenerationSmoke() {
   const stateAfter = JSON.parse(readFileSync(join(tempDir, "state.json"), "utf8"));
   assert(stateAfter.generatedImages.some((item: AnyRecord) => item.type === "image_generation" && item.prompt === "smoke generated image"), "generated image was not persisted");
   assert(stateAfter.generatedImages.some((item: AnyRecord) => item.type === "image_edit" && item.sourceFileIds?.[0] === referenceId), "edited image reference was not persisted");
-  assert(stateAfter.logs.some((log: AnyRecord) => log.kind === "provider:image:generation" && log.requestPreview?.includes("smoke generated image")), "image generation log missing request preview");
-  assert(stateAfter.logs.some((log: AnyRecord) => log.kind === "provider:image:edit" && log.requestPreview?.includes("reference.png")), "image edit log missing multipart reference preview");
+  const imageLogs = await api("/api/logs");
+  assert(imageLogs.some((log: AnyRecord) => log.kind === "provider:image:generation" && log.requestPreview?.includes("smoke generated image")), "image generation log missing request preview");
+  assert(imageLogs.some((log: AnyRecord) => log.kind === "provider:image:edit" && log.requestPreview?.includes("reference.png")), "image edit log missing multipart reference preview");
   return { generated: generated.images.length, edited: edited.images.length, referenceId };
 }
 
@@ -2040,7 +2041,9 @@ async function runEpubStatsLogsSmoke() {
   assert(groupNames.includes("模型请求"), "stats missing model request group");
   assert(stats.totals?.requests > 0, "stats missing request totals");
   const logs = await api("/api/logs");
-  assert(logs.some((log: AnyRecord) => log.kind === "provider:aux:stream" && log.requestPreview && log.responsePreview), "logs missing auxiliary request/response previews");
+  // logs 已改为内存态(最近 100 条,对齐移动端)。smoke 全流程产生的日志远超 100 条,
+  // 特定 kind 的历史日志可能已滚出窗口,故只验证"日志记录了完整 preview"这一核心机制。
+  assert(logs.some((log: AnyRecord) => log.requestPreview && log.responsePreview), "logs missing request/response previews");
   return { epubTextLength: uploaded.extractedTextLength, requestGroups: groupNames, logCount: logs.length };
 }
 
@@ -2079,9 +2082,8 @@ async function main() {
     const webDavBackup = await runWebDavBackupSmoke();
     const imageGeneration = await runImageGenerationSmoke();
     const epubStatsLogs = await runEpubStatsLogsSmoke();
-    const state = JSON.parse(readFileSync(join(tempDir, "state.json"), "utf8"));
-    assert(state.logs.some((log: AnyRecord) => log.kind === "provider:chat:stream" && log.requestPreview), "request log for stream round missing");
-    assert(state.logs.some((log: AnyRecord) => log.kind === "provider:aux:stream" && log.requestPreview), "request log for streamed auxiliary work missing");
+    const logs = await api("/api/logs");
+    assert(logs.some((log: AnyRecord) => log.requestPreview), "no request log with preview captured");
     console.log(JSON.stringify({
       ok: true,
       chatRequests: chat.captured.length,
@@ -2109,7 +2111,7 @@ async function main() {
       webDavBackup,
       imageGeneration,
       epubStatsLogs,
-      logCount: state.logs.length,
+      logCount: logs.length,
       dataDir: tempDir,
     }, null, 2));
   } finally {
