@@ -289,6 +289,15 @@ interface RequestLog {
   toolName?: string;
 }
 
+// 与 logs 解耦的持久化请求统计累加器。logs 已改为内存态(重启清空,对齐移动端),
+// 但统计页的累计指标必须跨重启保留,所以单独维护计数器,每次请求完成时累加。
+interface RequestStats {
+  totalRequests: number;
+  failedRequests: number;
+  byProvider: Record<string, { ok: number; failed: number }>;
+  byGroup: Record<string, { ok: number; failed: number }>;
+}
+
 interface DailyStat {
   date: string;
   messages: number;
@@ -327,6 +336,7 @@ interface State {
   files: StoredFile[];
   generatedImages: GeneratedImage[];
   logs: RequestLog[];
+  stats: RequestStats;
   memories: AssistantMemory[];
   nextFileId: number;
   nextMemoryId: number;
@@ -1099,6 +1109,7 @@ function defaultState(): State {
     files: [],
     generatedImages: [],
     logs: [],
+    stats: defaultRequestStats(),
     memories: [],
     nextFileId: 1,
     nextMemoryId: 1,
@@ -1126,6 +1137,7 @@ function normalizeState(input: Partial<State>): State {
     files: Array.isArray(input.files) ? input.files : [],
     generatedImages: Array.isArray(input.generatedImages) ? input.generatedImages : [],
     logs: Array.isArray(input.logs) ? input.logs : [],
+    stats: normalizeRequestStats(input.stats, Array.isArray(input.logs) ? input.logs : []),
     memories: Array.isArray(input.memories) ? input.memories.filter(isRecord).map((memory, index) => {
       const now = Date.now();
       // Pre-2026-05 PC builds saved global-scope memories under "global" (without underscores).
@@ -1783,7 +1795,56 @@ async function flushSaveState(): Promise<void> {
 // 声明之后调用，否则会撞 TDZ 触发模块加载时的 ReferenceError，导致服务直接起不来。
 saveState();
 
+function classifyRequestGroup(kind: string, toolName: string): string {
+  if (kind.startsWith("mcp:")) return "MCP 请求";
+  if (kind.startsWith("search:") || kind.startsWith("tool:search") || kind.startsWith("tool:scrape") || toolName === "search_web" || toolName === "scrape_web") return "搜索引擎请求";
+  return "模型请求";
+}
+
+function defaultRequestStats(): RequestStats {
+  return { totalRequests: 0, failedRequests: 0, byProvider: {}, byGroup: {} };
+}
+
+// 把一条请求日志的计数累加进 stats(既用于实时累加,也用于老用户一次性迁移)。
+function bumpStatsCounters(stats: RequestStats, log: { ok: boolean; providerName: string; kind?: string; toolName?: string }): void {
+  stats.totalRequests += 1;
+  if (!log.ok) stats.failedRequests += 1;
+  const prov = stats.byProvider[log.providerName] ?? { ok: 0, failed: 0 };
+  if (log.ok) prov.ok += 1; else prov.failed += 1;
+  stats.byProvider[log.providerName] = prov;
+  const group = classifyRequestGroup(String(log.kind ?? ""), String(log.toolName ?? ""));
+  const grp = stats.byGroup[group] ?? { ok: 0, failed: 0 };
+  if (log.ok) grp.ok += 1; else grp.failed += 1;
+  stats.byGroup[group] = grp;
+}
+
+// 老用户的 state.json 没有 stats 字段(统计以前藏在持久化 logs 里)。加载时把旧 logs
+// 的统计一次性累加进 stats —— 之后 logs 改内存态会丢弃,但累计统计得以保留,老用户重启
+// 后统计页不会归零。新版本已有 stats 字段时直接沿用,不重复迁移(避免双算)。
+function normalizeRequestStats(raw: unknown, legacyLogs: RequestLog[]): RequestStats {
+  if (isRecord(raw) && (typeof raw.totalRequests === "number" || isRecord(raw.byProvider) || isRecord(raw.byGroup))) {
+    const base = defaultRequestStats();
+    base.totalRequests = typeof raw.totalRequests === "number" ? raw.totalRequests : 0;
+    base.failedRequests = typeof raw.failedRequests === "number" ? raw.failedRequests : 0;
+    if (isRecord(raw.byProvider)) {
+      for (const [k, v] of Object.entries(raw.byProvider)) {
+        if (isRecord(v) && typeof v.ok === "number" && typeof v.failed === "number") base.byProvider[k] = { ok: v.ok, failed: v.failed };
+      }
+    }
+    if (isRecord(raw.byGroup)) {
+      for (const [k, v] of Object.entries(raw.byGroup)) {
+        if (isRecord(v) && typeof v.ok === "number" && typeof v.failed === "number") base.byGroup[k] = { ok: v.ok, failed: v.failed };
+      }
+    }
+    return base;
+  }
+  const migrated = defaultRequestStats();
+  for (const log of legacyLogs) bumpStatsCounters(migrated, log);
+  return migrated;
+}
+
 function addLog(input: Omit<RequestLog, "id" | "at">) {
+  bumpStatsCounters(state.stats, input);
   const requestPreview = input.requestPreview ?? input.requestBody;
   const responsePreview = input.responsePreview ?? input.responseBody;
   state.logs.unshift({
@@ -2444,23 +2505,9 @@ function computeStats() {
     }
   }
 
-  for (const log of state.logs) {
-    const item = providers.get(log.providerName) ?? { ok: 0, failed: 0 };
-    if (log.ok) item.ok += 1;
-    else item.failed += 1;
-    providers.set(log.providerName, item);
-    const kind = String(log.kind ?? "");
-    const toolName = String(log.toolName ?? "");
-    const groupName = kind.startsWith("mcp:")
-      ? "MCP 请求"
-      : kind.startsWith("search:") || kind.startsWith("tool:search") || kind.startsWith("tool:scrape") || toolName === "search_web" || toolName === "scrape_web"
-        ? "搜索引擎请求"
-        : "模型请求";
-    const group = requestGroups.get(groupName) ?? { ok: 0, failed: 0 };
-    if (log.ok) group.ok += 1;
-    else group.failed += 1;
-    requestGroups.set(groupName, group);
-  }
+  // 请求统计来自持久化累加器 state.stats(logs 已改内存态,不再遍历)。
+  for (const [name, value] of Object.entries(state.stats.byProvider)) providers.set(name, { ...value });
+  for (const [name, value] of Object.entries(state.stats.byGroup)) requestGroups.set(name, { ...value });
 
   return {
     totals: {
@@ -2472,8 +2519,8 @@ function computeStats() {
       inputTokens,
       outputTokens,
       launchCount: state.launchCount,
-      requests: state.logs.length,
-      failedRequests: state.logs.filter((log) => !log.ok).length,
+      requests: state.stats.totalRequests,
+      failedRequests: state.stats.failedRequests,
     },
     daily: [...daily.values()].sort((a, b) => a.date.localeCompare(b.date)),
     models: [...models.values()].sort((a, b) => b.count - a.count),
