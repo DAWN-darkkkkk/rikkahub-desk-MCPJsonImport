@@ -5867,10 +5867,11 @@ async function postMcpJsonRpc(
   const timeoutId = setTimeout(() => ac.abort(), 30_000);
   let response: Response;
   let text: string;
+  const requestHeaders = { ...headersFromMcpServer(server), ...extraHeaders };
   try {
     response = await fetch(target, {
       method: "POST",
-      headers: { ...headersFromMcpServer(server), ...extraHeaders },
+      headers: requestHeaders,
       body: JSON.stringify(body),
       signal: ac.signal,
     });
@@ -5887,6 +5888,8 @@ async function postMcpJsonRpc(
       status: 0,
       kind: `mcp:${method}`,
       durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders,
       requestPreview: jsonPreview(body),
       responsePreview: "",
       toolName: method,
@@ -5904,6 +5907,9 @@ async function postMcpJsonRpc(
     status: response.status,
     kind: `mcp:${method}`,
     durationMs: Date.now() - started,
+    method: "POST",
+    requestHeaders,
+    responseHeaders: Object.fromEntries(response.headers.entries()),
     requestPreview: jsonPreview(body),
     responsePreview: textPreview(text),
     toolName: method,
