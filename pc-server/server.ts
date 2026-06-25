@@ -12559,9 +12559,10 @@ async function generateSpeechWithTtsProvider(text: string, providerId?: string, 
       providerName: provider.name,
       url: "windows:System.Speech",
       ok: true,
-      latencyMs: Date.now() - started,
-      inputTokens: text.length,
-      outputTokens: wavBytes.length,
+      kind: "provider:tts",
+      durationMs: Date.now() - started,
+      requestPreview: text.slice(0, 500),
+      responsePreview: `${wavBytes.length} bytes audio/wav`,
     });
     return { audio: wavBytes, mime: "audio/wav", provider };
   }
