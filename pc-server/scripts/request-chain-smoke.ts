@@ -1964,8 +1964,8 @@ async function runImageGenerationSmoke() {
   assert(stateAfter.generatedImages.some((item: AnyRecord) => item.type === "image_generation" && item.prompt === "smoke generated image"), "generated image was not persisted");
   assert(stateAfter.generatedImages.some((item: AnyRecord) => item.type === "image_edit" && item.sourceFileIds?.[0] === referenceId), "edited image reference was not persisted");
   const imageLogs = await api("/api/logs");
-  assert(imageLogs.some((log: AnyRecord) => log.kind === "provider:image:generation" && log.requestPreview?.includes("smoke generated image")), "image generation log missing request preview");
-  assert(imageLogs.some((log: AnyRecord) => log.kind === "provider:image:edit" && log.requestPreview?.includes("reference.png")), "image edit log missing multipart reference preview");
+  assert(imageLogs.some((log: AnyRecord) => log.kind === "provider:image:generation" && log.requestBody?.includes("smoke generated image")), "image generation log missing request body");
+  assert(imageLogs.some((log: AnyRecord) => log.kind === "provider:image:edit" && log.requestBody?.includes("reference.png")), "image edit log missing multipart reference body");
   return { generated: generated.images.length, edited: edited.images.length, referenceId };
 }
 
@@ -2041,9 +2041,10 @@ async function runEpubStatsLogsSmoke() {
   assert(groupNames.includes("模型请求"), "stats missing model request group");
   assert(stats.totals?.requests > 0, "stats missing request totals");
   const logs = await api("/api/logs");
-  // logs 已改为内存态(最近 100 条,对齐移动端)。smoke 全流程产生的日志远超 100 条,
-  // 特定 kind 的历史日志可能已滚出窗口,故只验证"日志记录了完整 preview"这一核心机制。
-  assert(logs.some((log: AnyRecord) => log.requestPreview && log.responsePreview), "logs missing request/response previews");
+  // logs 已改为内存态(最近 100 条,对齐移动端)。备份导入会重置 logs/stats,此时只剩
+  // imageGen + epub 产生的新日志。验证完整 body + method/headers 字段对齐移动端。
+  assert(logs.some((log: AnyRecord) => log.requestBody && log.responseBody), "logs missing request/response body");
+  assert(logs.some((log: AnyRecord) => log.method && log.requestHeaders && log.responseHeaders), "logs missing method/headers");
   return { epubTextLength: uploaded.extractedTextLength, requestGroups: groupNames, logCount: logs.length };
 }
 
@@ -2078,12 +2079,19 @@ async function main() {
     const translation = await runTranslationSmoke();
     const compressionSummaries = await runCompressionSmoke();
     const searchDelete = await runDeletedConversationSearchSmoke();
+    // 备份导入会重置 stats(pc-backup.json 不含统计累加器),在此之前验证前面 20+ 个
+    // 子测试的请求都被持久化累加器计入了(对齐移动端"安装以来累计"语义)。
+    {
+      const preBackupStats = await api("/api/stats");
+      assert((preBackupStats.totals?.requests ?? 0) >= 10, "stats accumulator did not count requests from prior sub-tests");
+    }
     const backupRoundtrip = await runBackupRoundtripSmoke();
     const webDavBackup = await runWebDavBackupSmoke();
     const imageGeneration = await runImageGenerationSmoke();
     const epubStatsLogs = await runEpubStatsLogsSmoke();
     const logs = await api("/api/logs");
-    assert(logs.some((log: AnyRecord) => log.requestPreview), "no request log with preview captured");
+    assert(logs.some((log: AnyRecord) => log.requestBody), "no request log with body captured");
+    assert(logs.some((log: AnyRecord) => log.method && log.requestHeaders), "no request log with method/headers captured");
     console.log(JSON.stringify({
       ok: true,
       chatRequests: chat.captured.length,

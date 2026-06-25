@@ -137,8 +137,6 @@ interface RequestLog {
   durationMs?: number;
   method?: string;
   requestHeaders?: Record<string, string>;
-  requestPreview?: string;
-  responsePreview?: string;
   requestBody?: string;
   responseBody?: string;
   responseHeaders?: Record<string, string>;
@@ -8759,8 +8757,8 @@ function LogsSection({ logs, onClear }: { logs: RequestLog[]; onClear: () => voi
 function LogDetailDialog({ log, onClose }: { log: RequestLog | null; onClose: () => void }) {
   const { t } = useTranslation();
   const [reveal, setReveal] = React.useState(false);
-  const requestText = log?.requestBody || log?.requestPreview || "";
-  const responseText = log?.responseBody || log?.responsePreview || log?.error || "";
+  const requestText = log?.requestBody || "";
+  const responseText = log?.responseBody || log?.error || "";
   const requestJson = React.useMemo(() => tryParseJson(requestText), [requestText]);
   const responseJson = React.useMemo(() => tryParseJson(responseText), [responseText]);
   const copy = React.useCallback(

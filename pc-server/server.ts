@@ -284,8 +284,6 @@ interface RequestLog {
   durationMs?: number;
   method?: string;
   requestHeaders?: Record<string, string>;
-  requestPreview?: string;
-  responsePreview?: string;
   requestBody?: string;
   responseBody?: string;
   responseHeaders?: Record<string, string>;
@@ -1843,15 +1841,7 @@ function normalizeRequestStats(raw: unknown, legacyLogs: RequestLog[]): RequestS
 
 function addLog(input: Omit<RequestLog, "id" | "at">) {
   bumpStatsCounters(state.stats, input);
-  const requestPreview = input.requestPreview ?? input.requestBody;
-  const responsePreview = input.responsePreview ?? input.responseBody;
-  state.logs.unshift({
-    id: id(),
-    at: Date.now(),
-    ...input,
-    ...(requestPreview ? { requestPreview } : {}),
-    ...(responsePreview ? { responsePreview } : {}),
-  });
+  state.logs.unshift({ id: id(), at: Date.now(), ...input });
   state.logs = state.logs.slice(0, 100);
   saveState();
 }
@@ -2590,13 +2580,13 @@ function validateKnownJsonIds(items: unknown, ids: unknown, fieldName: string) {
 
 // 对齐移动端:日志存完整请求/响应体(供前端 JsonTree 展开),默认不再字符级截断。
 // 可选 limit 仅保留给少数需要硬截断的场景(如错误摘要)。
-function jsonPreview(value: unknown, limit?: number): string {
+function jsonBody(value: unknown, limit?: number): string {
   const text = JSON.stringify(value, null, 2);
   if (limit !== undefined && text.length > limit) return `${text.slice(0, limit)}\n\n... [truncated ${text.length - limit} chars]`;
   return text;
 }
 
-function textPreview(value: string, limit?: number): string {
+function textBody(value: string, limit?: number): string {
   if (limit !== undefined && value.length > limit) return `${value.slice(0, limit)}\n\n... [truncated ${value.length - limit} chars]`;
   return value;
 }
@@ -3009,9 +2999,11 @@ function applyAndroidZipBackupFromPath(zipPath: string): { settingsImported: boo
   }
 
   // PC-origin zip fast path: if pc-backup.json exists, this came from a PC export — restore
-  // the full state (conversations + message tree + generatedImages + logs + everything),
-  // then re-link the file bytes from upload/. The Android settings.json path below still
-  // exists for Android-origin zips, which don't ship pc-backup.json.
+  // settings + generatedImages + memories + files metadata (from pc-backup.json) and
+  // conversations (from rikka_hub.db), then re-link file bytes from upload/. logs/stats are
+  // machine-local (in-memory / per-install accumulator) and are NOT carried in the backup.
+  // The Android settings.json path below still exists for Android-origin zips, which don't
+  // ship pc-backup.json.
   const pcBackupPath = join(extractDir, "pc-backup.json");
   if (existsSync(pcBackupPath)) {
     return applyPcBackupFromExtractDir(extractDir, pcBackupPath);
@@ -4799,9 +4791,9 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "POST",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview({ query, maxResults }),
-      responsePreview: jsonPreview(raw),
-      error: response.ok ? undefined : jsonPreview(raw),
+      requestBody: jsonBody({ query, maxResults }),
+      responseBody: jsonBody(raw),
+      error: response.ok ? undefined : jsonBody(raw),
     });
     if (!response.ok) throw new Error(JSON.stringify(raw).slice(0, 500));
     return {
@@ -4836,9 +4828,9 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "POST",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview(requestBody),
-      responsePreview: textPreview(text),
-      error: response.ok ? undefined : textPreview(text),
+      requestBody: jsonBody(requestBody),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`RikkaHub search failed with code ${response.status}: ${text.slice(0, 500)}`);
     return {
@@ -4873,9 +4865,9 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "POST",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview({ query, maxResults }),
-      responsePreview: jsonPreview(raw),
-      error: response.ok ? undefined : jsonPreview(raw),
+      requestBody: jsonBody({ query, maxResults }),
+      responseBody: jsonBody(raw),
+      error: response.ok ? undefined : jsonBody(raw),
     });
     if (!response.ok) throw new Error(JSON.stringify(raw).slice(0, 500));
     return {
@@ -4911,9 +4903,9 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "POST",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview(requestBody),
-      responsePreview: textPreview(text),
-      error: response.ok ? undefined : textPreview(text),
+      requestBody: jsonBody(requestBody),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`Zhipu search failed with code ${response.status}: ${text.slice(0, 500)}`);
     return {
@@ -4944,9 +4936,9 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "GET",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview({ query, maxResults }),
-      responsePreview: textPreview(text),
-      error: response.ok ? undefined : textPreview(text),
+      requestBody: jsonBody({ query, maxResults }),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`Brave search failed with code ${response.status}: ${text.slice(0, 500)}`);
     return {
@@ -4986,9 +4978,9 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "GET",
       requestHeaders: headers,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview({ query, maxResults, engines, language }),
-      responsePreview: textPreview(text),
-      error: response.ok ? undefined : textPreview(text),
+      requestBody: jsonBody({ query, maxResults, engines, language }),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`SearXNG request failed with status ${response.status}: ${text.slice(0, 500)}`);
     return {
@@ -5021,9 +5013,9 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "GET",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview({ query, maxResults }),
-      responsePreview: textPreview(text),
-      error: response.ok ? undefined : textPreview(text),
+      requestBody: jsonBody({ query, maxResults }),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`Tinyfish search failed with code ${response.status}: ${text.slice(0, 500)}`);
     return {
@@ -5053,8 +5045,8 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "POST",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      durationMs: Date.now() - started, requestPreview: jsonPreview(body), responsePreview: textPreview(text),
-      toolName: "search_web", error: response.ok ? undefined : textPreview(text),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`Perplexity search failed: ${response.status} ${text.slice(0, 300)}`);
     const results = Array.isArray(raw.results) ? raw.results : [];
@@ -5085,8 +5077,8 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "POST",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      durationMs: Date.now() - started, requestPreview: jsonPreview(body), responsePreview: textPreview(text),
-      toolName: "search_web", error: response.ok ? undefined : textPreview(text),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`Bocha search failed: ${response.status} ${text.slice(0, 300)}`);
     const pages = raw?.data?.webPages?.value ?? [];
@@ -5117,8 +5109,8 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "POST",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      durationMs: Date.now() - started, requestPreview: jsonPreview(body), responsePreview: textPreview(text),
-      toolName: "search_web", error: response.ok ? undefined : textPreview(text),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`LinkUp search failed: ${response.status} ${text.slice(0, 300)}`);
     const sources = Array.isArray(raw.sources) ? raw.sources : [];
@@ -5148,8 +5140,8 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "POST",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      durationMs: Date.now() - started, requestPreview: jsonPreview(body), responsePreview: textPreview(text),
-      toolName: "search_web", error: response.ok ? undefined : textPreview(text),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`Metaso search failed: ${response.status} ${text.slice(0, 300)}`);
     const webpages = Array.isArray(raw.webpages) ? raw.webpages : [];
@@ -5180,8 +5172,8 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "POST",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      durationMs: Date.now() - started, requestPreview: jsonPreview(body), responsePreview: textPreview(text),
-      toolName: "search_web", error: response.ok ? undefined : textPreview(text),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`Ollama search failed: ${response.status} ${text.slice(0, 300)}`);
     const results = Array.isArray(raw.results) ? raw.results : [];
@@ -5211,8 +5203,8 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "POST",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      durationMs: Date.now() - started, requestPreview: jsonPreview(body), responsePreview: textPreview(text),
-      toolName: "search_web", error: response.ok ? undefined : textPreview(text),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`Jina search failed: ${response.status} ${text.slice(0, 300)}`);
     const data = Array.isArray(raw.data) ? raw.data : [];
@@ -5242,8 +5234,8 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "POST",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      durationMs: Date.now() - started, requestPreview: jsonPreview(body), responsePreview: textPreview(text),
-      toolName: "search_web", error: response.ok ? undefined : textPreview(text),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`Firecrawl search failed: ${response.status} ${text.slice(0, 300)}`);
     const data = isRecord(raw.data) ? (raw.data as Record<string, JsonValue>) : {};
@@ -5297,8 +5289,8 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       method: "POST",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      durationMs: Date.now() - started, requestPreview: jsonPreview(body), responsePreview: textPreview(text),
-      toolName: "search_web", error: response.ok ? undefined : textPreview(text),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`Grok search failed: ${response.status} ${text.slice(0, 300)}`);
     const output = Array.isArray(raw.output) ? raw.output : [];
@@ -5335,8 +5327,8 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
       kind: "tool:search_web",
       toolName: "search_web",
       durationMs: Date.now() - started,
-      requestPreview: jsonPreview({ query, maxResults }),
-      responsePreview: jsonPreview(result),
+      requestBody: jsonBody({ query, maxResults }),
+      responseBody: jsonBody(result),
     });
     return result;
   }
@@ -5358,9 +5350,9 @@ async function runSearchWeb(params: Record<string, JsonValue>) {
     method: "GET",
     requestHeaders,
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    requestPreview: jsonPreview({ query, maxResults }),
-    responsePreview: textPreview(stripHtml(html)),
-    error: response.ok ? undefined : textPreview(html),
+    requestBody: jsonBody({ query, maxResults }),
+    responseBody: textBody(stripHtml(html)),
+    error: response.ok ? undefined : textBody(html),
   });
   if (!response.ok) throw new Error(`Bing ${response.status}: ${html.slice(0, 300)}`);
   const items: Array<{ id: string; title: string; url: string; domain: string; icon: string; text: string }> = [];
@@ -5395,8 +5387,8 @@ async function runScrapeWeb(params: Record<string, JsonValue>) {
       kind: "tool:scrape_web",
       toolName: "scrape_web",
       durationMs: Date.now() - started,
-      requestPreview: jsonPreview({ url: target }),
-      responsePreview: jsonPreview(result),
+      requestBody: jsonBody({ url: target }),
+      responseBody: jsonBody(result),
     });
     return result;
   }
@@ -5424,9 +5416,9 @@ async function runScrapeWeb(params: Record<string, JsonValue>) {
       method: "POST",
       requestHeaders,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview(requestBody),
-      responsePreview: textPreview(text),
-      error: response.ok ? undefined : textPreview(text),
+      requestBody: jsonBody(requestBody),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`Tinyfish fetch failed with code ${response.status}: ${text.slice(0, 500)}`);
     const item = Array.isArray(raw.results) ? raw.results[0] : null;
@@ -5455,9 +5447,9 @@ async function runScrapeWeb(params: Record<string, JsonValue>) {
     method: "GET",
     requestHeaders,
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    requestPreview: jsonPreview({ url: target }),
-    responsePreview: textPreview(stripHtml(text)),
-    error: response.ok ? undefined : textPreview(text),
+    requestBody: jsonBody({ url: target }),
+    responseBody: textBody(stripHtml(text)),
+    error: response.ok ? undefined : textBody(text),
   });
   if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 300)}`);
   return {
@@ -5838,7 +5830,7 @@ async function mcpSsePostEndpoint(server: Record<string, JsonValue>) {
     status: response.status,
     kind: "mcp:sse:endpoint",
     durationMs: Date.now() - started,
-    responsePreview: endpoint,
+    responseBody: endpoint,
     toolName: "endpoint",
   });
   server.ssePostEndpoint = endpoint;
@@ -5890,8 +5882,8 @@ async function postMcpJsonRpc(
       durationMs: Date.now() - started,
       method: "POST",
       requestHeaders,
-      requestPreview: jsonPreview(body),
-      responsePreview: "",
+      requestBody: jsonBody(body),
+      responseBody: "",
       toolName: method,
       error: reason,
     });
@@ -5910,13 +5902,13 @@ async function postMcpJsonRpc(
     method: "POST",
     requestHeaders,
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    requestPreview: jsonPreview(body),
-    responsePreview: textPreview(text),
+    requestBody: jsonBody(body),
+    responseBody: textBody(text),
     toolName: method,
-    error: response.ok && !raw.error ? undefined : jsonPreview(raw.error ?? text),
+    error: response.ok && !raw.error ? undefined : jsonBody(raw.error ?? text),
   });
   if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-  if (raw.error) throw new Error(jsonPreview(raw.error, 500));
+  if (raw.error) throw new Error(jsonBody(raw.error, 500));
   return {
     result: raw.result ?? raw,
     sessionId: response.headers.get("mcp-session-id") ?? response.headers.get("Mcp-Session-Id") ?? undefined,
@@ -8754,8 +8746,8 @@ async function fetchProviderModels(providerItem: Provider) {
     method: "GET",
     requestHeaders: providerHeaders(providerItem),
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    responsePreview: textPreview(text),
-    error: response.ok ? undefined : textPreview(text),
+    responseBody: textBody(text),
+    error: response.ok ? undefined : textBody(text),
   });
   if (!response.ok) {
     if (response.status === 404 && providerItem.models.length > 0) {
@@ -8767,7 +8759,7 @@ async function fetchProviderModels(providerItem: Provider) {
     }
     throw new Error(`${response.status}: ${text.slice(0, 500) || response.statusText}`);
   }
-  return { endpoint, models: normalizeFetchedModels(providerItem, raw), preview: textPreview(text) };
+  return { endpoint, models: normalizeFetchedModels(providerItem, raw), preview: textBody(text) };
 }
 
 async function fetchProviderBalance(providerItem: Provider) {
@@ -8815,14 +8807,14 @@ async function fetchProviderBalance(providerItem: Provider) {
     method: "GET",
     requestHeaders: providerHeaders(providerItem),
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    responsePreview: textPreview(text),
-    error: response.ok ? undefined : textPreview(text),
+    responseBody: textBody(text),
+    error: response.ok ? undefined : textBody(text),
   });
   if (!response.ok) throw new Error(`余额查询失败：${response.status} ${text.slice(0, 500) || response.statusText}`);
   const value = getByPath(raw, String(option.resultPath ?? ""));
   const formatted = formatBalanceValue(value);
   if (!formatted) throw new Error(`余额结果路径没有取到值：${option.resultPath || "(root)"}`);
-  return { status: "ok", endpoint, value: formatted, preview: textPreview(text) };
+  return { status: "ok", endpoint, value: formatted, preview: textBody(text) };
 }
 
 function firstProviderModel(providerItem: Provider, preferredModelId?: string, fetchedModels: Model[] = []) {
@@ -9046,8 +9038,8 @@ async function runProviderCheck(providerItem: Provider, mode: "non_stream" | "st
       durationMs: Date.now() - started,
       method: "POST",
       requestHeaders: headers,
-      requestPreview: jsonPreview(body),
-      responsePreview: "",
+      requestBody: jsonBody(body),
+      responseBody: "",
       error: detail,
     });
     return {
@@ -9074,8 +9066,8 @@ async function runProviderCheck(providerItem: Provider, mode: "non_stream" | "st
       method: "POST",
       requestHeaders: headers,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview(body),
-      responsePreview: textPreview(text),
+      requestBody: jsonBody(body),
+      responseBody: textBody(text),
       error: detail,
     });
     return {
@@ -9097,16 +9089,16 @@ async function runProviderCheck(providerItem: Provider, mode: "non_stream" | "st
     method: "POST",
     requestHeaders: headers,
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    requestPreview: jsonPreview(body),
-    responsePreview: textPreview(text),
-    error: response.ok ? undefined : textPreview(text),
+    requestBody: jsonBody(body),
+    responseBody: textBody(text),
+    error: response.ok ? undefined : textBody(text),
   });
   return {
     mode,
     ok: response.ok,
     status: response.status,
     endpoint: url,
-    preview: textPreview(text || (mode === "stream" && response.ok ? "流式测试已收到事件" : "")),
+    preview: textBody(text || (mode === "stream" && response.ok ? "流式测试已收到事件" : "")),
   };
 }
 
@@ -9147,7 +9139,7 @@ async function testSearchService(service: SearchService) {
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   if (type === "tavily") {
     const endpoint = "https://api.tavily.com/search";
@@ -9158,7 +9150,7 @@ async function testSearchService(service: SearchService) {
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   if (type === "exa") {
     const endpoint = "https://api.exa.ai/search";
@@ -9169,7 +9161,7 @@ async function testSearchService(service: SearchService) {
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   if (type === "tinyfish") {
     const endpoint = "https://api.search.tinyfish.ai?query=RikkaHub";
@@ -9178,7 +9170,7 @@ async function testSearchService(service: SearchService) {
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`Tinyfish search failed with code ${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   if (type === "zhipu") {
     const endpoint = "https://open.bigmodel.cn/api/paas/v4/web_search";
@@ -9189,14 +9181,14 @@ async function testSearchService(service: SearchService) {
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   if (type === "brave") {
     const endpoint = "https://api.search.brave.com/res/v1/web/search?q=RikkaHub&count=1";
     const response = await fetch(endpoint, { headers: { Accept: "application/json", "X-Subscription-Token": apiKey } });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   if (type === "searxng") {
     const baseUrl = String(service.url ?? "").trim().replace(/\/+$/, "");
@@ -9209,13 +9201,13 @@ async function testSearchService(service: SearchService) {
     const response = await fetch(endpoint, { headers });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   if (type === "custom_js") {
     const searchScript = String(service.searchScript ?? "").trim();
     if (!searchScript) throw new Error("Custom JS search script is empty");
     const result = await runCustomJsSearch(service, "RikkaHub", 1);
-    return { status: "ok", name, endpoint: "custom_js", preview: jsonPreview(result) };
+    return { status: "ok", name, endpoint: "custom_js", preview: jsonBody(result) };
   }
   if (type === "firecrawl") {
     const endpoint = "https://api.firecrawl.dev/v2/search";
@@ -9226,7 +9218,7 @@ async function testSearchService(service: SearchService) {
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   if (type === "grok") {
     const endpoint = String(service.customUrl ?? "").trim() || "https://api.x.ai/v1/responses";
@@ -9246,7 +9238,7 @@ async function testSearchService(service: SearchService) {
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   // 以下 6 个分支(perplexity/bocha/linkup/metaso/ollama/jina)此前缺失,导致这些类型在
   // 设置页点「测试」全部落到末尾 throw "not supported"。请求体对齐 runSearchService 里
@@ -9260,7 +9252,7 @@ async function testSearchService(service: SearchService) {
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   if (type === "bocha") {
     const endpoint = "https://api.bochaai.com/v1/web-search";
@@ -9271,7 +9263,7 @@ async function testSearchService(service: SearchService) {
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   if (type === "linkup") {
     const endpoint = "https://api.linkup.so/v1/search";
@@ -9282,7 +9274,7 @@ async function testSearchService(service: SearchService) {
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   if (type === "metaso") {
     const endpoint = "https://metaso.cn/api/v1/search";
@@ -9293,7 +9285,7 @@ async function testSearchService(service: SearchService) {
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   if (type === "ollama") {
     const endpoint = "https://ollama.com/api/web_search";
@@ -9305,7 +9297,7 @@ async function testSearchService(service: SearchService) {
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint, preview: textPreview(text) };
+    return { status: "ok", name, endpoint, preview: textBody(text) };
   }
   if (type === "jina") {
     const searchUrl = String(service.searchUrl ?? "").trim() || "https://s.jina.ai/";
@@ -9316,7 +9308,7 @@ async function testSearchService(service: SearchService) {
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-    return { status: "ok", name, endpoint: searchUrl, preview: textPreview(text) };
+    return { status: "ok", name, endpoint: searchUrl, preview: textBody(text) };
   }
   throw new Error(`${name} search type '${type}' is not supported`);
 }
@@ -10079,9 +10071,9 @@ async function fetchText(
     method: "POST",
     requestHeaders: headers,
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    requestPreview: jsonPreview(body),
-    responsePreview: textPreview(rawText),
-    error: response.ok ? undefined : textPreview(rawText),
+    requestBody: jsonBody(body),
+    responseBody: textBody(rawText),
+    error: response.ok ? undefined : textBody(rawText),
   });
   if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${rawText.slice(0, 500)}`);
   return pick(raw)?.trim() || "(empty response)";
@@ -10122,9 +10114,9 @@ async function streamClaudeChat(
       method: "POST",
       requestHeaders: headers,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview(body),
-      responsePreview: textPreview(text),
-      error: textPreview(text),
+      requestBody: jsonBody(body),
+      responseBody: textBody(text),
+      error: textBody(text),
     });
     throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
   }
@@ -10157,8 +10149,8 @@ async function streamClaudeChat(
     method: "POST",
     requestHeaders: headers,
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    requestPreview: jsonPreview(body),
-    responsePreview: textPreview(full),
+    requestBody: jsonBody(body),
+    responseBody: textBody(full),
   });
   return full || "(empty response)";
 }
@@ -10391,9 +10383,9 @@ async function streamClaudeChatWithTools(
         method: "POST",
         requestHeaders: headers,
         responseHeaders: Object.fromEntries(response.headers.entries()),
-        requestPreview: jsonPreview(currentBody),
-        responsePreview: textPreview(text),
-        error: textPreview(text),
+        requestBody: jsonBody(currentBody),
+        responseBody: textBody(text),
+        error: textBody(text),
       });
       throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
     }
@@ -10410,8 +10402,8 @@ async function streamClaudeChatWithTools(
       method: "POST",
       requestHeaders: headers,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview(currentBody),
-      responsePreview: textPreview(round_.raw),
+      requestBody: jsonBody(currentBody),
+      responseBody: textBody(round_.raw),
     });
     if (round_.textOut) {
       allContent += `${allContent ? "\n" : ""}${round_.textOut}`;
@@ -10535,9 +10527,9 @@ async function fetchClaudeTextWithTools(
       method: "POST",
       requestHeaders: headers,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview(currentBody),
-      responsePreview: textPreview(rawText),
-      error: response.ok ? undefined : textPreview(rawText),
+      requestBody: jsonBody(currentBody),
+      responseBody: textBody(rawText),
+      error: response.ok ? undefined : textBody(rawText),
     });
     if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${rawText.slice(0, 500)}`);
 
@@ -10788,9 +10780,9 @@ async function streamGoogleChatWithTools(
         method: "POST",
         requestHeaders: headers,
         responseHeaders: Object.fromEntries(response.headers.entries()),
-        requestPreview: jsonPreview(currentBody),
-        responsePreview: textPreview(text),
-        error: textPreview(text),
+        requestBody: jsonBody(currentBody),
+        responseBody: textBody(text),
+        error: textBody(text),
       });
       throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
     }
@@ -10807,8 +10799,8 @@ async function streamGoogleChatWithTools(
       method: "POST",
       requestHeaders: headers,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview(currentBody),
-      responsePreview: textPreview(round_.raw),
+      requestBody: jsonBody(currentBody),
+      responseBody: textBody(round_.raw),
     });
     if (round_.textOut) {
       allContent += `${allContent ? "\n" : ""}${round_.textOut}`;
@@ -10901,9 +10893,9 @@ async function fetchOpenAiText(
       method: "POST",
       requestHeaders: headers,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview(currentBody),
-      responsePreview: textPreview(rawText),
-      error: response.ok ? undefined : textPreview(rawText),
+      requestBody: jsonBody(currentBody),
+      responseBody: textBody(rawText),
+      error: response.ok ? undefined : textBody(rawText),
     });
     if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${rawText.slice(0, 500)}`);
 
@@ -11291,9 +11283,9 @@ async function fetchOpenAiAuxiliaryStream(
     method: "POST",
     requestHeaders: headers,
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    requestPreview: jsonPreview(body),
-    responsePreview: textPreview(text),
-    error: response.ok ? undefined : textPreview(text),
+    requestBody: jsonBody(body),
+    responseBody: textBody(text),
+    error: response.ok ? undefined : textBody(text),
   });
   if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
   return text.trim() || "(empty response)";
@@ -11321,9 +11313,9 @@ async function fetchClaudeAuxiliaryStream(
       method: "POST",
       requestHeaders: headers,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview(body),
-      responsePreview: textPreview(text),
-      error: textPreview(text),
+      requestBody: jsonBody(body),
+      responseBody: textBody(text),
+      error: textBody(text),
     });
     throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
   }
@@ -11341,8 +11333,8 @@ async function fetchClaudeAuxiliaryStream(
     method: "POST",
     requestHeaders: headers,
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    requestPreview: jsonPreview(body),
-    responsePreview: textPreview(text),
+    requestBody: jsonBody(body),
+    responseBody: textBody(text),
   });
   return text.trim() || "(empty response)";
 }
@@ -11424,9 +11416,9 @@ async function fetchGoogleAuxiliaryStream(
     method: "POST",
     requestHeaders: headers,
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    requestPreview: jsonPreview(body),
-    responsePreview: textPreview(rawText),
-    error: response.ok ? undefined : textPreview(rawText),
+    requestBody: jsonBody(body),
+    responseBody: textBody(rawText),
+    error: response.ok ? undefined : textBody(rawText),
   });
   if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${rawText.slice(0, 500)}`);
   const chunks = rawText
@@ -11758,8 +11750,8 @@ async function fetchOpenAiTextStreaming(
         durationMs: Date.now() - roundStarted,
         method: "POST",
         requestHeaders: headers,
-        requestPreview: jsonPreview(requestBody),
-        responsePreview: "",
+        requestBody: jsonBody(requestBody),
+        responseBody: "",
         error: detail,
       });
       if (!forceNonStream && requestBody.stream !== false && !signal?.aborted) {
@@ -11783,9 +11775,9 @@ async function fetchOpenAiTextStreaming(
         method: "POST",
         requestHeaders: headers,
         responseHeaders: Object.fromEntries(response.headers.entries()),
-        requestPreview: jsonPreview(requestBody),
-        responsePreview: textPreview(text),
-        error: textPreview(text),
+        requestBody: jsonBody(requestBody),
+        responseBody: textBody(text),
+        error: textBody(text),
       });
       throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
     }
@@ -11805,8 +11797,8 @@ async function fetchOpenAiTextStreaming(
         method: "POST",
         requestHeaders: headers,
         responseHeaders: Object.fromEntries(response.headers.entries()),
-        requestPreview: jsonPreview(requestBody),
-        responsePreview: "",
+        requestBody: jsonBody(requestBody),
+        responseBody: "",
         error: err instanceof Error ? err.message : String(err),
       });
       if (!forceNonStream && !signal?.aborted) {
@@ -11829,8 +11821,8 @@ async function fetchOpenAiTextStreaming(
       method: "POST",
       requestHeaders: headers,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview(requestBody),
-      responsePreview: textPreview(result.rawText || result.content || JSON.stringify({
+      requestBody: jsonBody(requestBody),
+      responseBody: textBody(result.rawText || result.content || JSON.stringify({
         toolCalls: result.toolCalls.map((toolCall) => ({
           id: toolCall.id,
           name: toolCall.function?.name,
@@ -12367,9 +12359,9 @@ async function callImageGeneration(input: {
       method: "POST",
       requestHeaders: applyModelRequestHeaders({ "Content-Type": "application/json" }, providerItem, modelItem),
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: jsonPreview(body),
-      responsePreview: textPreview(text),
-      error: response.ok ? undefined : textPreview(text),
+      requestBody: jsonBody(body),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`Failed to generate image: ${response.status} ${text.slice(0, 500)}`);
     const raw = JSON.parse(text || "{}");
@@ -12415,9 +12407,9 @@ async function callImageGeneration(input: {
       method: "POST",
       requestHeaders: headers,
       responseHeaders: Object.fromEntries(response.headers.entries()),
-      requestPreview: `multipart image edit\nmodel=${selectedModel}\nn=${count}\nsize=${sizes.openai}\nreferences=${references.map((file) => file.fileName).join(", ")}\ncustom=${customBodyEntriesForForm(modelItem).map((entry) => entry.key).join(", ") || "-"}`,
-      responsePreview: textPreview(text),
-      error: response.ok ? undefined : textPreview(text),
+      requestBody: `multipart image edit\nmodel=${selectedModel}\nn=${count}\nsize=${sizes.openai}\nreferences=${references.map((file) => file.fileName).join(", ")}\ncustom=${customBodyEntriesForForm(modelItem).map((entry) => entry.key).join(", ") || "-"}`,
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
     });
     if (!response.ok) throw new Error(`Failed to edit image: ${response.status} ${text.slice(0, 500)}`);
     const raw = JSON.parse(text || "{}");
@@ -12450,9 +12442,9 @@ async function callImageGeneration(input: {
     method: "POST",
     requestHeaders: headers,
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    requestPreview: jsonPreview(body),
-    responsePreview: textPreview(text),
-    error: response.ok ? undefined : textPreview(text),
+    requestBody: jsonBody(body),
+    responseBody: textBody(text),
+    error: response.ok ? undefined : textBody(text),
   });
   if (!response.ok) throw new Error(`Failed to generate image: ${response.status} ${text.slice(0, 500)}`);
   const raw = JSON.parse(text || "{}");
@@ -12561,8 +12553,8 @@ async function generateSpeechWithTtsProvider(text: string, providerId?: string, 
       ok: true,
       kind: "provider:tts",
       durationMs: Date.now() - started,
-      requestPreview: text.slice(0, 500),
-      responsePreview: `${wavBytes.length} bytes audio/wav`,
+      requestBody: text,
+      responseBody: `${wavBytes.length} bytes audio/wav`,
     });
     return { audio: wavBytes, mime: "audio/wav", provider };
   }
@@ -12689,9 +12681,9 @@ async function generateSpeechWithTtsProvider(text: string, providerId?: string, 
     method: "POST",
     requestHeaders: headers,
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    requestPreview: jsonPreview(body),
-    responsePreview: response.ok ? `${audio.length} bytes ${mime}` : textPreview(audio.toString("utf8")),
-    error: response.ok ? undefined : textPreview(audio.toString("utf8")),
+    requestBody: jsonBody(body),
+    responseBody: response.ok ? `${audio.length} bytes ${mime}` : textBody(audio.toString("utf8")),
+    error: response.ok ? undefined : textBody(audio.toString("utf8")),
   });
   if (!response.ok) throw new Error(`TTS request failed: ${response.status} ${audio.toString("utf8").slice(0, 500)}`);
   return { audio, mime, provider };
@@ -12757,9 +12749,9 @@ async function transcribeAudioWithAsrProvider(file: File) {
     method: "POST",
     requestHeaders: headers,
     responseHeaders: Object.fromEntries(response.headers.entries()),
-    requestPreview: `multipart audio transcription\nmodel=${provider.model || "gpt-4o-transcribe"}\nlanguage=${provider.language || "auto"}\nfile=${file.name || "speech.webm"}`,
-    responsePreview: textPreview(rawText),
-    error: response.ok ? undefined : textPreview(rawText),
+    requestBody: `multipart audio transcription\nmodel=${provider.model || "gpt-4o-transcribe"}\nlanguage=${provider.language || "auto"}\nfile=${file.name || "speech.webm"}`,
+    responseBody: textBody(rawText),
+    error: response.ok ? undefined : textBody(rawText),
   });
   if (!response.ok) throw new Error(`ASR failed: ${response.status} ${rawText.slice(0, 500)}`);
   let raw: any = {};
@@ -13077,8 +13069,8 @@ function startAsrRealtimeSession(client: any, providerId?: string) {
       status: 0,
       kind: "provider:asr:realtime",
       durationMs: Date.now() - session.startedAt,
-      requestPreview: `realtime pcm websocket\nprovider=${provider.type}\nsampleRate=${provider.sampleRate || (provider.type === "openai_realtime" ? 24000 : 16000)}`,
-      responsePreview: session.lastText || [...session.completedTranscripts, ...session.partialTranscripts.values()].join(" "),
+      requestBody: `realtime pcm websocket\nprovider=${provider.type}\nsampleRate=${provider.sampleRate || (provider.type === "openai_realtime" ? 24000 : 16000)}`,
+      responseBody: session.lastText || [...session.completedTranscripts, ...session.partialTranscripts.values()].join(" "),
     });
     asrSendClient(session, { type: "status", status: "idle" });
   };
