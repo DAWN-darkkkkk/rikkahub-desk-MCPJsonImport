@@ -2021,7 +2021,10 @@ function deleteConversationsById(ids: Set<string>) {
     abortConversationGeneration(conversationId);
     conversationClients.delete(conversationId);
   }
+  // 先删内存,再删活库——避免删活库后残余脏标记 flush 又把节点 upsert 回来
+  // (flushConvDirty 检查 state.conversations 存在性,内存没了就跳过)。
   state.conversations = state.conversations.filter((item) => !ids.has(item.id));
+  deletePcConversations(Array.from(ids));
   saveState();
   broadcastList();
 }
@@ -2109,6 +2112,10 @@ function ensureConversation(idValue: string) {
       updateAt: now,
     };
     state.conversations.unshift(conversation);
+    // 1.2.6:新建会话 persist 进活库(建会话行),否则后续流式 upsert 该会话的节点时
+    // FK 失败(pc_message_node.conversation_id 引用 pc_conversation.id),且流式中崩溃
+    // 会丢会话行。
+    persistConversation(conversation);
   }
   return conversation;
 }
@@ -2919,6 +2926,7 @@ function applyBackupPayload(body: { state?: Partial<State>; skills?: unknown; fi
       state.files = state.files.map((entry) => (entry.id === fileId ? { ...entry, path: target } : entry));
     }
   }
+  finalizeConversationImport();
   saveState();
   broadcastSettings();
   broadcastList();
@@ -3018,6 +3026,7 @@ function applyPcBackupFromExtractDir(extractDir: string, pcBackupPath: string): 
     if (Array.isArray((body as { skills?: unknown }).skills)) {
       skillsImported = ((body as { skills?: unknown[] }).skills as unknown[]).length;
     }
+    finalizeConversationImport();
     saveState();
     broadcastSettings();
     broadcastList();
@@ -3153,6 +3162,7 @@ function applyAndroidZipBackupFromPath(zipPath: string): { settingsImported: boo
     skillsImported = copyDirRecursive(skillsSrc, skillsDir);
   }
 
+  finalizeConversationImport();
   saveState();
   broadcastSettings();
   broadcastList();
@@ -3945,6 +3955,37 @@ function loadConversationsFromDbWithFallback(): Conversation[] {
     console.error("[conv-db] 活库读取失败,从 state.json.pre-sqlite.bak 恢复", err);
     return recoverConversationsFromBak();
   }
+}
+
+/** 重灌活库为给定会话集:删除所有会话行(CASCADE 带走节点)+ 单事务灌入。
+ *  导入备份用——state.conversations 整体被替换/合并,活库必须同步。 */
+function resetConversationsDbTo(conversations: Conversation[]): void {
+  if (!conversationsDb) throw new Error("conversationsDb not open");
+  const db = conversationsDb;
+  const txn = db.transaction(() => {
+    db.exec("DELETE FROM pc_conversation");
+    migrateConversationsIntoDb(db, conversations);
+  });
+  txn();
+}
+
+/** 导入备份收尾:中止所有流 + 清脏 + 重灌活库为当前 state.conversations。
+ *  state.conversations 在导入流程里被整体替换/合并,活库必须同步重灌,否则重启后
+ *  loadAllConversationsFromDb 读到旧活库、导入的会话丢失。中止所有流 + 清脏防竞态
+ *  (流式中导入备份:否则流式循环会继续 upsert 旧节点进刚重灌的活库)。 */
+function finalizeConversationImport(): void {
+  // 中止所有流(手动,不走 abortConversationGeneration 以免它 persist——马上要全量重灌)
+  for (const conversationId of Array.from(generating.keys())) {
+    generating.get(conversationId)?.abort();
+  }
+  generating.clear();
+  if (pendingConvFlush) {
+    clearTimeout(pendingConvFlush);
+    pendingConvFlush = null;
+  }
+  dirtyConversationIds.clear();
+  dirtyNodeKeys.clear();
+  resetConversationsDbTo(state.conversations);
 }
 
 function insertConversationsIntoDb(db: InstanceType<typeof Database>) {
@@ -13605,6 +13646,7 @@ async function compressConversation(conversation: Conversation, additionalPrompt
         if (!delta) return;
         conversation.chatSuggestions = [`正在压缩对话历史... ${Math.min(summaries.length + 1, chunks.length)}/${chunks.length}`];
         conversation.updateAt = Date.now();
+        persistConversation(conversation);
         saveState();
         broadcastConversation(conversation);
       },
@@ -13618,6 +13660,7 @@ async function compressConversation(conversation: Conversation, additionalPrompt
   conversation.truncateIndex = 0;
   conversation.chatSuggestions = [];
   conversation.updateAt = Date.now();
+  persistConversation(conversation);
   saveState();
   broadcastConversation(conversation);
   return summaries;
@@ -13661,7 +13704,7 @@ async function runPostGenerationTasks(conversationId: string, snapshot: Conversa
       const live = liveConversation();
       if (live && shouldAutoGenerateTitle(live)) {
         live.title = title;
-        saveState();
+        persistConversation(live);
         broadcastConversation(live);
       }
     } catch (titleError) {
@@ -13680,7 +13723,7 @@ async function runPostGenerationTasks(conversationId: string, snapshot: Conversa
         const firstText = textFromParts(live.messages[0]?.messages[0]?.parts ?? []).trim();
         const fallback = limitAuxiliaryText(firstText, TITLE_CHARACTER_LIMIT) || "New Conversation";
         live.title = fallback;
-        saveState();
+        persistConversation(live);
         broadcastConversation(live);
       }
     }
@@ -13692,7 +13735,7 @@ async function runPostGenerationTasks(conversationId: string, snapshot: Conversa
       const fallback = limitAuxiliaryText(firstText, TITLE_CHARACTER_LIMIT) || "New Conversation";
       if (fallback !== live.title) {
         live.title = fallback;
-        saveState();
+        persistConversation(live);
         broadcastConversation(live);
       }
     }
@@ -13707,7 +13750,7 @@ async function runPostGenerationTasks(conversationId: string, snapshot: Conversa
       if (live && lastMessage?.id === assistantMessageId && !generating.has(live.id)) {
         live.chatSuggestions = suggestions;
         live.updateAt = Date.now();
-        saveState();
+        persistConversation(live);
         broadcastConversation(live);
       }
     } catch {
@@ -14880,11 +14923,13 @@ async function routeApi(request: Request, url: URL) {
       conversation.chatSuggestions = [];
       conversation.updateAt = Date.now();
       if (!conversation.title) conversation.title = "New Conversation";
+      persistConversation(conversation);
       saveState();
       broadcastConversation(conversation);
       void (async () => {
         userMessage.parts = await attachOcrToImageParts(userMessage.parts, picked.model);
         conversation.updateAt = Date.now();
+        persistConversation(conversation);
         saveState();
         broadcastNodeUpdate(conversation, userNode);
         void generateAnswer(conversation);
@@ -14894,6 +14939,7 @@ async function routeApi(request: Request, url: URL) {
     if (sub === "pin" && request.method === "POST") {
       conversation.isPinned = !conversation.isPinned;
       conversation.updateAt = Date.now();
+      persistConversation(conversation);
       saveState();
       broadcastConversation(conversation);
       return json({ status: "updated" });
@@ -14902,6 +14948,7 @@ async function routeApi(request: Request, url: URL) {
       const body = await readJson<{ title: string }>(request);
       conversation.title = body.title?.trim() || conversation.title;
       conversation.updateAt = Date.now();
+      persistConversation(conversation);
       saveState();
       broadcastConversation(conversation);
       return json({ status: "updated" });
@@ -14910,6 +14957,7 @@ async function routeApi(request: Request, url: URL) {
       const body = await readJson<{ assistantId: string }>(request);
       conversation.assistantId = body.assistantId;
       conversation.updateAt = Date.now();
+      persistConversation(conversation);
       saveState();
       broadcastConversation(conversation);
       return json({ status: "updated" });
@@ -14918,6 +14966,7 @@ async function routeApi(request: Request, url: URL) {
       const body = await readJson<{ systemPrompt?: string }>(request);
       conversation.systemPrompt = String(body.systemPrompt ?? "").trim() || null;
       conversation.updateAt = Date.now();
+      persistConversation(conversation);
       saveState();
       broadcastConversation(conversation);
       return json({ status: "updated" });
@@ -14948,6 +14997,7 @@ async function routeApi(request: Request, url: URL) {
         broadcastNodeUpdate(conversation, lastNode);
       }
       conversation.updateAt = Date.now();
+      persistConversation(conversation);
       saveState();
       broadcastConversation(conversation);
       return json({ status: "stopped" });
@@ -14958,6 +15008,7 @@ async function routeApi(request: Request, url: URL) {
       } catch (err) {
         return error(err instanceof Error ? err.message : String(err), 400);
       }
+      persistConversation(conversation);
       saveState();
       broadcastConversation(conversation);
       return json({ status: "updated", title: conversation.title });
@@ -14996,6 +15047,7 @@ async function routeApi(request: Request, url: URL) {
         truncateConversationForRegenerate(conversation, body.messageId);
       }
       conversation.updateAt = Date.now();
+      persistConversation(conversation);
       saveState();
       broadcastConversation(conversation);
       void generateAnswer(conversation, regenerateAtNodeId);
@@ -15010,6 +15062,7 @@ async function routeApi(request: Request, url: URL) {
       if (!Number.isInteger(nextIndex) || nextIndex < 0 || nextIndex >= node.messages.length) return error("Invalid branch index", 400);
       node.selectIndex = nextIndex;
       conversation.updateAt = Date.now();
+      persistConversation(conversation);
       saveState();
       broadcastConversation(conversation);
       return json({ status: "updated" });
@@ -15027,6 +15080,7 @@ async function routeApi(request: Request, url: URL) {
         .filter((node) => node.messages.length > 0);
       if (!changed) return error("Message not found", 404);
       conversation.updateAt = Date.now();
+      persistConversation(conversation);
       saveState();
       broadcastConversation(conversation);
       return json({ status: "deleted" });
@@ -15052,12 +15106,14 @@ async function routeApi(request: Request, url: URL) {
       conversation.messages = conversation.messages.slice(0, nodeIndex + 1);
       conversation.chatSuggestions = [];
       conversation.updateAt = Date.now();
+      persistConversation(conversation);
       saveState();
       broadcastConversation(conversation);
       if (msg.role === "USER") {
         void (async () => {
           msg.parts = await attachOcrToImageParts(msg.parts, picked.model);
           conversation.updateAt = Date.now();
+          persistConversation(conversation);
           saveState();
           broadcastNodeUpdate(conversation, node);
           void generateAnswer(conversation);
@@ -15076,6 +15132,7 @@ async function routeApi(request: Request, url: URL) {
       const targetLanguage = String(body.targetLanguage ?? "").trim() || Intl.DateTimeFormat().resolvedOptions().locale;
       msg.translation = "正在翻译...";
       conversation.updateAt = Date.now();
+      persistConversation(conversation);
       saveState();
       broadcastConversation(conversation);
       void (async () => {
@@ -15101,6 +15158,7 @@ async function routeApi(request: Request, url: URL) {
               streamedTranslation += delta;
               msg.translation = streamedTranslation || "正在翻译...";
               conversation.updateAt = Date.now();
+              persistConversation(conversation);
               saveState();
               broadcastConversation(conversation);
             },
@@ -15144,6 +15202,7 @@ async function routeApi(request: Request, url: URL) {
         updateAt: Date.now(),
       };
       state.conversations.unshift(fork);
+      persistConversation(fork);
       saveState();
       broadcastList();
       return json({ conversationId: fork.id });
@@ -15167,6 +15226,7 @@ async function routeApi(request: Request, url: URL) {
       }
       if (!changed) return error("Tool call not found", 404);
       conversation.updateAt = Date.now();
+      persistConversation(conversation);
       saveState();
       broadcastConversation(conversation);
       const hasPendingTools = conversation.messages.some((node) =>
