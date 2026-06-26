@@ -1763,10 +1763,17 @@ async function performStateSave(): Promise<void> {
   // (post-import), the indentation alone can double serialize CPU cost.
   // logs 是内存态运行时缓冲(对齐移动端,重启清空),不写入 state.json。
   // JSON.stringify 对值为 undefined 的属性会省略键,故 logs 不会落盘。
-  // logs 是内存态(不落盘);1.2.6 起 conversations 也排除——会话已迁入 SQLite 活库,
-  // state.json 瘦身。若不排除,启动后第一次 saveState() 会把内存 state.conversations 又
-  // 写回 state.json,破坏瘦身。JSON.stringify 对 undefined 值省略键,两者都不会落盘。
-  const content = JSON.stringify({ ...state, logs: undefined, conversations: undefined });
+  // conversations:仅当迁移标记(conversations-sqlite-1.2.6)已写时才排除——此时活库是
+  // 权威源,state.json 瘦身。迁移未完成时必须保留 conversations,确保 state.json 始终是
+  // 合法的重试源:若迁移失败后这里把会话抹空,下次启动 parsed.conversations 为空、活库也空,
+  // 会话永久丢失(详见 migrateConversationsIfNeeded 的方案 B 兜底)。
+  const convSqliteMigrated = Array.isArray(state.appliedMigrations)
+    && state.appliedMigrations.includes(CONVERSATIONS_SQLITE_MIGRATION);
+  const content = JSON.stringify({
+    ...state,
+    logs: undefined,
+    ...(convSqliteMigrated ? { conversations: undefined } : {}),
+  });
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const tempPath = `${statePath}.${process.pid}.${Date.now()}.${attempt}.tmp`;
@@ -3592,38 +3599,73 @@ interface PcMessageNodeRow {
 /** 打开/创建会话活库并建表(幂等)。每次启动调一次,返回长连接。 */
 function openConversationsDb(): InstanceType<typeof Database> {
   mkdirSync(dataDir, { recursive: true });
+  try {
+    return openConversationsDbUnsafe();
+  } catch (err) {
+    // 活库损坏(杀软隔离 / 磁盘错误 / 非 SQLite 文件 / 旧版残留)。1.2.5 前无 DB 依赖、服务
+    // 总能起来;1.2.6 不能因活库损坏让整个服务起不来。保留坏文件供事后取证,清旁文件,重建
+    // 空库。后续恢复:未迁移过 → migrateConversationsIfNeeded 从 state.json(方案 A 保住的
+    // 重试源)或 pre-sqlite.bak(方案 B)重新灌库;已迁移过 → 空库起步,坏文件已留存,用户
+    // 可用 sqlite3 .recover 手动 salvage。不自动用 stale 的 .bak 覆盖(已迁移后会话已变动,
+    // 回滚到迁移前会静默丢新增/复活已删,比空库更迷惑)。
+    console.error("[conv-db] 活库打开/建表失败,尝试隔离坏文件并重建:", err);
+    try {
+      if (existsSync(conversationsDbPath)) {
+        const corruptPath = `${conversationsDbPath}.corrupt-${Date.now()}`;
+        try { renameSync(conversationsDbPath, corruptPath); }
+        catch { /* 文件锁/权限:尽力而为,继续清旁文件重建 */ }
+      }
+      for (const suffix of ["-wal", "-shm"]) {
+        const sidecar = `${conversationsDbPath}${suffix}`;
+        if (existsSync(sidecar)) { try { unlinkSync(sidecar); } catch { /* best-effort */ } }
+      }
+      return openConversationsDbUnsafe();
+    } catch (err2) {
+      console.error("[conv-db] 重建活库仍失败,会话持久化不可用", err2);
+      throw err2;
+    }
+  }
+}
+
+/** 实际打开 + PRAGMA + 建表。抛错时确保关闭句柄(Windows 文件锁),否则 rename 会失败。 */
+function openConversationsDbUnsafe(): InstanceType<typeof Database> {
   const db = new Database(conversationsDbPath, { create: true, readwrite: true });
-  // WAL:脏页进 -wal 旁文件,不重写主库——这是"增量写"的根本机制。
-  // synchronous=NORMAL:WAL 下足够安全且更快(每次 commit 不强制 fsync)。
-  // foreign_keys=ON:CASCADE 删除依赖它(删会话行自动带走其节点)。
-  // busy_timeout:并发写竞争时等待而非立即报 SQLITE_BUSY。
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA synchronous = NORMAL");
-  db.exec("PRAGMA foreign_keys = ON");
-  db.exec("PRAGMA busy_timeout = 5000");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS pc_conversation (
-      id              TEXT PRIMARY KEY NOT NULL,
-      assistant_id    TEXT NOT NULL,
-      title           TEXT NOT NULL DEFAULT '',
-      system_prompt   TEXT NOT NULL DEFAULT '',
-      truncate_index  INTEGER NOT NULL DEFAULT -1,
-      suggestions     TEXT NOT NULL DEFAULT '[]',
-      is_pinned       INTEGER NOT NULL DEFAULT 0,
-      create_at       INTEGER NOT NULL,
-      update_at       INTEGER NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS pc_message_node (
-      id              TEXT PRIMARY KEY NOT NULL,
-      conversation_id TEXT NOT NULL,
-      node_index      INTEGER NOT NULL,
-      messages        TEXT NOT NULL DEFAULT '[]',
-      select_index    INTEGER NOT NULL DEFAULT 0,
-      FOREIGN KEY (conversation_id) REFERENCES pc_conversation(id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS idx_pc_msg_node_conv ON pc_message_node(conversation_id);
-  `);
-  return db;
+  try {
+    // WAL:脏页进 -wal 旁文件,不重写主库——这是"增量写"的根本机制。
+    // synchronous=NORMAL:WAL 下足够安全且更快(每次 commit 不强制 fsync)。
+    // foreign_keys=ON:CASCADE 删除依赖它(删会话行自动带走其节点)。
+    // busy_timeout:并发写竞争时等待而非立即报 SQLITE_BUSY。
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA synchronous = NORMAL");
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec("PRAGMA busy_timeout = 5000");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS pc_conversation (
+        id              TEXT PRIMARY KEY NOT NULL,
+        assistant_id    TEXT NOT NULL,
+        title           TEXT NOT NULL DEFAULT '',
+        system_prompt   TEXT NOT NULL DEFAULT '',
+        truncate_index  INTEGER NOT NULL DEFAULT -1,
+        suggestions     TEXT NOT NULL DEFAULT '[]',
+        is_pinned       INTEGER NOT NULL DEFAULT 0,
+        create_at       INTEGER NOT NULL,
+        update_at       INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS pc_message_node (
+        id              TEXT PRIMARY KEY NOT NULL,
+        conversation_id TEXT NOT NULL,
+        node_index      INTEGER NOT NULL,
+        messages        TEXT NOT NULL DEFAULT '[]',
+        select_index    INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY (conversation_id) REFERENCES pc_conversation(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pc_msg_node_conv ON pc_message_node(conversation_id);
+    `);
+    return db;
+  } catch (err) {
+    try { db.close(); } catch { /* best-effort:句柄随 GC 释放 */ }
+    throw err;
+  }
 }
 
 // 会话列表顺序 = state.conversations 数组顺序(GET /api/conversations 不排序,直接返回
@@ -3887,8 +3929,21 @@ function migrateConversationsIfNeeded(parsed: Partial<State>): boolean {
   const appliedMigrations = Array.isArray(parsed.appliedMigrations) ? parsed.appliedMigrations : [];
   if (appliedMigrations.includes(CONVERSATIONS_SQLITE_MIGRATION)) return true;
 
-  const conversationsToMigrate = Array.isArray(parsed.conversations) ? parsed.conversations : [];
+  let conversationsToMigrate = Array.isArray(parsed.conversations) ? parsed.conversations : [];
   const preSqliteBakPath = join(dataDir, "state.json.pre-sqlite.bak");
+
+  // 方案 B(兜底):state.json 已无 conversations,但 pre-sqlite.bak 里有——说明上次迁移
+  // 失败、saveState 把会话从 state.json 抹空了(此路径已被 performStateSave 的标记门闸堵住,
+  // 这里是纵深防御,捕获任何把 state.json 抹空的未知途径)。从 .bak 救回重灌。
+  // 仅在迁移标记未写时执行:已迁移用户的空活库是合法空状态(用户删光了),不能误复活。
+  // 标记已写会在上面 L3888 早退,不会走到这里。
+  if (conversationsToMigrate.length === 0) {
+    const fromBak = recoverConversationsFromBak();
+    if (fromBak.length > 0) {
+      console.log(`[conv-db] 检测到迁移失败残留:从 pre-sqlite.bak 恢复 ${fromBak.length} 条会话`);
+      conversationsToMigrate = fromBak;
+    }
+  }
 
   // ① 备份(只在有会话、state.json 存在、.bak 不存在时;防覆盖已有备份)
   if (conversationsToMigrate.length > 0 && existsSync(statePath) && !existsSync(preSqliteBakPath)) {
