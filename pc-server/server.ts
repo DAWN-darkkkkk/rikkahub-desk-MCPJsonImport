@@ -15445,6 +15445,9 @@ async function routeApi(request: Request, url: URL) {
     return json({ ok: true });
   }
   if (path === "stats" && request.method === "GET") return json(computeStats());
+  // 赞助者列表。当前无自有数据源,返回空数组;接入 sponsor 数据时只需在此处读取即可,
+  // 前端会展示对应的加载 / 空状态。
+  if (path === "sponsors" && request.method === "GET") return json([]);
   if (path === "data/webdav/config" && request.method === "POST") {
     const body = await readJson<Partial<WebDavConfig>>(request);
     const webDavConfig = normalizeWebDavConfig(body);

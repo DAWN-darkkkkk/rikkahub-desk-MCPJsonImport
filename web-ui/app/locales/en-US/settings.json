@@ -12,7 +12,21 @@
     "stats": "Statistics",
     "logs": "Request logs",
     "proxy": "Proxy & port",
-    "about": "About"
+    "about": "About",
+    "donate": "Donate"
+  },
+  "donate": {
+    "title": "Donate",
+    "subtitle": "If this app helps you, consider supporting it to keep it going.",
+    "methods": "Donation methods",
+    "afdian": "Afdian",
+    "afdian_desc": "For users in China",
+    "international": "International",
+    "international_desc": "For global users",
+    "coming_soon": "Coming soon",
+    "sponsor_list": "Sponsor list",
+    "sponsor_empty": "No sponsors yet — thank you for every bit of support.",
+    "sponsor_failed": "Failed to load sponsor list"
   },
   "about": {
     "title": "About",

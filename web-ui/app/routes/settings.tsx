@@ -17,6 +17,7 @@ import {
   Globe,
   Github,
   GripVertical,
+  Heart,
   KeyRound,
   Loader2,
   MessageSquareText,
@@ -102,6 +103,7 @@ type Section =
   | "stats"
   | "logs"
   | "proxy"
+  | "donate"
   | "about"
   | "plan";
 type ProviderKind = "openai" | "claude" | "google";
@@ -233,6 +235,7 @@ const navItems: Array<{
   { id: "stats", labelKey: "settings:nav.stats", icon: Database },
   { id: "logs", labelKey: "settings:nav.logs", icon: FileClock },
   { id: "proxy", labelKey: "settings:nav.proxy", icon: Globe },
+  { id: "donate", labelKey: "settings:nav.donate", icon: Heart },
   { id: "about", labelKey: "settings:nav.about", icon: CheckCircle2 },
 ];
 
@@ -787,6 +790,7 @@ export default function SettingsPage() {
             {section === "stats" && <StatsSection stats={stats} />}
             {section === "logs" && <LogsSection logs={logs} onClear={clearLogs} />}
             {section === "proxy" && <ProxySection settings={settings} onSettings={updateLocal} />}
+            {section === "donate" && <DonateSection />}
             {section === "about" && <AboutSection />}
           </div>
         </ScrollArea>
@@ -8548,6 +8552,107 @@ function ProxySection({
           <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
             {t("settings:proxy.port_restart_note")}
           </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// 爱发电品牌图标。path 数据取自 Rikkahub-Android 的 VectorDrawable,保持品牌识别度。
+function AfdianIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="currentColor" aria-hidden="true">
+      <path d="M9,14.234a0.567,0.567 0,1 0,0 1.134,0.567 0.567 0 0,0 0,-1.134m5.351,1.705a0.567,0.567 0,1 0,0 1.135,0.567 0.567,0 0,0 0,-1.135m8.401,1.436c-0.189,0.095 -0.461,0.1 -0.713,0.013 -0.169,-0.06 -0.352,-0.116 -0.534,-0.172 -0.339,-0.104 -0.904,-0.276 -1.011,-0.407a0.533,0.533 0,1 0,-0.853 0.643c0.059,0.08 0.139,0.146 0.22,0.209 -0.816,1.131 -4.398,3.382 -9.464,2.273 -2.283,-0.5 -3.819,-1.413 -4.444,-2.639 -0.451,-0.885 -0.348,-1.797 -0.133,-2.293 0.62,-1.29 5.097,-4.261 7.955,-5.943a0.537,0.537 0,0 0,0.188 -0.733c-0.149,-0.254 -0.49,-0.356 -0.73,-0.189 -0.231,0.135 -1.015,0.601 -2.015,1.236 -0.338,-0.227 -0.923,-0.508 -1.86,-0.6 -1.486,-0.148 -4.92,-0.805 -6.029,-1.275C2.535,7.162 0.731,6.27 1.131,5.267c0.092,-0.234 0.527,-0.613 1.47,-0.974a8.5,8.5 0,0 1,1.995 -0.492l-0.212,0.103c-0.642,0.312 -1.343,0.662 -1.813,1.075 -0.034,-0.022 -0.07,-0.044 -0.094,-0.069a0.527,0.527 0,0 0,-0.754 -0.017,0.533 0.533 0,0,0 -0.017,0.756c0.19,0.2 0.471,0.35 0.829,0.465l0.039,0.014c1.245,0.383 3.458,0.336 6.578,0.211 1.345,-0.052 2.615,-0.102 3.674,-0.082 3.512,0.07 6.152,1.469 8.07,4.279 1.178,1.725 0.753,3.426 0.079,4.903a1.4,1.4 0,0 1,-0.231 -0.222,0.54 0.54,0 0,0 -0.75,-0.085 0.535,0.535 0,0 0,-0.086 0.751c0.109,0.137 0.665,0.778 1.355,0.724l0.037,-0.002c0.021,-0.003 0.042,0.001 0.064,-0.003 0.472,-0.086 0.768,-0.063 1.045,0.111 0.367,0.232 0.547,0.37 0.511,0.485 -0.021,0.073 -0.076,0.125 -0.168,0.177M8.19,11.418l-0.315,0.231a1.6,1.6 0,0 1,-0.243 -0.32c0.123,-0.038 0.33,0.007 0.558,0.089m14.733,4.356a1.9,1.9 0,0 0,-0.81 -0.27c0.632,-1.544 1.034,-3.565 -0.336,-5.572 -2.096,-3.072 -5.101,-4.668 -8.93,-4.744 -1.091,-0.022 -2.377,0.029 -3.737,0.083 -1.58,0.063 -3.683,0.145 -5.112,0.027 0.285,-0.155 0.588,-0.304 0.851,-0.431 1.006,-0.49 1.797,-0.872 1.535,-1.548 -0.137,-0.396 -0.547,-0.603 -1.219,-0.618C3.748,2.669 0.688,3.489 0.138,4.872c-0.31,0.779 -0.361,2.282 2.775,3.61 1.29,0.548 4.934,1.216 6.341,1.355 0.397,0.039 0.701,0.119 0.931,0.205a75,75 0,0 0,-0.986 0.664c-0.577,-0.329 -1.521,-0.718 -2.226,-0.237a0.94,0.94 0,0 0,-0.435 0.768c-0.01,0.385 0.224,0.763 0.486,1.066 -1.038,0.83 -1.877,1.634 -2.175,2.253 -0.332,0.762 -0.467,2.008 0.153,3.224 0.786,1.544 2.524,2.62 5.166,3.199 3.454,0.755 6.437,0.075 8.411,-0.966 1.099,-0.579 1.878,-1.27 2.257,-1.887l0.356,0.113c0.169,0.051 0.338,0.103 0.496,0.159 0.522,0.181 1.1,0.157 1.545,-0.068l0.025,-0.013c0.336,-0.177 0.577,-0.46 0.683,-0.803 0.285,-0.922 -0.528,-1.432 -1.018,-1.74" />
+    </svg>
+  );
+}
+
+interface Sponsor {
+  userName: string;
+  avatar: string;
+  amount?: string;
+}
+
+function DonateSection() {
+  const { t } = useTranslation();
+  const [sponsors, setSponsors] = React.useState<Sponsor[] | null>(null);
+  const [failed, setFailed] = React.useState(false);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    api
+      .get<Sponsor[]>("sponsors")
+      .then((data) => {
+        if (!cancelled) setSponsors(data);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const loading = sponsors === null && !failed;
+
+  return (
+    <>
+      <SectionHeader icon={Heart} title={t("settings:donate.title")} subtitle={t("settings:donate.subtitle")} />
+      <div className="space-y-6">
+        <div className="rounded-lg border bg-card">
+          <button
+            type="button"
+            className="flex w-full items-center gap-3 p-4 text-left transition hover:bg-accent/50"
+            onClick={() => void openExternal("https://afdian.com/a/mirsky")}
+          >
+            <AfdianIcon className="size-5 shrink-0 text-muted-foreground" />
+            <div className="min-w-0 flex-1">
+              <div className="font-medium">{t("settings:donate.afdian")}</div>
+              <div className="text-sm text-muted-foreground">{t("settings:donate.afdian_desc")}</div>
+            </div>
+            <ExternalLink className="size-4 shrink-0 text-muted-foreground" />
+          </button>
+          <Separator />
+          <div className="flex items-center gap-3 p-4">
+            <Globe className="size-5 shrink-0 text-muted-foreground" />
+            <div className="min-w-0 flex-1">
+              <div className="font-medium">{t("settings:donate.international")}</div>
+              <div className="text-sm text-muted-foreground">{t("settings:donate.international_desc")}</div>
+            </div>
+            <span className="shrink-0 rounded-full border px-2.5 py-0.5 text-xs text-muted-foreground">
+              {t("settings:donate.coming_soon")}
+            </span>
+          </div>
+        </div>
+
+        <div>
+          <div className="mb-3 text-sm font-medium text-primary">{t("settings:donate.sponsor_list")}</div>
+          {loading ? (
+            <div className="flex justify-center py-10">
+              <Loader2 className="size-5 animate-spin text-muted-foreground" />
+            </div>
+          ) : failed ? (
+            <div className="rounded-lg border bg-card p-6 text-center text-sm text-muted-foreground">
+              {t("settings:donate.sponsor_failed")}
+            </div>
+          ) : sponsors!.length === 0 ? (
+            <div className="rounded-lg border bg-card p-6 text-center text-sm text-muted-foreground">
+              {t("settings:donate.sponsor_empty")}
+            </div>
+          ) : (
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(3rem,1fr))] gap-4">
+              {sponsors!.map((s) => (
+                <div
+                  key={s.userName + s.avatar}
+                  className="flex flex-col items-center gap-1.5"
+                  title={s.amount ? `${s.userName} · ${s.amount}` : s.userName}
+                >
+                  <img src={s.avatar} alt={s.userName} className="size-12 rounded-full object-cover" loading="lazy" />
+                  <span className="w-full truncate text-center text-xs text-muted-foreground">{s.userName}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </>

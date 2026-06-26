@@ -12,7 +12,21 @@
     "stats": "统计",
     "logs": "请求日志",
     "proxy": "代理与端口",
-    "about": "关于"
+    "about": "关于",
+    "donate": "赞助"
+  },
+  "donate": {
+    "title": "赞助",
+    "subtitle": "如果这个应用对你有帮助,欢迎支持一下,让项目持续发展。",
+    "methods": "赞助方式",
+    "afdian": "爱发电",
+    "afdian_desc": "面向国内用户",
+    "international": "国际赞助",
+    "international_desc": "面向全球用户",
+    "coming_soon": "敬请期待",
+    "sponsor_list": "赞助用户列表",
+    "sponsor_empty": "暂时还没有赞助者,感谢每一份支持。",
+    "sponsor_failed": "赞助者列表加载失败"
   },
   "about": {
     "title": "关于",
