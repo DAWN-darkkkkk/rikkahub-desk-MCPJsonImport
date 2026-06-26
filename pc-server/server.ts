@@ -3097,7 +3097,17 @@ function applyAndroidZipBackupFromPath(zipPath: string): { settingsImported: boo
       // Avatar type strings come in as Android FQNs; rewrite them back to PC's short form
       // (dummy/emoji/image) so the UI code paths that branch on type === "dummy" etc.
       // keep working.
-      const merged = { ...state.settings, ...raw } as State["settings"];
+      // APP→PC:以 PC 为基底,只引入 APP 独有的配置;PC 已有的(含 apiKey、自定义 provider/助手)
+      // 一律保留。旧逻辑 {...PC.settings, ...APP} 是浅合并,APP 的 providers/assistants 数组会
+      // 整体覆盖 PC,导入备份时 PC 配的 apiKey 等定制全丢(Issue: 导入空 APP 备份清空 PC 配置)。
+      // 标量字段 PC 优先;providers/assistants/searchServices 按 id 合并(PC 为主 + APP 独有)。
+      const merged = {
+        ...raw,
+        ...state.settings,
+        providers: mergeById(state.settings.providers ?? [], Array.isArray(raw.providers) ? raw.providers : []),
+        assistants: mergeById(state.settings.assistants ?? [], Array.isArray(raw.assistants) ? raw.assistants : []),
+        searchServices: mergeById(state.settings.searchServices ?? [], Array.isArray(raw.searchServices) ? raw.searchServices : []),
+      } as State["settings"];
       const adjusted = rewriteAvatarsInSettings(merged, ANDROID_AVATAR_TYPE_TO_PC);
       state = normalizeState({ ...state, settings: adjusted as State["settings"] });
       settingsImported = true;
