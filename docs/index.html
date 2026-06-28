@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <!-- Google Search Console ownership verification. Required for Search Console to surface
+       crawl status / indexing requests / sitemap analytics for this domain. Safe to leave
+       in place permanently — the tag has no runtime effect on visitors. -->
+  <meta name="google-site-verification" content="EwtloXnYiu0yqZeDE0MGhx4nB2wrM3GnSHXztlq-n6w" />
+
+  <title>Rikkahub Desktop · Rikkahub 桌面版 — Windows 端原生 LLM 聊天客户端</title>
+
+  <!-- Primary SEO meta. Description is keyword-dense but still reads naturally to
+       satisfy both search rankings and humans. Listed alternate names (PC / 桌面版 /
+       电脑版) so search queries for any of those terms surface this page. -->
+  <meta name="description" content="Rikkahub Desktop（Rikkahub 桌面版 / Rikkahub 电脑版 / Rikkahub PC）— 原生 Windows LLM 聊天客户端，支持 OpenAI、Anthropic、Google 等多种供应商切换，本地化运行，无遥测、无云端账号。基于 @re-ovo 的 Android 版 Rikkahub 重构。" />
+  <meta name="keywords" content="rikkahub, rikkahub desktop, rikkahub 桌面版, rikkahub 电脑版, rikkahub PC, rikkahub Windows, Windows LLM client, AI 聊天客户端, OpenAI, Anthropic Claude, Google Gemini, MCP, 本地模型, Ollama, LM Studio" />
+  <meta name="author" content="yuh-G" />
+  <meta name="robots" content="index, follow" />
+  <link rel="canonical" href="https://rikkahub-desktop.pages.dev/" />
+
+  <!-- Open Graph for social card previews. -->
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="Rikkahub Desktop" />
+  <meta property="og:title" content="Rikkahub Desktop · 原生 Windows LLM 聊天客户端" />
+  <meta property="og:description" content="支持 OpenAI / Anthropic / Google 等多供应商切换，本地化运行，基于 @re-ovo 的 Android 版 Rikkahub 重构。" />
+  <meta property="og:url" content="https://rikkahub-desktop.pages.dev/" />
+  <meta property="og:image" content="https://rikkahub-desktop.pages.dev/icon.png" />
+  <meta property="og:locale" content="zh_CN" />
+  <meta property="og:locale:alternate" content="en_US" />
+
+  <!-- Twitter / X card. -->
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Rikkahub Desktop · Native Windows LLM Chat Client" />
+  <meta name="twitter:description" content="支持 OpenAI / Anthropic / Google 等多供应商切换，基于 @re-ovo 的 Android 版 Rikkahub 重构。" />
+  <meta name="twitter:image" content="https://rikkahub-desktop.pages.dev/icon.png" />
+
+  <!-- Hreflang for the language switcher. Both `zh` and `en` point to the same URL
+       since language is client-toggled; `x-default` gives search engines the canonical. -->
+  <link rel="alternate" hreflang="zh-CN" href="https://rikkahub-desktop.pages.dev/" />
+  <link rel="alternate" hreflang="en" href="https://rikkahub-desktop.pages.dev/" />
+  <link rel="alternate" hreflang="x-default" href="https://rikkahub-desktop.pages.dev/" />
+
+  <link rel="icon" type="image/png" href="icon.png" />
+
+  <!-- JSON-LD structured data: tells Google this is a downloadable software application,
+       enables richer search results (logo, OS, "Free" pricing label, download button). -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Rikkahub Desktop",
+    "alternateName": ["Rikkahub PC", "Rikkahub 桌面版", "Rikkahub 电脑版", "Rikkahub Windows"],
+    "description": "原生 Windows LLM 聊天客户端，支持 OpenAI、Anthropic、Google 等多种供应商切换。基于 @re-ovo 的 Android 版 Rikkahub 重构。",
+    "applicationCategory": "ProductivityApplication",
+    "operatingSystem": "Windows 10, Windows 11",
+    "url": "https://rikkahub-desktop.pages.dev/",
+    "downloadUrl": "https://github.com/yuh-G/rikkahub-desktop/releases/latest",
+    "image": "https://rikkahub-desktop.pages.dev/icon.png",
+    "softwareVersion": "1.1.0",
+    "fileSize": "37MB",
+    "softwareRequirements": "Windows 10 1809+ or Windows 11",
+    "author": {
+      "@type": "Person",
+      "name": "yuh-G",
+      "url": "https://github.com/yuh-G"
+    },
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "license": "https://github.com/yuh-G/rikkahub-desktop/blob/master/LICENSE",
+    "isBasedOn": {
+      "@type": "SoftwareApplication",
+      "name": "RikkaHub",
+      "url": "https://rikka-ai.com/",
+      "author": {
+        "@type": "Person",
+        "name": "@re-ovo",
+        "url": "https://github.com/re-ovo"
+      }
+    }
+  }
+  </script>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800;900&family=Geist+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Geist', 'Noto Sans SC', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+            mono: ['Geist Mono', 'ui-monospace', 'monospace'],
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    html { scroll-behavior: smooth; }
+    body { font-family: 'Geist', 'Noto Sans SC', sans-serif; -webkit-font-smoothing: antialiased; }
+    .grid-bg {
+      background-image:
+        linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: radial-gradient(ellipse 80% 60% at 50% 30%, black 30%, transparent 90%);
+      -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 30%, black 30%, transparent 90%);
+    }
+    .hero-glow::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(ellipse 50% 40% at 30% 20%, rgba(99, 102, 241, 0.25), transparent 60%),
+        radial-gradient(ellipse 40% 30% at 70% 30%, rgba(168, 85, 247, 0.2), transparent 60%),
+        radial-gradient(ellipse 60% 40% at 50% 80%, rgba(59, 130, 246, 0.15), transparent 60%);
+    }
+    .gradient-text {
+      background: linear-gradient(135deg, #a78bfa 0%, #818cf8 50%, #60a5fa 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+    .window-frame {
+      box-shadow:
+        0 0 0 1px rgba(255, 255, 255, 0.05),
+        0 30px 60px -15px rgba(99, 102, 241, 0.25),
+        0 60px 120px -30px rgba(0, 0, 0, 0.5);
+    }
+    .feat-card { transition: transform 0.2s, border-color 0.2s, background 0.2s; }
+    .feat-card:hover { transform: translateY(-2px); }
+    @keyframes fadein-up {
+      from { opacity: 0; transform: translateY(20px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .animate-fadein { animation: fadein-up 0.8s ease-out backwards; }
+  </style>
+</head>
+<body class="bg-[#0a0a0f] text-zinc-100 antialiased overflow-x-hidden">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-white/[0.06] bg-[#0a0a0f]/70 backdrop-blur-xl">
+    <div class="mx-auto flex max-w-7xl items-center justify-between px-6 py-3.5">
+      <a href="#top" class="flex items-center gap-2.5">
+        <img src="icon.png" alt="Rikkahub" class="size-7 rounded-md" />
+        <span class="text-[15px] font-semibold tracking-tight">Rikkahub Desktop</span>
+      </a>
+      <div class="flex items-center gap-1 text-sm">
+        <a href="#features" data-i18n="nav.features" class="hidden rounded-md px-3 py-1.5 text-zinc-400 transition hover:text-white sm:inline-block">功能</a>
+        <a href="#screenshots" data-i18n="nav.screenshots" class="hidden rounded-md px-3 py-1.5 text-zinc-400 transition hover:text-white sm:inline-block">截图</a>
+        <a href="#credit" data-i18n="nav.credit" class="hidden rounded-md px-3 py-1.5 text-zinc-400 transition hover:text-white sm:inline-block">致谢</a>
+        <a href="https://github.com/yuh-G/rikkahub-desktop" target="_blank" rel="noopener" class="rounded-md px-3 py-1.5 text-zinc-400 transition hover:text-white">GitHub</a>
+        <!-- Language toggle. The button's text always shows the OTHER language to communicate
+             "click to switch to" semantics. Persisted via localStorage; first visit uses
+             navigator.language. -->
+        <button data-lang-btn onclick="toggleLang()"
+                class="ml-1 inline-flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-white/[0.03] px-3 py-1.5 text-xs font-medium text-zinc-300 transition hover:border-white/[0.15] hover:text-white">
+          <svg class="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+          </svg>
+          <span data-lang-label>EN</span>
+        </button>
+        <a href="https://github.com/yuh-G/rikkahub-desktop/releases/latest" target="_blank" rel="noopener"
+           data-download="primary" data-i18n="nav.download"
+           class="ml-1 rounded-md bg-white px-4 py-1.5 font-medium text-black transition hover:bg-zinc-200">下载</a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ━━━━━━━━━━━━━━━━━━━ HERO ━━━━━━━━━━━━━━━━━━━ -->
+  <header id="top" class="hero-glow relative overflow-hidden pt-32 pb-20 sm:pt-44 sm:pb-32">
+    <div class="grid-bg absolute inset-0"></div>
+    <div class="relative mx-auto max-w-6xl px-6 text-center">
+      <a href="https://github.com/yuh-G/rikkahub-desktop/releases/latest" target="_blank" rel="noopener"
+         class="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.03] px-4 py-1.5 text-xs text-zinc-400 transition hover:border-white/[0.15] hover:text-white animate-fadein">
+        <span class="size-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+        <span data-i18n="hero.badge">最新版本可用 — 查看 Releases</span>
+        <svg class="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14m-6-6 6 6-6 6"/></svg>
+      </a>
+
+      <h1 class="mt-8 text-5xl font-extrabold tracking-tight sm:text-7xl lg:text-8xl animate-fadein" style="animation-delay: 0.1s">
+        <span data-i18n="hero.titleLine1">您的 AI 对话</span><br />
+        <span class="gradient-text" data-i18n="hero.titleLine2">由您掌控</span>
+      </h1>
+
+      <!-- The longer descriptive tagline — text per user instruction. Used in place of the
+           punchier previous subtitle so the hero conveys the full project context: it's a
+           Windows-native client, supports provider switching, and explicitly credits the
+           Android original. -->
+      <p data-i18n="hero.tagline"
+         class="mx-auto mt-8 max-w-3xl text-base text-zinc-400 sm:text-lg leading-relaxed animate-fadein" style="animation-delay: 0.2s">
+        Rikkahub 是一个原生 Windows LLM 聊天客户端，支持切换不同的供应商进行聊天，依赖原作者 RE 构建的 Android 版 Rikkahub 重构而成。
+      </p>
+
+      <div class="mt-12 flex flex-wrap items-center justify-center gap-3 animate-fadein" style="animation-delay: 0.3s">
+        <!-- Primary download button — goes to Cloudflare R2 mirror (fast in China & globally).
+             The R2 URL is set at runtime from the LATEST_VERSION constant defined in the
+             init script at the bottom, so each release we only edit one line. Crawlers see
+             a real href (the GitHub fallback) at static-parse time and only get JS-upgraded
+             to the R2 URL when a browser loads the page — best of both worlds for SEO and UX. -->
+        <a data-download="primary"
+           href="https://github.com/yuh-G/rikkahub-desktop/releases/latest" target="_blank" rel="noopener"
+           class="group inline-flex items-center gap-2 rounded-xl bg-white px-7 py-3.5 text-base font-semibold text-black shadow-2xl shadow-white/10 transition hover:bg-zinc-200">
+          <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3v12m-4-4 4 4 4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+          </svg>
+          <span data-i18n="hero.ctaDownload">下载 Windows 版</span>
+          <span class="font-mono text-xs font-normal text-zinc-500 transition group-hover:text-zinc-700">.exe · ~37MB</span>
+        </a>
+        <a href="https://github.com/yuh-G/rikkahub-desktop" target="_blank" rel="noopener"
+           class="inline-flex items-center gap-2 rounded-xl border border-white/[0.12] bg-white/[0.03] px-7 py-3.5 text-base font-semibold text-white transition hover:border-white/[0.25] hover:bg-white/[0.06]">
+          <svg class="size-5" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.44 9.8 8.21 11.39.6.11.82-.26.82-.58 0-.29-.01-1.04-.02-2.05-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5.99.11-.78.42-1.3.76-1.6-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.62-5.48 5.92.43.37.81 1.1.81 2.22 0 1.6-.01 2.89-.01 3.29 0 .32.22.7.83.58A12.01 12.01 0 0 0 24 12c0-6.63-5.37-12-12-12Z"/></svg>
+          <span data-i18n="hero.ctaGithub">在 GitHub 查看</span>
+        </a>
+      </div>
+
+      <!-- Hint about download sources. The primary download goes through Cloudflare R2
+           (fast globally, especially in China where GitHub Releases is slow). Provide the
+           GitHub Releases URL as an explicit fallback for users who distrust mirrors. -->
+      <p class="mt-4 text-xs text-zinc-500 animate-fadein" style="animation-delay: 0.35s">
+        <span data-i18n="hero.mirrorHint">下载源：Cloudflare 全球 CDN · </span>
+        <a href="https://github.com/yuh-G/rikkahub-desktop/releases/latest" target="_blank" rel="noopener"
+           class="underline-offset-2 hover:text-white hover:underline" data-i18n="hero.mirrorFallback">GitHub Releases 备用源 ↗</a>
+      </p>
+
+      <p data-i18n="hero.requirements" class="mt-2 text-xs text-zinc-600 animate-fadein" style="animation-delay: 0.4s">
+        Windows 10 1809+ / Windows 11 · 自带 WebView2 引导器 · 无需管理员权限
+      </p>
+
+      <div class="mt-20 sm:mt-24 animate-fadein" style="animation-delay: 0.5s">
+        <div class="window-frame relative mx-auto max-w-5xl overflow-hidden rounded-2xl border border-white/[0.08] bg-zinc-900">
+          <div class="flex items-center gap-1.5 border-b border-white/[0.06] bg-zinc-900/80 px-4 py-2.5">
+            <span class="size-3 rounded-full bg-red-500/80"></span>
+            <span class="size-3 rounded-full bg-yellow-500/80"></span>
+            <span class="size-3 rounded-full bg-green-500/80"></span>
+            <span class="ml-3 font-mono text-xs text-zinc-500">rikkahub.exe</span>
+          </div>
+          <img src="screenshots/chat.png" alt="Rikkahub Desktop chat" loading="eager"
+               class="w-full" onerror="this.parentElement.style.display='none'" />
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- ━━━━━━━━━━━━━━━━━━━ ATTRIBUTION ━━━━━━━━━━━━━━━━━━━ -->
+  <section id="credit" class="relative px-6 py-20">
+    <div class="mx-auto max-w-4xl">
+      <div class="relative overflow-hidden rounded-3xl border border-white/[0.08] bg-gradient-to-br from-indigo-500/[0.08] via-purple-500/[0.05] to-transparent p-8 sm:p-12">
+        <div class="pointer-events-none absolute -right-20 -top-20 size-60 rounded-full bg-purple-500/15 blur-3xl"></div>
+        <div class="relative">
+          <div class="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.03] px-3 py-1 text-xs font-medium text-zinc-400">
+            <svg class="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+            <span data-i18n="credit.badge">致敬原作</span>
+          </div>
+          <h2 data-i18n="credit.title" class="mt-5 text-3xl font-bold tracking-tight sm:text-4xl">基于 @re-ovo 的 Rikkahub 重构</h2>
+          <p data-i18n-html="credit.body" class="mt-5 max-w-3xl text-base leading-relaxed text-zinc-400 sm:text-lg">
+            本项目是 <a href="https://github.com/re-ovo" target="_blank" rel="noopener" class="font-semibold text-white underline-offset-4 hover:underline">@re-ovo</a> 所设计与开发的开源项目 Rikkahub 在 Windows 平台的移植版本。所有产品方向、命名、视觉品牌与产品理念均归原作者所有。本桌面版仅在 Windows 平台对其重构实现，并尽可能保持与原作的功能与数据格式一致 — 你可以在 PC 端直接导入手机端备份。
+          </p>
+          <div class="mt-7 flex flex-wrap gap-3">
+            <a href="https://rikka-ai.com/" target="_blank" rel="noopener"
+               class="inline-flex items-center gap-2 rounded-lg bg-white/[0.08] px-4 py-2.5 text-sm font-medium text-white transition hover:bg-white/[0.12]">
+              <svg class="size-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+              rikka-ai.com
+              <svg class="size-3 opacity-50" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17 17 7m0 0H8m9 0v9"/></svg>
+            </a>
+            <a href="https://github.com/rikkahub/rikkahub" target="_blank" rel="noopener"
+               class="inline-flex items-center gap-2 rounded-lg bg-white/[0.08] px-4 py-2.5 text-sm font-medium text-white transition hover:bg-white/[0.12]">
+              <svg class="size-4" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.44 9.8 8.21 11.39.6.11.82-.26.82-.58 0-.29-.01-1.04-.02-2.05-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5.99.11-.78.42-1.3.76-1.6-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.62-5.48 5.92.43.37.81 1.1.81 2.22 0 1.6-.01 2.89-.01 3.29 0 .32.22.7.83.58A12.01 12.01 0 0 0 24 12c0-6.63-5.37-12-12-12Z"/></svg>
+              rikkahub/rikkahub
+              <svg class="size-3 opacity-50" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17 17 7m0 0H8m9 0v9"/></svg>
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ━━━━━━━━━━━━━━━━━━━ STATS ━━━━━━━━━━━━━━━━━━━ -->
+  <section class="px-6 py-12">
+    <div class="mx-auto max-w-5xl">
+      <div class="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.04] md:grid-cols-4">
+        <div class="bg-[#0a0a0f] p-6 text-center">
+          <div class="text-3xl font-bold sm:text-4xl">30+</div>
+          <div data-i18n="stats.providers" class="mt-1 text-sm text-zinc-500">内置供应商</div>
+        </div>
+        <div class="bg-[#0a0a0f] p-6 text-center">
+          <div class="text-3xl font-bold sm:text-4xl">17</div>
+          <div data-i18n="stats.search" class="mt-1 text-sm text-zinc-500">联网搜索引擎</div>
+        </div>
+        <div class="bg-[#0a0a0f] p-6 text-center">
+          <div class="text-3xl font-bold sm:text-4xl">7</div>
+          <div data-i18n="stats.tts" class="mt-1 text-sm text-zinc-500">TTS 引擎</div>
+        </div>
+        <div class="bg-[#0a0a0f] p-6 text-center">
+          <div class="text-3xl font-bold sm:text-4xl">0</div>
+          <div data-i18n="stats.telemetry" class="mt-1 text-sm text-zinc-500">遥测 / 云端账号</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ━━━━━━━━━━━━━━━━━━━ FEATURES ━━━━━━━━━━━━━━━━━━━ -->
+  <section id="features" class="px-6 py-24">
+    <div class="mx-auto max-w-6xl">
+      <div class="text-center">
+        <div class="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.03] px-3 py-1 text-xs font-medium text-zinc-400">
+          <span data-i18n="features.badge">功能特色</span>
+        </div>
+        <h2 data-i18n="features.title" class="mt-6 text-4xl font-bold tracking-tight sm:text-5xl">为 AI 爱好者打造</h2>
+        <p data-i18n="features.subtitle" class="mx-auto mt-4 max-w-2xl text-zinc-400">每个细节都经过实际场景打磨。</p>
+      </div>
+
+      <div class="mt-16 grid gap-px overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.04] sm:grid-cols-2 lg:grid-cols-3">
+        <div class="feat-card bg-[#0a0a0f] p-7 hover:bg-white/[0.02]">
+          <div class="inline-flex size-10 items-center justify-center rounded-lg bg-indigo-500/15 text-indigo-300">
+            <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>
+          </div>
+          <h3 data-i18n="feat1.title" class="mt-5 text-lg font-semibold">多供应商支持</h3>
+          <p data-i18n="feat1.body" class="mt-2 text-sm text-zinc-500 leading-relaxed">OpenAI / Anthropic / Google + 任意 OpenAI 兼容端点。一个客户端聊遍全网模型。</p>
+        </div>
+
+        <div class="feat-card bg-[#0a0a0f] p-7 hover:bg-white/[0.02]">
+          <div class="inline-flex size-10 items-center justify-center rounded-lg bg-purple-500/15 text-purple-300">
+            <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          </div>
+          <h3 data-i18n="feat2.title" class="mt-5 text-lg font-semibold">本地模型即开即用</h3>
+          <p data-i18n-html="feat2.body" class="mt-2 text-sm text-zinc-500 leading-relaxed">Ollama / LM Studio / llama.cpp Server — 端点指向 <code class="rounded bg-white/[0.06] px-1.5 py-0.5 font-mono text-xs">localhost:11434</code> 即可。</p>
+        </div>
+
+        <div class="feat-card bg-[#0a0a0f] p-7 hover:bg-white/[0.02]">
+          <div class="inline-flex size-10 items-center justify-center rounded-lg bg-blue-500/15 text-blue-300">
+            <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+          </div>
+          <h3 data-i18n="feat3.title" class="mt-5 text-lg font-semibold">MCP 与内置工具</h3>
+          <p data-i18n="feat3.body" class="mt-2 text-sm text-zinc-500 leading-relaxed">Model Context Protocol + Streamable HTTP，Gemini Search Grounding 与 OpenAI web_search 一键切换。</p>
+        </div>
+
+        <div class="feat-card bg-[#0a0a0f] p-7 hover:bg-white/[0.02]">
+          <div class="inline-flex size-10 items-center justify-center rounded-lg bg-emerald-500/15 text-emerald-300">
+            <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+          </div>
+          <h3 data-i18n="feat4.title" class="mt-5 text-lg font-semibold">世界书 · 提示词注入 · Skills</h3>
+          <p data-i18n="feat4.body" class="mt-2 text-sm text-zinc-500 leading-relaxed">世界书条目按触发词自动注入，提示词注入按位置叠加到系统提示词，Skills 可从 GitHub 一键导入。三套机制可以混合使用，每个助手独立配置。</p>
+        </div>
+
+        <div class="feat-card bg-[#0a0a0f] p-7 hover:bg-white/[0.02]">
+          <div class="inline-flex size-10 items-center justify-center rounded-lg bg-amber-500/15 text-amber-300">
+            <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          </div>
+          <h3 data-i18n="feat5.title" class="mt-5 text-lg font-semibold">17 种联网搜索</h3>
+          <p data-i18n="feat5.body" class="mt-2 text-sm text-zinc-500 leading-relaxed">Tavily、Exa、Brave、Perplexity、博查、智谱、秘塔、Firecrawl、Grok、Jina、SearXNG、自定义 JS……</p>
+        </div>
+
+        <div class="feat-card bg-[#0a0a0f] p-7 hover:bg-white/[0.02]">
+          <div class="inline-flex size-10 items-center justify-center rounded-lg bg-pink-500/15 text-pink-300">
+            <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+          </div>
+          <h3 data-i18n="feat6.title" class="mt-5 text-lg font-semibold">完整 Markdown 渲染</h3>
+          <p data-i18n="feat6.body" class="mt-2 text-sm text-zinc-500 leading-relaxed">代码高亮、LaTeX 公式、Mermaid 图、表格、思维链与代码块预览。</p>
+        </div>
+
+        <div class="feat-card bg-[#0a0a0f] p-7 hover:bg-white/[0.02]">
+          <div class="inline-flex size-10 items-center justify-center rounded-lg bg-cyan-500/15 text-cyan-300">
+            <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M6 9v3a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V9"/><path d="M12 12v3"/></svg>
+          </div>
+          <h3 data-i18n="feat7.title" class="mt-5 text-lg font-semibold">分支与重新生成</h3>
+          <p data-i18n="feat7.body" class="mt-2 text-sm text-zinc-500 leading-relaxed">在任意消息处生成多个分支，每个分支可独立切换模型对比。</p>
+        </div>
+
+        <div class="feat-card bg-[#0a0a0f] p-7 hover:bg-white/[0.02]">
+          <div class="inline-flex size-10 items-center justify-center rounded-lg bg-teal-500/15 text-teal-300">
+            <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          </div>
+          <h3 data-i18n="feat8.title" class="mt-5 text-lg font-semibold">Android 备份直接导入</h3>
+          <p data-i18n="feat8.body" class="mt-2 text-sm text-zinc-500 leading-relaxed">.zip 备份一键导入 — 对话历史、设置、附件、Skills、MCP、提示词注入、世界书全保留。</p>
+        </div>
+
+        <div class="feat-card bg-[#0a0a0f] p-7 hover:bg-white/[0.02]">
+          <div class="inline-flex size-10 items-center justify-center rounded-lg bg-orange-500/15 text-orange-300">
+            <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+          </div>
+          <h3 data-i18n="feat9.title" class="mt-5 text-lg font-semibold">TTS 与 ASR</h3>
+          <p data-i18n="feat9.body" class="mt-2 text-sm text-zinc-500 leading-relaxed">Windows 系统语音、OpenAI、Gemini、Qwen、Groq、MiniMax、MiMo，带一键测试。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ━━━━━━━━━━━━━━━━━━━ SCREENSHOTS ━━━━━━━━━━━━━━━━━━━ -->
+  <section id="screenshots" class="px-6 py-24">
+    <div class="mx-auto max-w-6xl">
+      <div class="text-center">
+        <div class="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.03] px-3 py-1 text-xs font-medium text-zinc-400">
+          <span data-i18n="screenshots.badge">实际界面</span>
+        </div>
+        <h2 data-i18n="screenshots.title" class="mt-6 text-4xl font-bold tracking-tight sm:text-5xl">不止是聊天</h2>
+      </div>
+
+      <div class="mt-16 space-y-24">
+        <div class="grid items-center gap-12 lg:grid-cols-2">
+          <div>
+            <div class="inline-flex items-center gap-2 rounded-full border border-purple-500/20 bg-purple-500/10 px-3 py-1 text-xs font-medium text-purple-300">
+              <span data-i18n="screenshots.providerBadge">供应商管理</span>
+            </div>
+            <h3 data-i18n="screenshots.providerTitle" class="mt-4 text-3xl font-bold tracking-tight sm:text-4xl">所有供应商，一处管理</h3>
+            <p data-i18n="screenshots.providerBody1" class="mt-4 text-zinc-400 leading-relaxed">
+              内置 OpenAI、Anthropic、Google、AiHubMix、硅基流动、DeepSeek、OpenRouter、Vercel AI Gateway、阿里云百炼、火山引擎、月之暗面、智谱、阶跃星辰 等 30+ 供应商模板，添加 API Key 即用。
+            </p>
+            <p data-i18n="screenshots.providerBody2" class="mt-3 text-zinc-400 leading-relaxed">
+              支持自定义 Base URL、Response API、自定义请求头/请求体、Claude Prompt Caching、余额查询。每个模型还可设独立的供应商覆盖。
+            </p>
+          </div>
+          <div class="window-frame relative overflow-hidden rounded-2xl border border-white/[0.08] bg-zinc-900">
+            <div class="flex items-center gap-1.5 border-b border-white/[0.06] bg-zinc-900/80 px-4 py-2.5">
+              <span class="size-3 rounded-full bg-red-500/80"></span>
+              <span class="size-3 rounded-full bg-yellow-500/80"></span>
+              <span class="size-3 rounded-full bg-green-500/80"></span>
+              <span class="ml-3 font-mono text-xs text-zinc-500" data-i18n="screenshots.frameSettings">设置 — 供应商</span>
+            </div>
+            <img src="screenshots/settings.png" alt="Settings — Providers" loading="lazy"
+                 class="w-full" onerror="this.parentElement.style.display='none'" />
+          </div>
+        </div>
+
+        <div class="grid items-center gap-12 lg:grid-cols-2">
+          <div class="window-frame relative overflow-hidden rounded-2xl border border-white/[0.08] bg-zinc-900 lg:order-1">
+            <div class="flex items-center gap-1.5 border-b border-white/[0.06] bg-zinc-900/80 px-4 py-2.5">
+              <span class="size-3 rounded-full bg-red-500/80"></span>
+              <span class="size-3 rounded-full bg-yellow-500/80"></span>
+              <span class="size-3 rounded-full bg-green-500/80"></span>
+              <span class="ml-3 font-mono text-xs text-zinc-500" data-i18n="screenshots.frameImage">图像生成</span>
+            </div>
+            <img src="screenshots/image-gen.png" alt="Image generation" loading="lazy"
+                 class="w-full" onerror="this.parentElement.style.display='none'" />
+          </div>
+          <div class="lg:order-2">
+            <div class="inline-flex items-center gap-2 rounded-full border border-pink-500/20 bg-pink-500/10 px-3 py-1 text-xs font-medium text-pink-300">
+              <span data-i18n="screenshots.imageBadge">图像生成</span>
+            </div>
+            <h3 data-i18n="screenshots.imageTitle" class="mt-4 text-3xl font-bold tracking-tight sm:text-4xl">文本到图像</h3>
+            <p data-i18n="screenshots.imageBody1" class="mt-4 text-zinc-400 leading-relaxed">
+              支持 gpt-image-2、DALL·E 3、Imagen、Qwen-Image、FLUX 等主流模型。可上传参考图编辑，自动保存历史参考便于复用。
+            </p>
+            <p data-i18n="screenshots.imageBody2" class="mt-3 text-zinc-400 leading-relaxed">
+              生成的图片与对话历史一起本地存档，便于后续引用或导出。
+            </p>
+          </div>
+        </div>
+
+        <!-- Third showcase: Extensions (world books, prompt injections, MCP, Skills, etc.) —
+             text on the left, screenshot on the right (same orientation as the first
+             showcase so the page has a left-right-left rhythm down the page). -->
+        <div class="grid items-center gap-12 lg:grid-cols-2">
+          <div>
+            <div class="inline-flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-300">
+              <span data-i18n="screenshots.extBadge">扩展生态</span>
+            </div>
+            <h3 data-i18n="screenshots.extTitle" class="mt-4 text-3xl font-bold tracking-tight sm:text-4xl">为每个助手注入个性</h3>
+            <p data-i18n="screenshots.extBody1" class="mt-4 text-zinc-400 leading-relaxed">
+              MCP 服务器、提示词注入、世界书、快捷消息、Agent Skills — 五种扩展机制可以混合使用。每个助手独立选择启用哪些扩展，互不干扰。
+            </p>
+            <p data-i18n="screenshots.extBody2" class="mt-3 text-zinc-400 leading-relaxed">
+              世界书条目按触发关键词自动注入上下文；提示词注入按"系统提示词前后 / 聊天开头结尾 / 指定深度"位置叠加；Skills 直接从 GitHub 仓库一键导入。
+            </p>
+          </div>
+          <div class="window-frame relative overflow-hidden rounded-2xl border border-white/[0.08] bg-zinc-900">
+            <div class="flex items-center gap-1.5 border-b border-white/[0.06] bg-zinc-900/80 px-4 py-2.5">
+              <span class="size-3 rounded-full bg-red-500/80"></span>
+              <span class="size-3 rounded-full bg-yellow-500/80"></span>
+              <span class="size-3 rounded-full bg-green-500/80"></span>
+              <span class="ml-3 font-mono text-xs text-zinc-500" data-i18n="screenshots.frameExt">设置 — MCP 与拓展</span>
+            </div>
+            <img src="screenshots/Extension.png" alt="Extensions — MCP, prompt injections, world books, Skills" loading="lazy"
+                 class="w-full" onerror="this.parentElement.style.display='none'" />
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ━━━━━━━━━━━━━━━━━━━ TECH STACK ━━━━━━━━━━━━━━━━━━━ -->
+  <section class="px-6 py-16">
+    <div class="mx-auto max-w-5xl">
+      <div class="rounded-2xl border border-white/[0.08] bg-white/[0.02] p-8 text-center sm:p-12">
+        <p data-i18n="tech.label" class="text-sm font-medium text-zinc-500">基于现代技术构建</p>
+        <div class="mt-6 flex flex-wrap items-center justify-center gap-x-8 gap-y-4 font-mono text-sm text-zinc-400">
+          <a href="https://bun.sh" target="_blank" rel="noopener" class="transition hover:text-white">Bun</a>
+          <a href="https://tauri.app" target="_blank" rel="noopener" class="transition hover:text-white">Tauri v2</a>
+          <a href="https://react.dev" target="_blank" rel="noopener" class="transition hover:text-white">React 19</a>
+          <a href="https://reactrouter.com" target="_blank" rel="noopener" class="transition hover:text-white">React Router 7</a>
+          <a href="https://tailwindcss.com" target="_blank" rel="noopener" class="transition hover:text-white">Tailwind CSS</a>
+          <a href="https://ui.shadcn.com" target="_blank" rel="noopener" class="transition hover:text-white">shadcn/ui</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ━━━━━━━━━━━━━━━━━━━ FINAL CTA ━━━━━━━━━━━━━━━━━━━ -->
+  <section class="relative overflow-hidden px-6 py-32">
+    <div class="hero-glow absolute inset-0"></div>
+    <div class="relative mx-auto max-w-3xl text-center">
+      <h2 class="text-5xl font-extrabold tracking-tight sm:text-6xl">
+        <span data-i18n="cta.title1">现在就</span><span class="gradient-text" data-i18n="cta.title2">开始</span>
+      </h2>
+      <p data-i18n="cta.subtitle" class="mx-auto mt-5 max-w-xl text-zinc-400">
+        Windows 10/11 双击运行即可。覆盖安装无缝升级，数据永远在你自己的硬盘上。
+      </p>
+      <div class="mt-10 flex flex-wrap items-center justify-center gap-3">
+        <a href="https://github.com/yuh-G/rikkahub-desktop/releases/latest" target="_blank" rel="noopener"
+           data-download="primary"
+           class="inline-flex items-center gap-2 rounded-xl bg-white px-7 py-3.5 text-base font-semibold text-black shadow-2xl shadow-white/10 transition hover:bg-zinc-200">
+          <span data-i18n="cta.button">下载最新版</span>
+          <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14m-6-6 6 6-6 6"/></svg>
+        </a>
+        <a href="https://github.com/yuh-G/rikkahub-desktop" target="_blank" rel="noopener"
+           class="inline-flex items-center gap-2 rounded-xl border border-white/[0.12] bg-white/[0.03] px-7 py-3.5 text-base font-semibold text-white transition hover:border-white/[0.25] hover:bg-white/[0.06]">
+          <span data-i18n="cta.github">在 GitHub 查看</span>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ━━━━━━━━━━━━━━━━━━━ FOOTER ━━━━━━━━━━━━━━━━━━━ -->
+  <footer class="border-t border-white/[0.06] px-6 py-12">
+    <div class="mx-auto max-w-6xl">
+      <div class="flex flex-col items-center justify-between gap-6 text-sm text-zinc-500 sm:flex-row">
+        <div class="flex flex-col items-center gap-2 sm:items-start">
+          <div class="flex items-center gap-2">
+            <img src="icon.png" alt="" class="size-5 rounded" />
+            <span class="font-medium text-zinc-300">Rikkahub Desktop</span>
+          </div>
+          <div data-i18n-html="footer.attribution">
+            基于 <a href="https://github.com/rikkahub/rikkahub" class="text-zinc-400 underline-offset-2 hover:text-white hover:underline" target="_blank" rel="noopener">RikkaHub by @re-ovo</a> 重构 · © 2026 yuh-G
+          </div>
+        </div>
+        <div class="flex items-center gap-5">
+          <a href="https://github.com/yuh-G/rikkahub-desktop" target="_blank" rel="noopener" data-i18n="footer.github" class="transition hover:text-white">GitHub</a>
+          <a href="https://github.com/yuh-G/rikkahub-desktop/releases" target="_blank" rel="noopener" data-i18n="footer.releases" class="transition hover:text-white">所有版本</a>
+          <a href="https://github.com/yuh-G/rikkahub-desktop/blob/master/LICENSE" target="_blank" rel="noopener" data-i18n="footer.license" class="transition hover:text-white">许可证</a>
+          <a href="https://rikka-ai.com/" target="_blank" rel="noopener" data-i18n="footer.origSite" class="transition hover:text-white">原作官网</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <!-- ━━━━━━━━━━━━━━━━━━━ i18n RUNTIME ━━━━━━━━━━━━━━━━━━━
+       Tiny client-side i18n: scans `[data-i18n]` (textContent) and `[data-i18n-html]`
+       (innerHTML — for strings with inline links) elements, looks the key up in the
+       translations table below, and swaps. Language preference is persisted in
+       localStorage as `rikkahub-lang` so a returning English user lands on English
+       without clicking. First-visit default comes from `navigator.language`. -->
+  <script>
+    const translations = {
+      zh: {
+        'nav.features': '功能',
+        'nav.screenshots': '截图',
+        'nav.credit': '致谢',
+        'nav.download': '下载',
+        'hero.badge': '最新版本可用 — 查看 Releases',
+        'hero.titleLine1': '您的 AI 对话',
+        'hero.titleLine2': '由您掌控',
+        'hero.tagline': 'Rikkahub 是一个原生 Windows LLM 聊天客户端，支持切换不同的供应商进行聊天，依赖原作者 RE 构建的 Android 版 Rikkahub 重构而成。',
+        'hero.ctaDownload': '下载 Windows 版',
+        'hero.ctaGithub': '在 GitHub 查看',
+        'hero.mirrorHint': '下载源：Cloudflare 全球 CDN · ',
+        'hero.mirrorFallback': 'GitHub Releases 备用源 ↗',
+        'hero.requirements': 'Windows 10 1809+ / Windows 11 · 自带 WebView2 引导器 · 无需管理员权限',
+        'credit.badge': '致敬原作',
+        'credit.title': '基于 @re-ovo 的 Rikkahub 重构',
+        'credit.body': '本项目是 <a href="https://github.com/re-ovo" target="_blank" rel="noopener" class="font-semibold text-white underline-offset-4 hover:underline">@re-ovo</a> 所设计与开发的开源项目 Rikkahub 在 Windows 平台的移植版本。所有产品方向、命名、视觉品牌与产品理念均归原作者所有。本桌面版仅在 Windows 平台对其重构实现，并尽可能保持与原作的功能与数据格式一致 — 你可以在 PC 端直接导入手机端备份。',
+        'stats.providers': '内置供应商',
+        'stats.search': '联网搜索引擎',
+        'stats.tts': 'TTS 引擎',
+        'stats.telemetry': '遥测 / 云端账号',
+        'features.badge': '功能特色',
+        'features.title': '为 AI 爱好者打造',
+        'features.subtitle': '每个细节都经过实际场景打磨。',
+        'feat1.title': '多供应商支持',
+        'feat1.body': 'OpenAI / Anthropic / Google + 任意 OpenAI 兼容端点。一个客户端聊遍全网模型。',
+        'feat2.title': '本地模型即开即用',
+        'feat2.body': 'Ollama / LM Studio / llama.cpp Server — 端点指向 <code class="rounded bg-white/[0.06] px-1.5 py-0.5 font-mono text-xs">localhost:11434</code> 即可。',
+        'feat3.title': 'MCP 与内置工具',
+        'feat3.body': 'Model Context Protocol + Streamable HTTP，Gemini Search Grounding 与 OpenAI web_search 一键切换。',
+        'feat4.title': '世界书 · 提示词注入 · Skills',
+        'feat4.body': '世界书条目按触发词自动注入，提示词注入按位置叠加到系统提示词，Skills 可从 GitHub 一键导入。三套机制可以混合使用，每个助手独立配置。',
+        'feat5.title': '17 种联网搜索',
+        'feat5.body': 'Tavily、Exa、Brave、Perplexity、博查、智谱、秘塔、Firecrawl、Grok、Jina、SearXNG、自定义 JS……',
+        'feat6.title': '完整 Markdown 渲染',
+        'feat6.body': '代码高亮、LaTeX 公式、Mermaid 图、表格、思维链与代码块预览。',
+        'feat7.title': '分支与重新生成',
+        'feat7.body': '在任意消息处生成多个分支，每个分支可独立切换模型对比。',
+        'feat8.title': 'Android 备份直接导入',
+        'feat8.body': '.zip 备份一键导入 — 对话历史、设置、附件、Skills、MCP、提示词注入、世界书全保留。',
+        'feat9.title': 'TTS 与 ASR',
+        'feat9.body': 'Windows 系统语音、OpenAI、Gemini、Qwen、Groq、MiniMax、MiMo，带一键测试。',
+        'screenshots.badge': '实际界面',
+        'screenshots.title': '不止是聊天',
+        'screenshots.providerBadge': '供应商管理',
+        'screenshots.providerTitle': '所有供应商，一处管理',
+        'screenshots.providerBody1': '内置 OpenAI、Anthropic、Google、AiHubMix、硅基流动、DeepSeek、OpenRouter、Vercel AI Gateway、阿里云百炼、火山引擎、月之暗面、智谱、阶跃星辰 等 30+ 供应商模板，添加 API Key 即用。',
+        'screenshots.providerBody2': '支持自定义 Base URL、Response API、自定义请求头/请求体、Claude Prompt Caching、余额查询。每个模型还可设独立的供应商覆盖。',
+        'screenshots.imageBadge': '图像生成',
+        'screenshots.imageTitle': '文本到图像',
+        'screenshots.imageBody1': '支持 gpt-image-2、DALL·E 3、Imagen、Qwen-Image、FLUX 等主流模型。可上传参考图编辑，自动保存历史参考便于复用。',
+        'screenshots.imageBody2': '生成的图片与对话历史一起本地存档，便于后续引用或导出。',
+        'screenshots.extBadge': '扩展生态',
+        'screenshots.extTitle': '为每个助手注入个性',
+        'screenshots.extBody1': 'MCP 服务器、提示词注入、世界书、快捷消息、Agent Skills — 五种扩展机制可以混合使用。每个助手独立选择启用哪些扩展，互不干扰。',
+        'screenshots.extBody2': '世界书条目按触发关键词自动注入上下文；提示词注入按"系统提示词前后 / 聊天开头结尾 / 指定深度"位置叠加；Skills 直接从 GitHub 仓库一键导入。',
+        'screenshots.frameExt': '设置 — MCP 与拓展',
+        'screenshots.frameSettings': '设置 — 供应商',
+        'screenshots.frameImage': '图像生成',
+        'tech.label': '基于现代技术构建',
+        'cta.title1': '现在就',
+        'cta.title2': '开始',
+        'cta.subtitle': 'Windows 10/11 双击运行即可。覆盖安装无缝升级，数据永远在你自己的硬盘上。',
+        'cta.button': '下载最新版',
+        'cta.github': '在 GitHub 查看',
+        'footer.attribution': '基于 <a href="https://github.com/rikkahub/rikkahub" class="text-zinc-400 underline-offset-2 hover:text-white hover:underline" target="_blank" rel="noopener">RikkaHub by @re-ovo</a> 重构 · © 2026 yuh-G',
+        'footer.github': 'GitHub',
+        'footer.releases': '所有版本',
+        'footer.license': '许可证',
+        'footer.origSite': '原作官网',
+      },
+      en: {
+        'nav.features': 'Features',
+        'nav.screenshots': 'Screenshots',
+        'nav.credit': 'Credits',
+        'nav.download': 'Download',
+        'hero.badge': 'Latest release available — see Releases',
+        'hero.titleLine1': 'Your AI conversations',
+        'hero.titleLine2': 'under your control',
+        'hero.tagline': 'Rikkahub is a native Windows LLM chat client that lets you seamlessly switch between providers. Rebuilt for the desktop from the Android RikkaHub originally created by RE.',
+        'hero.ctaDownload': 'Download for Windows',
+        'hero.ctaGithub': 'View on GitHub',
+        'hero.mirrorHint': 'Served via Cloudflare global CDN · ',
+        'hero.mirrorFallback': 'GitHub Releases fallback ↗',
+        'hero.requirements': 'Windows 10 1809+ / Windows 11 · WebView2 bootstrapper included · No admin required',
+        'credit.badge': 'Credit where due',
+        'credit.title': "Rebuilt from @re-ovo's RikkaHub",
+        'credit.body': 'This project is a Windows desktop port of RikkaHub, designed and developed by <a href="https://github.com/re-ovo" target="_blank" rel="noopener" class="font-semibold text-white underline-offset-4 hover:underline">@re-ovo</a>. All product direction, naming, visual identity, and philosophy belong to the original author. This desktop edition re-implements it on Windows while staying as close as possible to the original\'s features and data formats — you can directly import backups from the mobile version.',
+        'stats.providers': 'Built-in providers',
+        'stats.search': 'Search engines',
+        'stats.tts': 'TTS engines',
+        'stats.telemetry': 'Telemetry / cloud accounts',
+        'features.badge': 'Features',
+        'features.title': 'Built for AI enthusiasts',
+        'features.subtitle': 'Every detail polished through real-world use.',
+        'feat1.title': 'Multi-provider support',
+        'feat1.body': 'OpenAI / Anthropic / Google plus any OpenAI-compatible endpoint. One client, every model.',
+        'feat2.title': 'Local models out of the box',
+        'feat2.body': 'Ollama / LM Studio / llama.cpp Server — just point the endpoint at <code class="rounded bg-white/[0.06] px-1.5 py-0.5 font-mono text-xs">localhost:11434</code>.',
+        'feat3.title': 'MCP & built-in tools',
+        'feat3.body': 'Model Context Protocol with Streamable HTTP. Gemini Search Grounding and OpenAI web_search toggle in one click.',
+        'feat4.title': 'World books · Prompt injections · Skills',
+        'feat4.body': 'World book entries auto-inject by trigger keywords, prompt injections stack into the system prompt by position, Skills import directly from GitHub. Mix and match per assistant.',
+        'feat5.title': '17 search engines',
+        'feat5.body': 'Tavily, Exa, Brave, Perplexity, Bocha, Zhipu, Metaso, Firecrawl, Grok, Jina, SearXNG, custom JS, …',
+        'feat6.title': 'Full Markdown rendering',
+        'feat6.body': 'Syntax highlighting, LaTeX math, Mermaid diagrams, tables, reasoning chains, code preview.',
+        'feat7.title': 'Branching & regeneration',
+        'feat7.body': 'Branch at any message and switch models per branch to compare responses side by side.',
+        'feat8.title': 'Direct Android backup import',
+        'feat8.body': '.zip backups import cleanly — chat history, settings, attachments, Skills, MCP, prompt injections and world books all preserved.',
+        'feat9.title': 'TTS & ASR',
+        'feat9.body': 'Windows SAPI, OpenAI, Gemini, Qwen, Groq, MiniMax, MiMo — with one-tap test buttons.',
+        'screenshots.badge': 'Real UI',
+        'screenshots.title': 'More than just chat',
+        'screenshots.providerBadge': 'Provider management',
+        'screenshots.providerTitle': 'All providers, one place',
+        'screenshots.providerBody1': '30+ built-in provider templates including OpenAI, Anthropic, Google, AiHubMix, SiliconFlow, DeepSeek, OpenRouter, Vercel AI Gateway, Aliyun, Volcengine, Moonshot, Zhipu, StepFun — drop in your API key and go.',
+        'screenshots.providerBody2': 'Custom Base URL, Response API, custom request headers/bodies, Claude prompt caching, balance queries. Every model can also carry its own provider override.',
+        'screenshots.imageBadge': 'Image generation',
+        'screenshots.imageTitle': 'Text to image',
+        'screenshots.imageBody1': 'Supports gpt-image-2, DALL·E 3, Imagen, Qwen-Image, FLUX. Upload reference images for editing; history is kept for easy reuse.',
+        'screenshots.imageBody2': 'Generated images are archived alongside conversation history for later reuse or export.',
+        'screenshots.extBadge': 'Extension ecosystem',
+        'screenshots.extTitle': 'Tailor every assistant',
+        'screenshots.extBody1': 'MCP servers, prompt injections, world books, quick messages, Agent Skills — five extension mechanisms that mix freely. Each assistant picks its own set independently.',
+        'screenshots.extBody2': 'World book entries auto-inject by trigger keywords; prompt injections stack by position (before/after system prompt, top/bottom of chat, at depth); Skills import directly from a GitHub repo.',
+        'screenshots.frameExt': 'Settings — MCP & Extensions',
+        'screenshots.frameSettings': 'Settings — Providers',
+        'screenshots.frameImage': 'Image generation',
+        'tech.label': 'Built on modern foundations',
+        'cta.title1': 'Start ',
+        'cta.title2': 'now',
+        'cta.subtitle': 'Double-click on Windows 10/11. Seamless cover-install upgrades, data always on your own disk.',
+        'cta.button': 'Download latest',
+        'cta.github': 'View on GitHub',
+        'footer.attribution': 'Rebuilt from <a href="https://github.com/rikkahub/rikkahub" class="text-zinc-400 underline-offset-2 hover:text-white hover:underline" target="_blank" rel="noopener">RikkaHub by @re-ovo</a> · © 2026 yuh-G',
+        'footer.github': 'GitHub',
+        'footer.releases': 'All releases',
+        'footer.license': 'License',
+        'footer.origSite': 'Original site',
+      },
+    };
+
+    function setLang(lang) {
+      if (!translations[lang]) lang = 'en';
+      document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+      try { localStorage.setItem('rikkahub-lang', lang); } catch (e) { /* private mode */ }
+      const dict = translations[lang];
+      document.querySelectorAll('[data-i18n]').forEach((el) => {
+        const key = el.getAttribute('data-i18n');
+        if (dict[key] !== undefined) el.textContent = dict[key];
+      });
+      document.querySelectorAll('[data-i18n-html]').forEach((el) => {
+        const key = el.getAttribute('data-i18n-html');
+        if (dict[key] !== undefined) el.innerHTML = dict[key];
+      });
+      document.querySelectorAll('[data-lang-label]').forEach((el) => {
+        // Button shows the OTHER language — "click here to switch to X".
+        el.textContent = lang === 'zh' ? 'EN' : '中';
+      });
+    }
+
+    function toggleLang() {
+      const current = document.documentElement.lang.startsWith('zh') ? 'zh' : 'en';
+      setLang(current === 'zh' ? 'en' : 'zh');
+    }
+
+    // Initial language pick: saved > browser default > zh.
+    (function () {
+      let saved = null;
+      try { saved = localStorage.getItem('rikkahub-lang'); } catch (e) { /* private mode */ }
+      const browser = (navigator.language || 'zh').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+      setLang(saved || browser);
+    })();
+
+    // ━━━━━━━━━━━━━━━━━━━ DYNAMIC DOWNLOAD URL UPGRADE ━━━━━━━━━━━━━━━━━━━
+    // The page loads with `[data-download="primary"]` buttons pointing at the GitHub
+    // Releases /latest page (set in the HTML attribute), so crawlers and JS-disabled
+    // browsers always have a working download. On load we:
+    //   1. Ask api.github.com what the latest release tag is — this is the single
+    //      source of truth, and it bumps the moment you publish a new GitHub Release.
+    //   2. Fall back to a static `latest.txt` on R2 (just one line, e.g. "1.0.5") if
+    //      the GitHub API is rate-limited (60 req/hr/IP) or otherwise unreachable.
+    //   3. Fall back to RIKKAHUB_FALLBACK_VERSION if both routes fail, so users on
+    //      flaky networks still get a usable link.
+    // Why this matters: the only file that has to track the current version is whatever
+    // you upload to R2 (the .exe itself, named Rikkahub_<version>_x64-setup.exe). You
+    // don't need to touch this page on every release — just publish the GitHub Release
+    // and drop the .exe on R2.
+    const RIKKAHUB_R2_BASE = 'https://pub-d26eee7d911c4bab937ebe1729a4cefe.r2.dev';
+    const RIKKAHUB_GITHUB_REPO = 'yuh-G/rikkahub-desktop';
+    const RIKKAHUB_FALLBACK_VERSION = '1.0.9'; // safety net only; do NOT rely on bumping this
+    const RIKKAHUB_GITHUB_FALLBACK_URL = `https://github.com/${RIKKAHUB_GITHUB_REPO}/releases/latest`;
+
+    function rikkahubR2DownloadUrl(version) {
+      return `${RIKKAHUB_R2_BASE}/Rikkahub_${version}_x64-setup.exe`;
+    }
+
+    async function resolveLatestVersion() {
+      // Primary: GitHub Releases API. CORS is open here, so the fetch works from any
+      // origin. We don't authenticate — 60 req/hr/IP is plenty per visitor.
+      try {
+        const res = await fetch(`https://api.github.com/repos/${RIKKAHUB_GITHUB_REPO}/releases/latest`, {
+          headers: { Accept: 'application/vnd.github+json' },
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const tag = String(data.tag_name || '').replace(/^v/i, '').trim();
+          if (tag) return { version: tag, source: 'github-api' };
+        }
+      } catch (err) {
+        console.warn('[rikkahub] GitHub API check failed', err);
+      }
+      // Fallback: a tiny `latest.txt` on R2 (one line, version only). Upload this
+      // alongside the .exe and it covers the case where GitHub API is rate-limited.
+      try {
+        const res = await fetch(`${RIKKAHUB_R2_BASE}/latest.txt`, { cache: 'no-store' });
+        if (res.ok) {
+          const tag = (await res.text()).trim().replace(/^v/i, '');
+          if (tag) return { version: tag, source: 'r2-latest-txt' };
+        }
+      } catch (err) {
+        console.warn('[rikkahub] R2 latest.txt check failed', err);
+      }
+      return { version: RIKKAHUB_FALLBACK_VERSION, source: 'fallback' };
+    }
+
+    (async () => {
+      const { version, source } = await resolveLatestVersion();
+      console.info(`[rikkahub] resolved latest version: ${version} (source: ${source})`);
+      const downloadUrl = rikkahubR2DownloadUrl(version);
+      document.querySelectorAll('[data-download="primary"]').forEach((el) => {
+        el.setAttribute('href', downloadUrl);
+      });
+      // Update visible version labels if any element opts in via data-rikkahub-version.
+      document.querySelectorAll('[data-rikkahub-version]').forEach((el) => {
+        el.textContent = `v${version}`;
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,88 @@
+{
+  "conversations": {
+    "meta": {
+      "title": "RikkaHub Web",
+      "description": "RikkaHub 网页客户端"
+    },
+    "preview": {
+      "empty_message": "空消息",
+      "image": "[图片]",
+      "video": "[视频]",
+      "audio": "[音频]",
+      "document": "[文档]",
+      "document_with_name": "[文档] {{name}}",
+      "thinking": "[思考]",
+      "tool_call": "[工具调用]",
+      "tool_with_name": "[工具] {{name}}"
+    },
+    "errors": {
+      "load_detail_failed": "加载会话详情失败"
+    },
+    "empty_state": {
+      "select_title": "请选择会话",
+      "select_description": "选择左侧会话以查看消息",
+      "loading_title": "加载中...",
+      "loading_description": "正在加载会话详情",
+      "error_title": "加载失败",
+      "no_message_title": "暂无消息",
+      "no_message_description": "当前会话还没有消息"
+    },
+    "welcome_prompt": "有什么可以帮助你的？",
+    "user": {
+      "default_name": "用户"
+    },
+    "header": {
+      "select_conversation": "请选择会话"
+    },
+    "custom_prompt": {
+      "button": "会话系统提示词",
+      "button_active": "会话系统提示词 ✎",
+      "placeholder": "覆盖当前会话的 system prompt",
+      "clear": "清除",
+      "save": "保存",
+      "cancel": "取消",
+      "saved": "会话系统提示词已保存",
+      "edit_aria": "编辑会话系统提示词",
+      "dialog_title": "会话系统提示词",
+      "dialog_description": "仅对当前会话生效。留空时会回退到助手默认系统提示词。",
+      "dialog_placeholder": "在这里覆盖当前会话的 system prompt"
+    },
+    "theme_toggle": {
+      "to_light": "切换到浅色模式",
+      "to_dark": "切换到深色模式"
+    },
+    "compress": {
+      "dialog_title": "压缩对话历史",
+      "dialog_description": "使用默认模型与提示词中的上下文压缩模型，将较早消息压缩成摘要并保留最近消息。",
+      "target_tokens": "目标 Token",
+      "keep_recent": "保留最近消息",
+      "additional_prompt": "额外要求",
+      "additional_placeholder": "可留空，例如：保留人物关系、关键参数和待办事项",
+      "cancel": "取消",
+      "start": "开始压缩",
+      "success": "对话历史已压缩",
+      "failed": "压缩失败"
+    },
+    "translate": {
+      "dialog_title": "选择翻译语言",
+      "dialog_description": "译文会保存在当前回复下方，不会进入下一轮上下文。",
+      "cancel": "取消",
+      "confirm": "翻译",
+      "failed": "翻译失败",
+      "lang": {
+        "zh-CN": "简体中文",
+        "zh-TW": "繁体中文",
+        "en-US": "英语",
+        "ja-JP": "日语",
+        "ko-KR": "韩语",
+        "fr-FR": "法语",
+        "de-DE": "德语",
+        "es-ES": "西班牙语"
+      }
+    },
+    "optimize_context": {
+      "user": "用户",
+      "assistant": "助手"
+    }
+  }
+}

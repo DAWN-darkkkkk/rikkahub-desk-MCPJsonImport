@@ -1,0 +1,88 @@
+{
+  "conversations": {
+    "meta": {
+      "title": "RikkaHub Web",
+      "description": "RikkaHub web client"
+    },
+    "preview": {
+      "empty_message": "Empty message",
+      "image": "[Image]",
+      "video": "[Video]",
+      "audio": "[Audio]",
+      "document": "[Document]",
+      "document_with_name": "[Document] {{name}}",
+      "thinking": "[Thinking]",
+      "tool_call": "[Tool call]",
+      "tool_with_name": "[Tool] {{name}}"
+    },
+    "errors": {
+      "load_detail_failed": "Failed to load conversation details"
+    },
+    "empty_state": {
+      "select_title": "Select a conversation",
+      "select_description": "Pick a conversation from the sidebar to view messages",
+      "loading_title": "Loading...",
+      "loading_description": "Loading conversation details",
+      "error_title": "Load failed",
+      "no_message_title": "No messages yet",
+      "no_message_description": "This conversation does not have any messages yet"
+    },
+    "welcome_prompt": "How can I help you?",
+    "user": {
+      "default_name": "User"
+    },
+    "header": {
+      "select_conversation": "Select a conversation"
+    },
+    "custom_prompt": {
+      "button": "Conversation System Prompt",
+      "button_active": "Conversation System Prompt ✎",
+      "placeholder": "Override the system prompt for this conversation",
+      "clear": "Clear",
+      "save": "Save",
+      "cancel": "Cancel",
+      "saved": "Conversation system prompt saved",
+      "edit_aria": "Edit conversation system prompt",
+      "dialog_title": "Conversation System Prompt",
+      "dialog_description": "Applies to this conversation only. When empty, it falls back to the assistant's default system prompt.",
+      "dialog_placeholder": "Override the system prompt for this conversation here"
+    },
+    "theme_toggle": {
+      "to_light": "Switch to light mode",
+      "to_dark": "Switch to dark mode"
+    },
+    "compress": {
+      "dialog_title": "Compress conversation history",
+      "dialog_description": "Uses the context compression model from the default model and prompt settings to summarize earlier messages while keeping recent ones.",
+      "target_tokens": "Target tokens",
+      "keep_recent": "Keep recent messages",
+      "additional_prompt": "Additional requirements",
+      "additional_placeholder": "Optional, e.g. keep character relationships, key parameters, and to-dos",
+      "cancel": "Cancel",
+      "start": "Start compression",
+      "success": "Conversation history compressed",
+      "failed": "Compression failed"
+    },
+    "translate": {
+      "dialog_title": "Select translation language",
+      "dialog_description": "The translation is saved below the current reply and won't enter the next round of context.",
+      "cancel": "Cancel",
+      "confirm": "Translate",
+      "failed": "Translation failed",
+      "lang": {
+        "zh-CN": "Simplified Chinese",
+        "zh-TW": "Traditional Chinese",
+        "en-US": "English",
+        "ja-JP": "Japanese",
+        "ko-KR": "Korean",
+        "fr-FR": "French",
+        "de-DE": "German",
+        "es-ES": "Spanish"
+      }
+    },
+    "optimize_context": {
+      "user": "User",
+      "assistant": "Assistant"
+    }
+  }
+}

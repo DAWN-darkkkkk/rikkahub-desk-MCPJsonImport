@@ -1,0 +1,16875 @@
+import { createHash, createHmac } from "node:crypto";
+import { chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
+import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import process from "node:process";
+import { gunzipSync, gzipSync, inflateRawSync } from "node:zlib";
+import { Database } from "bun:sqlite";
+
+// mupdf-wasm.wasm 通过 `with { type: "file" }` 让 bun build --compile 把这个 9.6MB 的
+// wasm 二进制嵌进单 exe。运行时通过 readFileSync(mupdfWasmPath) 读出字节,塞进 mupdf 暴露
+// 的全局 `$libmupdf_wasm_Module.wasmBinary`,这样 mupdf 初始化时不会再尝试按文件路径查找
+// wasm —— 而在 compile 后的单 exe 里,那个文件路径根本不存在。
+//
+// 必须用相对路径(而非 "mupdf/dist/mupdf-wasm.wasm" 这种 package 名前缀): Bun 的
+// `with { type: "file" }` 走的是文件路径解析,不走 node module resolution;后者在 compile
+// 后的 exe 内会找不到 package。已在 Windows 隔离目录(无 node_modules)实测验证,dev 和
+// compile 后的 exe 都能正确加载并提取 PDF。
+import mupdfWasmPath from "./node_modules/mupdf/dist/mupdf-wasm.wasm" with { type: "file" };
+
+type MupdfModule = typeof import("mupdf");
+let mupdfModule: MupdfModule | null = null;
+let mupdfLoadingPromise: Promise<MupdfModule> | null = null;
+async function loadMupdf(): Promise<MupdfModule> {
+  if (mupdfModule) return mupdfModule;
+  // 并发的多个 PDF 上传共用同一个 init,避免重复实例化 wasm。
+  if (mupdfLoadingPromise) return mupdfLoadingPromise;
+  mupdfLoadingPromise = (async () => {
+    const wasmBinary = readFileSync(mupdfWasmPath);
+    (globalThis as Record<string, unknown>)["$libmupdf_wasm_Module"] = { wasmBinary };
+    const mod = await import("mupdf");
+    mupdfModule = mod;
+    return mod;
+  })();
+  return mupdfLoadingPromise;
+}
+
+type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+interface Model {
+  id: string;
+  modelId: string;
+  displayName: string;
+  type: "CHAT" | "IMAGE" | "EMBEDDING";
+  inputModalities: string[];
+  outputModalities: string[];
+  abilities: string[];
+  tools: JsonValue[];
+}
+
+interface Provider {
+  type: "openai" | "google" | "claude";
+  id: string;
+  enabled: boolean;
+  name: string;
+  builtIn: boolean;
+  shortDescription: string;
+  description: string;
+  apiKey: string;
+  baseUrl: string;
+  chatCompletionsPath?: string;
+  useResponseApi?: boolean;
+  // 对齐安卓 commit e63d017：OpenAI provider 是否在历史回放里把
+  // assistant 的 reasoning_content 也回传给上游。默认 true（保持过去行为）；
+  // 用户可以为某些代理/平台关闭，避免它们因为不识别这个字段而拒绝请求。
+  includeHistoryReasoning?: boolean;
+  promptCaching?: boolean;
+  promptCacheTtl?: "5m" | "1h";
+  testPassed?: boolean;
+  testPassedAt?: number;
+  models: Model[];
+  balanceOption: {
+    enabled: boolean;
+    apiPath: string;
+    resultPath: string;
+  };
+}
+
+interface WebDavConfig {
+  url: string;
+  username: string;
+  password: string;
+  path: string;
+  items: string[];
+}
+
+interface S3Config {
+  endpoint: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  bucket: string;
+  region: string;
+  pathStyle: boolean;
+  items: string[];
+}
+
+interface ProxyConfig {
+  // User-set proxy URL. Empty string means "follow the system proxy automatically"
+  // (Windows registry → Bun env), matching browser-like behavior for non-technical users.
+  url: string;
+  // Optional HTTP basic auth credentials, applied as `http://user:pass@host:port` when
+  // forwarding to upstream APIs.
+  username: string;
+  password: string;
+}
+
+interface Assistant {
+  id: string;
+  chatModelId: string | null;
+  name: string;
+  avatar: Record<string, JsonValue>;
+  useAssistantAvatar: boolean;
+  tags: string[];
+  systemPrompt: string;
+  temperature: number | null;
+  topP: number | null;
+  contextMessageSize: number;
+  streamOutput: boolean;
+  enableMemory: boolean;
+  useGlobalMemory: boolean;
+  enableRecentChatsReference: boolean;
+  messageTemplate: string;
+  presetMessages: JsonValue[];
+  quickMessageIds: string[];
+  regexes: JsonValue[];
+  reasoningLevel: string;
+  maxTokens: number | null;
+  customHeaders: JsonValue[];
+  customBodies: JsonValue[];
+  mcpServers: string[];
+  // Per-assistant MCP-tool overrides. Outer key = MCP server id, inner key = tool name, value
+  // = { enable?: boolean, needsApproval?: boolean }. PC-only extension (Android's McpPicker
+  // is server-level only). Override semantics:
+  //   - global tool.enable === false  → tool hidden everywhere, override irrelevant
+  //   - global tool.enable === true && override.enable === false  → tool not exposed to the
+  //     model for THIS assistant (other assistants still see it)
+  //   - override.needsApproval !== undefined  → overrides the global per-tool needsApproval
+  //     for THIS assistant (true forces approval prompt, false skips it)
+  //   - missing override entry → behave as the global tool definition
+  // Default `{}` = inherit everything from the global tool list.
+  mcpToolOverrides: Record<string, Record<string, { enable?: boolean; needsApproval?: boolean }>>;
+  localTools: JsonValue[];
+  background: string | null;
+  backgroundOpacity: number;
+  modeInjectionIds: string[];
+  lorebookIds: string[];
+  enabledSkills: string[];
+  enableTimeReminder: boolean;
+  allowConversationSystemPrompt: boolean;
+}
+
+interface Settings {
+  dynamicColor: boolean;
+  themeId: string;
+  developerMode: boolean;
+  displaySetting: Record<string, JsonValue>;
+  enableWebSearch: boolean;
+  favoriteModels: string[];
+  chatModelId: string;
+  titleModelId: string;
+  translateModeId: string;
+  suggestionModelId: string;
+  imageGenerationModelId: string;
+  ocrModelId: string;
+  compressModelId: string;
+  // 模型 ID,用于对话界面"优化提示词"按钮。空串 = 未配置(按钮会提示去设置页配置)。
+  promptOptimizeModelId: string;
+  // "优化提示词"按钮使用的 meta-prompt。用户可在「设置 - 默认模型与提示词」编辑;
+  // 空串 = 用 DEFAULT_PROMPT_OPTIMIZE_PROMPT 默认模板。
+  promptOptimizePrompt: string;
+  translateThinkingBudget?: number;
+  titlePrompt: string;
+  translatePrompt: string;
+  suggestionPrompt: string;
+  ocrPrompt: string;
+  compressPrompt: string;
+  asrProviders: AsrProvider[];
+  selectedASRProviderId: string | null;
+  ttsProviders: TtsProvider[];
+  selectedTTSProviderId: string | null;
+  assistantId: string;
+  providers: Provider[];
+  assistants: Assistant[];
+  assistantTags: JsonValue[];
+  searchServices: JsonValue[];
+  searchCommonOptions: Record<string, JsonValue>;
+  searchServiceSelected: number;
+  mcpServers: JsonValue[];
+  modeInjections: JsonValue[];
+  lorebooks: JsonValue[];
+  quickMessages: JsonValue[];
+  webDavConfig: WebDavConfig;
+  s3Config: S3Config;
+  proxyConfig: ProxyConfig;
+  webServerJwtEnabled: boolean;
+  // Preferred local port for the embedded HTTP server. null = auto (8080, walking up on
+  // conflict). Only read at startup, so changing it requires a restart to take effect.
+  preferredPort: number | null;
+}
+
+interface AsrProvider {
+  type: "openai_realtime" | "dashscope" | "volcengine";
+  id: string;
+  name: string;
+  apiKey: string;
+  websocketUrl: string;
+  model?: string;
+  language?: string;
+  prompt?: string;
+  sampleRate?: number;
+  vadThreshold?: number;
+  prefixPaddingMs?: number;
+  silenceDurationMs?: number;
+  resourceId?: string;
+}
+
+interface TtsProvider {
+  type: "system" | "openai" | "gemini" | "minimax" | "qwen" | "groq" | "xai" | "mimo";
+  id: string;
+  name: string;
+  apiKey: string;
+  baseUrl: string;
+  model?: string;
+  voice?: string;
+  voiceName?: string;
+  voiceId?: string;
+  language?: string;
+  languageType?: string;
+  emotion?: string;
+  speed?: number;
+  speechRate?: number;
+  pitch?: number;
+}
+
+interface Message {
+  id: string;
+  role: "USER" | "ASSISTANT" | "SYSTEM" | "TOOL";
+  parts: JsonValue[];
+  annotations: JsonValue[];
+  createdAt: string;
+  finishedAt: string | null;
+  modelId: string | null;
+  usage: JsonValue | null;
+  translation: string | null;
+}
+
+interface MessageNode {
+  id: string;
+  messages: Message[];
+  selectIndex: number;
+}
+
+interface AssistantMemory {
+  id: number;
+  assistantId: string;
+  content: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+interface Conversation {
+  id: string;
+  assistantId: string;
+  systemPrompt: string | null;
+  title: string;
+  messages: MessageNode[];
+  truncateIndex: number;
+  chatSuggestions: string[];
+  isPinned: boolean;
+  createAt: number;
+  updateAt: number;
+}
+
+interface RequestLog {
+  id: string;
+  at: number;
+  providerId: string;
+  providerName: string;
+  url: string;
+  ok: boolean;
+  status: number;
+  error?: string;
+  kind?: string;
+  durationMs?: number;
+  method?: string;
+  requestHeaders?: Record<string, string>;
+  requestBody?: string;
+  responseBody?: string;
+  responseHeaders?: Record<string, string>;
+  toolName?: string;
+}
+
+// 与 logs 解耦的持久化请求统计累加器。logs 已改为内存态(重启清空,对齐移动端),
+// 但统计页的累计指标必须跨重启保留,所以单独维护计数器,每次请求完成时累加。
+interface RequestStats {
+  totalRequests: number;
+  failedRequests: number;
+  byProvider: Record<string, { ok: number; failed: number }>;
+  byGroup: Record<string, { ok: number; failed: number }>;
+}
+
+interface DailyStat {
+  date: string;
+  messages: number;
+  conversations: number;
+  characters: number;
+}
+
+interface StoredFile {
+  id: number;
+  path: string;
+  fileName: string;
+  mime: string;
+  size: number;
+  extractedText?: string;
+  extractedAt?: number;
+}
+
+interface GeneratedImage {
+  id: string;
+  prompt: string;
+  fileId: number;
+  url: string;
+  fileName: string;
+  mime: string;
+  model: string;
+  modelId: string;
+  type: "image_generation" | "image_edit";
+  sourceFileIds: number[];
+  sourcePaths?: string;
+  createdAt: number;
+}
+
+interface State {
+  settings: Settings;
+  conversations: Conversation[];
+  files: StoredFile[];
+  generatedImages: GeneratedImage[];
+  logs: RequestLog[];
+  stats: RequestStats;
+  memories: AssistantMemory[];
+  nextFileId: number;
+  nextMemoryId: number;
+  nextGeneratedImageId: number;
+  launchCount: number;
+  // 一次性迁移记录。每个已应用的迁移 id 存一次,防止启动时反复执行会覆盖用户后续
+  // 手动调整的迁移(如供应商顺序重排)。老 state 没有该字段,视为空数组。
+  appliedMigrations?: string[];
+}
+
+type SearchService = Record<string, JsonValue>;
+type SkillMetadata = {
+  name: string;
+  description: string;
+  compatibility?: string;
+  allowedTools: string[];
+};
+
+const DEFAULT_AUTO_MODEL_ID = "b7055fb4-39f9-4042-a88a-0d80ed76cf08";
+const DEFAULT_ASSISTANT_ID = "0950e2dc-9bd5-4801-afa3-aa887aa36b4e";
+const DEFAULT_LEARNING_MODE_ID = "b87eaf16-f5cd-4ac1-9e4f-b11ae3a61d74";
+// Mirrors `MemoryRepository.kt:11` in the original RikkaHub project. Keeping the literal
+// value identical means a `state.json` produced on one platform can be imported on the
+// other without losing the global-scope memory records.
+const GLOBAL_MEMORY_ID = "__global__";
+const DEFAULT_SYSTEM_TTS_ID = "026a01a2-c3a0-4fd5-8075-80e03bdef200";
+const MAX_TOOL_STEPS = 256;
+const TITLE_CHARACTER_LIMIT = 15;
+const SUGGESTION_CHARACTER_LIMIT = 18;
+
+const DEFAULT_TITLE_PROMPT = `I will give you some dialogue content in the \`<content>\` block.
+You need to summarize the conversation between user and assistant into a short title.
+1. The title language should be consistent with the user's primary language
+2. Do not use punctuation or other special symbols
+3. Reply directly with the title
+4. Summarize using {locale} language
+5. The title should not exceed ${TITLE_CHARACTER_LIMIT} characters
+
+<content>
+{content}
+</content>`;
+
+const DEFAULT_SUGGESTION_PROMPT = `I will provide you with some chat content in the \`<content>\` block, including conversations between the User and the AI assistant.
+You need to act as the **User** to reply to the assistant, generating 3~5 appropriate and contextually relevant responses to the assistant.
+
+Rules:
+1. Reply directly with suggestions, do not add any formatting, and separate suggestions with newlines, no need to add markdown list formats.
+2. Use {locale} language.
+3. Ensure each suggestion is valid.
+4. Each suggestion should not exceed ${SUGGESTION_CHARACTER_LIMIT} characters.
+5. Imitate the user's previous conversational style.
+6. Act as a User, not an Assistant!
+
+<content>
+{content}
+</content>`;
+
+const DEFAULT_TRANSLATION_PROMPT = `You are a translation expert, skilled in translating various languages, and maintaining accuracy, faithfulness, and elegance in translation.
+Next, I will send you text. Please translate it into {target_lang}, and return the translation result directly, without adding any explanations or other content.
+
+Please translate the <source_text> section:
+
+<source_text>
+{source_text}
+</source_text>`;
+
+const DEFAULT_OCR_PROMPT = `You are an OCR assistant.
+
+Extract all visible text from the image and also describe any non-text elements (icons, shapes, arrows, objects, symbols, or emojis).
+
+For each element, specify:
+- The exact text (for text) or a short description (for non-text).
+- For document-type content, please use markdown and latex format.
+- If there are objects like buildings or characters, try to identify who they are.
+- Its approximate position in the image (e.g., 'top left', 'center right', 'bottom middle').
+- Its spatial relationship to nearby elements (e.g., 'above', 'below', 'next to', 'on the left of').
+
+Keep the original reading order and layout structure as much as possible.
+Do not interpret or translate—only transcribe and describe what is visually present.`;
+
+const DEFAULT_COMPRESS_PROMPT = `You are a conversation compression assistant. Compress the following conversation into a concise summary.
+
+Requirements:
+1. Preserve key facts, decisions, and important context that would be needed to continue the conversation
+2. Keep the summary in the same language as the original conversation
+3. Target approximately {target_tokens} tokens
+4. Output the summary directly without any explanations or meta-commentary
+5. Format the summary as context information that can be used to continue the conversation
+6. Use {locale} language
+7. Start the output with a clear indicator that this is a summary (e.g., "[Summary of previous conversation]" or equivalent in the target language)
+
+{additional_context}
+
+<conversation>
+{content}
+</conversation>`;
+
+// 提示词优化 meta-prompt —— 用户在对话界面点"优化提示词"时,把输入框原文(+可选的最近几轮
+// 对话背景)+ 本提示词一起发给"提示词优化模型"。模型返回的优化版直接替换输入框,所以
+// 输出必须纯净(无前言/解释/引号)。设计目标:把口语化、混乱的草稿打磨成清晰专业的版本,
+// 同时严格不改原意、不膨胀简单请求、保留占位符和固定内容。开头明确"不限于某个领域"防止
+// 模型默认偏向任何场景(如 coding)。上下文是可选的——首条消息或无对话时省略,且注入时
+// 明确告诉模型"只在提示词承接对话时才用,否则忽略",防止无关上下文污染独立提示词。
+const DEFAULT_PROMPT_OPTIMIZE_PROMPT = `你是一位资深的提示词优化专家。下面会给你一段用户准备发给 AI 助手的话(提示词草稿),你的任务是把它打磨成清晰、得体、表达专业的版本,让 AI 更容易准确理解、给出更好的回复。这段话可能是提问、写作请求、修改要求、闲聊,或任何日常诉求——不限于某个领域。
+
+## 优化原则
+
+1. **严格保留原意,不要无中生有** —— 只能基于用户实际写出的内容来优化,不增加用户没有提出的诉求,不删减已表达的内容,不擅自改变核心意图。不要替用户补充他没有提供的具体信息(比如他说"帮我写封邮件",你不能擅自编造收件人、事由、语气);某处信息缺失或含糊时,就让表达更清楚、更有条理,但不要凭空捏造细节。你的职责是打磨表达,不是替用户重新定义需求。如果原文已经清晰得体,原样输出即可,不要为了优化而画蛇添足。
+
+2. **消除歧义** —— 用户常用模糊或笼统的表述("弄一下""优化一下""帮我处理那个")。如果下方附带了对话背景、且提示词明显在承接它(出现"那个""上面说的""再…一下"等指代),请结合背景理解这些指代具体指向什么;如果没有背景或仍无法确定,保留原表述,不要凭空猜测后替换——错误的猜测比模糊更糟。
+
+3. **让表达更清楚、更有条理** —— 把口语化、啰嗦、跳跃的表述梳理得通顺连贯。如果诉求包含多个要点(背景、需求、约束、期望的输出格式或语气),用分节或编号列表清晰组织;如果只是一句话的简单请求,保持简洁,不要用多余的框架稀释重点——简洁本身就是专业。
+
+4. **用词得体专业** —— 在不改变原意的前提下,把模糊、随意的说法换成更准确、更得体的表达,让模糊的动词变成具体的动作。例如:"帮我弄个东西" → 点明具体要做什么;"写个东西给老板" → 明确是邮件 / 汇报 / 请示中的哪一种;"弄好看点" → 指明是调整措辞 / 优化排版 / 精简结构;"翻译一下" → 点明源语言、目标语言、要保留的风格。注意保持原文的语域——正式的保持规整,轻松的别写得僵硬。
+
+5. **必要时点明隐含期望** —— 如果提示词隐含了目标读者、语气、篇幅、输出格式(如希望分点回答、举例、简短)或希望 AI 扮演的角色,且能从上下文或常识中合理推断,将其显式写出。无法合理推断的不要编造,也不要强加用户没有暗示的要求。
+
+6. **保持原文语言** —— 中文保持中文,英文保持英文,不要翻译,不要自行添加用户未要求的外语。
+
+7. **原样保留特殊内容** —— 原文中的模板占位符(如 {{name}}、{topic}、<url>、[日期])、代码块、数据、公式、引用原样保留,不修改、不"改进"。只优化这些固定内容之外的说明性文字。
+
+## 输出要求
+
+只输出优化后的那段话本身。不要写任何前言、解释、"以下是优化版本"之类的引导语,不要用引号包裹结果,不要在末尾追加说明。用户会把你的输出直接读进输入框——任何提示词以外的文字都是干扰。`;
+
+const sourceRootDir = resolve(import.meta.dir, "..");
+const executableDir = dirname(process.execPath);
+const rootDir = existsSync(join(executableDir, "web-ui")) ? executableDir : sourceRootDir;
+const dataDir = resolve(process.env.RIKKAHUB_PC_DATA_DIR ?? join(rootDir, "pc-data"));
+
+function tempDir(): string {
+  const t = process.env.TMPDIR ?? process.env.TEMP ?? process.env.TMP;
+  if (t) return t;
+  return process.platform === "win32" ? dataDir : "/tmp";
+}
+
+function osType(): string {
+  if (process.platform === "linux") return "Linux";
+  if (process.platform === "darwin") return "macOS";
+  return "Windows";
+}
+
+// 运行平台（用于自动更新：Windows 走 Tauri NSIS 安装器，Linux 走二进制原地替换）。
+// 与 analyticsOs() 的划分保持一致 —— Docker 容器内 process.platform 也是 "linux"，
+// 这是对的：Docker 镜像就是 Linux 二进制，只是它的更新路径不同（见下）。
+const RUNTIME_PLATFORM: "win" | "mac" | "linux" =
+  process.platform === "darwin" ? "mac" : process.platform === "linux" ? "linux" : "win";
+
+// 容器化部署检测。Docker 内即使替换了 /app/rikkahub-pc，容器一旦重建就会回到镜像里的
+// 旧版本，原地更新没有意义 —— 这类部署应当 docker pull 新镜像。检测 /.dockerenv（Docker
+// 标准标记）或显式注入的环境变量（兼容其他容器运行时）。
+const RUNNING_IN_CONTAINER = existsSync("/.dockerenv") || process.env.RIKKAHUB_CONTAINER === "1";
+
+const filesDir = join(dataDir, "files");
+const skillsDir = join(dataDir, "skills");
+// 用户上传的自定义字体。跟 files/skills 同级,落在 pc-data/ 下,gitignored 且应用更新不覆盖。
+const customFontsDir = join(dataDir, "fonts");
+const statePath = join(dataDir, "state.json");
+// 会话活库(SQLite,WAL)。1.2.6:会话从 state.json 迁出,改用 SQLite 增量写——流式只
+// upsert 当前在长的那个节点行,不再每 200ms 全量重写 state.json。与备份库(导出时现场
+// 生成、Android 兼容)是不同文件/表名/schema:活库 pc_conversation/pc_message_node 为 PC
+// 超集(含 system_prompt / truncate_index,Android 备份库没有这两列)。
+// 详见 conversation-persistence-design.md。
+const conversationsDbPath = join(dataDir, "rikka_hub.db");
+const skipVersionPath = join(dataDir, "skip-version.txt");
+// 已下载更新包的缓存目录。放在持久的 dataDir 下(而非系统 tempDir)——系统临时目录会被
+// OS/磁盘清理/重启清掉,会导致"下次进更新界面又得重下"。Windows 存 .exe 安装器,Linux
+// 存 tar.gz 及其解压产物。probeCachedInstaller / update/download / update/apply 共用。
+const updatesCacheDir = join(dataDir, "updates");
+// 应用内更新下载源:Cloudflare R2 镜像,与官网(rikkahub-desktop.pages.dev)同源,国内/全球
+// 访问都快(GitHub Release 在国内常需代理)。Windows 走 R2(Rikkahub_<tag>_x64-setup.exe);
+// Linux R2 无预编译包,仍走 GitHub Release 直链。
+const UPDATE_R2_BASE = "https://pub-d26eee7d911c4bab937ebe1729a4cefe.r2.dev";
+
+function readSkippedVersion(): string {
+  try { return readFileSync(skipVersionPath, "utf-8").trim(); } catch { return ""; }
+}
+function writeSkippedVersion(version: string) {
+  try { writeFileSync(skipVersionPath, version.trim()); } catch { /* best-effort */ }
+}
+
+// ── Analytics (anonymous DAU tracking) ────────────────────────────────────
+// One ping per app start + periodic updates during the session.  Sends only:
+//   device UUID, date, version, OS, cumulative message count for the day.
+// No user content, no IP storage, no model names, no file names.
+//
+// 设计准则:
+//   - 完全静默:无网络/DNS 失败/防火墙拦截都不能让用户看到任何报错
+//   - 不阻塞:fetch 出错只能被 Promise 链吞掉,绝不能冒泡成 UnhandledRejection
+//   - 不持久错误状态:连续失败不退避、不停跳,因为我们根本不关心是否送达
+const ANALYTICS_ENDPOINT = "https://rikkahub-desktop.pages.dev/ping";
+const deviceIdPath = join(dataDir, "device-id.txt");
+let analyticsDeviceId = "";
+let analyticsMsgCount = 0;
+
+function readOrCreateDeviceId(): string {
+  try { return readFileSync(deviceIdPath, "utf-8").trim(); } catch { /* not found */ }
+  const id = crypto.randomUUID();
+  try { writeFileSync(deviceIdPath, id); } catch { /* best-effort */ }
+  return id;
+}
+
+function localDateStr(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function analyticsOs(): string {
+  // 区分 win / mac / linux —— Docker 容器内 process.platform === "linux",
+  // 算 Linux 用户,合理(Docker 镜像也是基于 Linux 二进制)。
+  if (process.platform === "darwin") return "mac";
+  if (process.platform === "linux") return "linux";
+  return "win";
+}
+
+function sendAnalyticsPing(): void {
+  if (!analyticsDeviceId) return;
+  const url = `${ANALYTICS_ENDPOINT}?id=${encodeURIComponent(analyticsDeviceId)}`
+    + `&d=${localDateStr()}`
+    + `&v=${encodeURIComponent(APP_VERSION)}`
+    + `&os=${analyticsOs()}`
+    + `&mc=${analyticsMsgCount}`;
+  // 三重静默防御:
+  //   (1) try/catch 包裹同步部分,防 fetch() 同步抛错(比如 URL 不合法)
+  //   (2) AbortSignal.timeout 限制网络等待,DNS 失败/连接超时都会被吞
+  //   (3) .then/.catch 双 noop 确保 promise 既不打印未捕获 reject,也不让
+  //       响应体引起任何后续处理
+  try {
+    fetch(url, { method: "GET", signal: AbortSignal.timeout(5000) })
+      .then(() => {}, () => {});
+  } catch { /* fire-and-forget — never block, never warn */ }
+}
+
+function startAnalytics(): void {
+  // 同步部分(读 device-id、设置 interval)绝不可能抛错;唯一可能的失败点是
+  // fetch,已在 sendAnalyticsPing 内部隔离。这里整体再加一层 try/catch 兜底,
+  // 防御未来代码改动时引入意外异常 —— analytics 永远不应该让 server 启动失败。
+  try {
+    analyticsDeviceId = readOrCreateDeviceId();
+    const today = localDateStr();
+    let lastDate = today;
+    sendAnalyticsPing(); // startup ping
+    setInterval(() => {
+      const now = localDateStr();
+      if (now !== lastDate) { analyticsMsgCount = 0; lastDate = now; }
+      sendAnalyticsPing();
+    }, 10 * 60 * 1000); // every 10 minutes
+  } catch { /* analytics must never break the app */ }
+}
+
+// MUST be kept in sync with web-ui/src-tauri/tauri.conf.json's `version` field. The update
+// checker compares this against the latest GitHub release tag and the version is also shown
+// verbatim in the About page. If you bump tauri.conf.json's version, bump this too.
+const APP_VERSION = "1.3.1";
+
+type GithubRelease = {
+  tag_name?: string;
+  name?: string;
+  body?: string;
+  html_url?: string;
+  assets?: { name?: string; browser_download_url?: string; size?: number }[];
+};
+
+async function fetchGithubLatestRelease(repo: string): Promise<GithubRelease> {
+  const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
+    headers: { Accept: "application/vnd.github+json", "User-Agent": "RikkaHub-PC" },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GitHub ${res.status}: ${text.slice(0, 300)}`);
+  }
+  return (await res.json()) as GithubRelease;
+}
+
+// Anonymous fallback when api.github.com refuses. github.com/<repo>/releases/latest is a
+// regular HTML page that 302-redirects to /releases/tag/v<latest>. We follow the redirect
+// manually and pull the tag out of the Location header. No API, no rate limit, no token.
+async function fetchLatestReleaseFromHtmlRedirect(repo: string): Promise<{ tag: string; htmlUrl: string }> {
+  const url = `https://github.com/${repo}/releases/latest`;
+  const res = await fetch(url, {
+    method: "HEAD",
+    redirect: "manual",
+    headers: { "User-Agent": "RikkaHub-PC" },
+  });
+  // GitHub returns 302 with Location: /<owner>/<repo>/releases/tag/v<tag> on success.
+  const location = res.headers.get("location") ?? "";
+  if (!location) {
+    throw new Error(`No redirect from ${url} (status ${res.status})`);
+  }
+  const match = location.match(/\/releases\/tag\/v?([^/?#]+)/i);
+  if (!match) {
+    throw new Error(`Unrecognized release redirect target: ${location}`);
+  }
+  const tag = match[1].replace(/^v/i, "");
+  const absoluteHtmlUrl = location.startsWith("http") ? location : `https://github.com${location}`;
+  return { tag, htmlUrl: absoluteHtmlUrl };
+}
+
+// Look for a previously-downloaded installer for this exact version in the temp dir so the
+// UI can offer "直接安装" without re-downloading. Matched first by canonical filename, then
+// by any *.exe whose name embeds the version tag (tolerates users moving/renaming files).
+// Returns null if isNewer is false (don't surface stale installers).
+//
+// 仅 Windows 调用(buildResponse 里按平台过滤):Linux 的更新是 tar.gz,需要解压后才能
+// apply,缓存的 tar.gz 没法直接用,所以 Linux 走"每次重新下载解压"的路径,见 update/download。
+function probeCachedInstaller(fileName: string, tag: string, isNewer: boolean): string | null {
+  if (!isNewer || !fileName) return null;
+  try {
+    const tmpDir = updatesCacheDir;
+    if (!existsSync(tmpDir)) return null;
+    const canonical = join(tmpDir, fileName);
+    if (existsSync(canonical) && statSync(canonical).size > 0) {
+      return canonical;
+    }
+    for (const entry of readdirSync(tmpDir)) {
+      if (!/\.exe$/i.test(entry)) continue;
+      if (tag && !entry.includes(tag)) continue;
+      const candidate = join(tmpDir, entry);
+      try {
+        if (statSync(candidate).size > 0) return candidate;
+      } catch { /* ignore */ }
+    }
+  } catch (cacheErr) {
+    console.warn("[update/check] cache scan failed:", cacheErr);
+  }
+  return null;
+}
+
+/** Compare two dotted-version strings. Returns -1/0/1 like `a - b`. Tolerates "v" prefix,
+ *  missing patch parts (treated as 0), and non-numeric trailing labels (compared as strings). */
+function compareSemver(a: string, b: string): number {
+  const norm = (v: string) => v.replace(/^v/i, "").trim();
+  const partsA = norm(a).split(".");
+  const partsB = norm(b).split(".");
+  const len = Math.max(partsA.length, partsB.length);
+  for (let i = 0; i < len; i++) {
+    const ap = partsA[i] ?? "0";
+    const bp = partsB[i] ?? "0";
+    const an = Number.parseInt(ap, 10);
+    const bn = Number.parseInt(bp, 10);
+    if (Number.isFinite(an) && Number.isFinite(bn) && String(an) === ap && String(bn) === bp) {
+      if (an !== bn) return an > bn ? 1 : -1;
+    } else {
+      const cmp = ap.localeCompare(bp);
+      if (cmp !== 0) return cmp > 0 ? 1 : -1;
+    }
+  }
+  return 0;
+}
+
+function id() {
+  return crypto.randomUUID();
+}
+
+const LOG_PREVIEW_LIMIT = 256_000;
+
+function uniqueStrings(values: Array<string | null | undefined>) {
+  return [...new Set(values.map((value) => String(value ?? "").trim()).filter(Boolean))];
+}
+
+function inferModelAbilities(modelId: string): string[] {
+  const name = modelId.toLowerCase();
+  const abilities: string[] = [];
+  if (/(^|[/:_-])(gpt-[45]|o[134]|claude|gemini|deepseek|qwen|qwq|qvq|glm|kimi|moonshot|doubao|hunyuan|grok|llama|mistral|mixtral|command|sonar|perplexity|mimo)/i.test(modelId)) {
+    abilities.push("TOOL");
+  }
+  // Reasoning detection mirrors Android's ModelRegistry. Note that Claude family names like
+  // `claude-opus-4-6` don't contain literal "claude-4" as a substring (there's `opus` between),
+  // so we match either the legacy `claude-3.7 / claude-4` patterns OR any modern variant of
+  // claude-{opus,sonnet,haiku}-X to catch all Anthropic models 3.5+ which all support thinking.
+  if (/(gpt-5|^o[134]|[/:_-]o[134]|reason|reasoning|thinking|deepseek-r1|deepseek-reasoner|deepseek-v4|deepseek.*v4|qwq|qvq|qwen3|glm-[45]|glm-z1|hunyuan-a13b|mimo-v2|claude-3[.-]7|claude-4|claude-(opus|sonnet|haiku)-(3[.-]7|[4-9]|\d{2,})|gemini-2[.-]5|gemini-3|grok-4)/i.test(name)) {
+    abilities.push("REASONING");
+  }
+  return uniqueStrings(abilities);
+}
+
+function inferModelTools(_modelId: string): JsonValue[] {
+  // Previously this auto-tagged many models (gemini-2/sonar/perplexity/grok/glm-4.5/etc.)
+  // with the built-in search tool, so the chat input's "model built-in search" toggle
+  // started ON by default for fresh users. That violated the principle of "no surprise
+  // network calls" — users could send a message and unwittingly trigger search billing /
+  // upstream rate limits. Built-in search must be opt-in, configured per-model in the
+  // model edit dialog → 内置工具 tab. Returning empty here means new fetched models
+  // arrive with no tools and the toggle defaults OFF.
+  return [];
+}
+
+function inferInputModalities(modelId: string, raw?: any): string[] {
+  const declared = [
+    ...(Array.isArray(raw?.input_modalities) ? raw.input_modalities : []),
+    ...(Array.isArray(raw?.inputModalities) ? raw.inputModalities : []),
+  ].map((item) => String(item).toUpperCase());
+  if (declared.length) return uniqueStrings(declared);
+  return /(vision|visual|vl|omni|gpt-4o|gpt-4\.1|gemini|claude-3|claude-4|qwen.*vl|glm-4v|grok-vision|llava|pixtral|mimo[-_./:]?v?2[-_./:]?5|mimo[-_./:]?v?2[-_./:]?omni)/i.test(modelId)
+    ? ["TEXT", "IMAGE"]
+    : ["TEXT"];
+}
+
+function inferOutputModalities(modelId: string, raw?: any): string[] {
+  const declared = [
+    ...(Array.isArray(raw?.output_modalities) ? raw.output_modalities : []),
+    ...(Array.isArray(raw?.outputModalities) ? raw.outputModalities : []),
+    ...(Array.isArray(raw?.modalities) ? raw.modalities : []),
+  ].map((item) => String(item).toUpperCase());
+  if (declared.length) return uniqueStrings(declared);
+  return /(dall-e|gpt-image|image|imagen|flux|stable-diffusion|sd3|midjourney|recraft)/i.test(modelId)
+    ? ["TEXT", "IMAGE"]
+    : ["TEXT"];
+}
+
+function enrichModel(input: Model, raw?: any): Model {
+  const abilities = uniqueStrings([...(input.abilities ?? []), ...inferModelAbilities(input.modelId)]);
+  const inputModalities = uniqueStrings([...(input.inputModalities ?? []), ...inferInputModalities(input.modelId, raw)]);
+  const outputModalities = uniqueStrings([...(input.outputModalities ?? []), ...inferOutputModalities(input.modelId, raw)]);
+  const tools = (input.tools?.length ? input.tools : inferModelTools(input.modelId)) as JsonValue[];
+  return {
+    ...input,
+    abilities,
+    inputModalities: inputModalities.length ? inputModalities : ["TEXT"],
+    outputModalities: outputModalities.length ? outputModalities : ["TEXT"],
+    tools,
+  };
+}
+
+function model(modelId: string, displayName = modelId): Model {
+  return enrichModel({
+    id: id(),
+    modelId,
+    displayName,
+    type: "CHAT",
+    inputModalities: ["TEXT"],
+    outputModalities: ["TEXT"],
+    abilities: [],
+    tools: [],
+  });
+}
+
+function provider(input: Partial<Provider> & Pick<Provider, "id" | "name" | "baseUrl">): Provider {
+  return {
+    type: "openai",
+    enabled: false,
+    builtIn: true,
+    shortDescription: "",
+    description: "",
+    apiKey: "",
+    chatCompletionsPath: "/chat/completions",
+    useResponseApi: false,
+    // 对齐安卓 ProviderSetting.OpenAI.includeHistoryReasoning 默认值 (commit e63d017)
+    includeHistoryReasoning: true,
+    promptCaching: false,
+    promptCacheTtl: "5m",
+    testPassed: input.name === "RikkaHub" || input.id === "a8d2d463-e8c0-41f2-b89e-f5eb8e716cce",
+    models: [],
+    balanceOption: { enabled: false, apiPath: "/credits", resultPath: "data.total_usage" },
+    ...input,
+  };
+}
+
+// 一次性下架的预置供应商(合作终止)。它们已从 defaultProviders/defaultTtsProviders 移除,
+// 但老用户 state 里可能还存着 —— normalize 时做一次清理:只删用户从未真正使用(未填
+// apiKey)的;已配 key 的保留,避免静默删掉用户的接入凭据。
+const SUNSET_PROVIDER_IDS = new Set<string>([
+  "1b1395ed-b702-4aeb-8bc1-b681c4456953", // AiHubMix
+  "da020a90-f7b3-4c29-b90e-c511a0630630", // 小马算力
+  "da93779f-3956-48cc-82ef-67bb482eaaf7", // 302.AI
+  "53027b08-1b58-43d5-90ed-29173203e3d8", // AckAI
+  "4da09554-8844-4cc8-a4a9-fe1b2515e91b", // UnifyLLM
+]);
+const SUNSET_TTS_PROVIDER_IDS = new Set<string>([
+  "e36b22ef-ca82-40ab-9e70-60cad861911c", // AiHubMix (TTS)
+]);
+
+// 1.1.1 供应商迁移用的固定 id。改名/补模型走 id 匹配,确保老用户 state 也生效。
+const TENCENT_PROVIDER_ID = "ef5d149b-8e34-404b-818c-6ec242e5c3c5";
+const NA_API_PROVIDER_ID = "e7a2b5c3-8f4d-4e6a-9b1c-3d5f7e8a2c04";
+// 钠API 预置模型。仅当老用户从未配置过钠API(其 models 为空)时补上,已自定义的不覆盖。
+const NA_API_PRESET_MODELS = [
+  "claude-opus-4-6",
+  "gpt-5.5",
+  "deepseek-ai/DeepSeek-V4-Flash",
+  "deepseek-ai/DeepSeek-V4-Pro",
+];
+
+// 1.1.1 预置供应商期望顺序(按 id)。老用户也按此重排——内置(builtIn)供应商排到
+// 对应位置,用户新增的自定义供应商不受影响,统一保留在内置供应商之后(保持其相对顺序)。
+// 排序是幂等的:重复执行结果一致,不会反复改动已排好的 state。
+const BUILTIN_PROVIDER_ORDER: readonly string[] = [
+  "a8d2d463-e8c0-41f2-b89e-f5eb8e716cce", // RikkaHub
+  "1eeea727-9ee5-4cae-93e6-6fb01a4d051e", // OpenAI
+  "b2c7e1a4-9f3d-4a6e-8c1b-5d7f9e2a3b14", // Anthropic
+  "6ab18148-c138-4394-a46f-1cd8c8ceaa6d", // Gemini
+  "ff3cde7e-0f65-43d7-8fb2-6475c99f5990", // xAI
+  "f099ad5b-ef03-446d-8e78-7e36787f780b", // DeepSeek
+  "f76cae46-069a-4334-ab8e-224e4979e58c", // 阿里云百炼
+  "3dfd6f9b-f9d9-417f-80c1-ff8d77184191", // 火山引擎
+  "ef5d149b-8e34-404b-818c-6ec242e5c3c5", // 腾讯混元
+  "3bc40dc1-b11a-46fa-863b-6306971223be", // 智谱AI开放平台
+  "d6c4d8c6-3f62-4ca9-a6f3-7ade6b15ecc3", // 月之暗面
+  "f4f8870e-82d3-495b-9b64-d58e508b3b2c", // 阶跃星辰
+  "e7a2b5c3-8f4d-4e6a-9b1c-3d5f7e8a2c04", // 钠API
+  "d5734028-d39b-4d41-9841-fd648d65440e", // OpenRouter
+  "386e0f29-8228-4512-affe-8fd8add82d88", // Vercel AI Gateway
+  "56a94d29-c88b-41c5-8e09-38a7612d6cf8", // 硅基流动
+];
+function builtinProviderRank(providerItem: Provider): number {
+  const idx = BUILTIN_PROVIDER_ORDER.indexOf(providerItem.id);
+  return idx === -1 ? Number.MAX_SAFE_INTEGER : idx;
+}
+
+function defaultProviders(): Provider[] {
+  return [
+    provider({
+      id: "a8d2d463-e8c0-41f2-b89e-f5eb8e716cce",
+      name: "RikkaHub",
+      baseUrl: "https://api.rikka-ai.com/v1",
+      enabled: true,
+      shortDescription: "RikkaHub built-in relay",
+      description: "Built-in RikkaHub provider template, matching the Android default.",
+      models: [
+        {
+          ...model("auto", "Auto"),
+          id: DEFAULT_AUTO_MODEL_ID,
+          abilities: ["TOOL", "REASONING"],
+        },
+      ],
+    }),
+    provider({
+      id: "1eeea727-9ee5-4cae-93e6-6fb01a4d051e",
+      name: "OpenAI",
+      baseUrl: "https://api.openai.com/v1",
+      shortDescription: "Official OpenAI-compatible API",
+      models: [model("gpt-4.1"), model("gpt-4.1-mini"), model("gpt-4o-mini")],
+    }),
+    provider({
+      id: "b2c7e1a4-9f3d-4a6e-8c1b-5d7f9e2a3b14",
+      type: "claude",
+      name: "Anthropic",
+      baseUrl: "https://api.anthropic.com/v1",
+      shortDescription: "Anthropic Claude 原生 API",
+      models: [model("claude-opus-4-6"), model("claude-sonnet-4-6"), model("claude-haiku-4-5-20251001")],
+    }),
+    provider({
+      id: "6ab18148-c138-4394-a46f-1cd8c8ceaa6d",
+      type: "google",
+      name: "Gemini",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      enabled: true,
+      shortDescription: "Google Gemini API",
+      models: [model("gemini-2.5-flash"), model("gemini-2.5-pro")],
+    }),
+    provider({ id: "ff3cde7e-0f65-43d7-8fb2-6475c99f5990", name: "xAI", baseUrl: "https://api.x.ai/v1", useResponseApi: true }),
+    provider({
+      id: "f099ad5b-ef03-446d-8e78-7e36787f780b",
+      name: "DeepSeek",
+      baseUrl: "https://api.deepseek.com/v1",
+      shortDescription: "DeepSeek official API",
+      balanceOption: { enabled: true, apiPath: "/user/balance", resultPath: "balance_infos[0].total_balance" },
+    }),
+    provider({ id: "f76cae46-069a-4334-ab8e-224e4979e58c", name: "阿里云百炼", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1" }),
+    provider({ id: "3dfd6f9b-f9d9-417f-80c1-ff8d77184191", name: "火山引擎", baseUrl: "https://ark.cn-beijing.volces.com/api/v3" }),
+    provider({ id: "ef5d149b-8e34-404b-818c-6ec242e5c3c5", name: "腾讯混元", baseUrl: "https://api.hunyuan.cloud.tencent.com/v1" }),
+    provider({ id: "3bc40dc1-b11a-46fa-863b-6306971223be", name: "智谱AI开放平台", baseUrl: "https://open.bigmodel.cn/api/paas/v4" }),
+    provider({
+      id: "d6c4d8c6-3f62-4ca9-a6f3-7ade6b15ecc3",
+      name: "月之暗面",
+      baseUrl: "https://api.moonshot.cn/v1",
+      balanceOption: { enabled: true, apiPath: "/users/me/balance", resultPath: "data.available_balance" },
+    }),
+    provider({ id: "f4f8870e-82d3-495b-9b64-d58e508b3b2c", name: "阶跃星辰", baseUrl: "https://api.stepfun.com/v1" }),
+    provider({
+      id: "e7a2b5c3-8f4d-4e6a-9b1c-3d5f7e8a2c04",
+      name: "钠API",
+      baseUrl: "https://naapi.cc/v1",
+      shortDescription: "钠 API 提供 ChatGPT、Claude、Gemini 等 100+ 全球顶级模型接口",
+      description: "钠 API 提供 ChatGPT、Claude、Gemini 等 100+ 全球顶级模型接口,Focusing on competitive pricing and superior stability.",
+      balanceOption: { enabled: true, apiPath: "/credits", resultPath: "data.total_credits" },
+      models: [
+        model("claude-opus-4-6"),
+        model("gpt-5.5"),
+        model("deepseek-ai/DeepSeek-V4-Flash"),
+        model("deepseek-ai/DeepSeek-V4-Pro"),
+      ],
+    }),
+    provider({
+      id: "d5734028-d39b-4d41-9841-fd648d65440e",
+      name: "OpenRouter",
+      baseUrl: "https://openrouter.ai/api/v1",
+      shortDescription: "OpenRouter multi-model gateway",
+      balanceOption: { enabled: true, apiPath: "/credits", resultPath: "data.total_credits - data.total_usage" },
+    }),
+    provider({
+      id: "386e0f29-8228-4512-affe-8fd8add82d88",
+      name: "Vercel AI Gateway",
+      baseUrl: "https://ai-gateway.vercel.sh/v1",
+      shortDescription: "Vercel AI Gateway",
+      balanceOption: { enabled: true, apiPath: "/credits", resultPath: "balance" },
+    }),
+    provider({
+      id: "56a94d29-c88b-41c5-8e09-38a7612d6cf8",
+      name: "硅基流动",
+      baseUrl: "https://api.siliconflow.cn/v1",
+      shortDescription: "SiliconFlow OpenAI-compatible API",
+      balanceOption: { enabled: true, apiPath: "/user/info", resultPath: "data.totalBalance" },
+    }),
+  ];
+}
+
+function defaultAssistant(): Assistant {
+  return {
+    id: DEFAULT_ASSISTANT_ID,
+    chatModelId: null,
+    name: "",
+    avatar: { type: "dummy" },
+    useAssistantAvatar: false,
+    tags: [],
+    systemPrompt: "",
+    temperature: null,
+    topP: null,
+    contextMessageSize: 0,
+    streamOutput: true,
+    enableMemory: false,
+    useGlobalMemory: false,
+    enableRecentChatsReference: false,
+    messageTemplate: "{{ message }}",
+    presetMessages: [],
+    quickMessageIds: [],
+    regexes: [],
+    reasoningLevel: "AUTO",
+    maxTokens: null,
+    customHeaders: [],
+    customBodies: [],
+    mcpServers: [],
+    mcpToolOverrides: {},
+    localTools: [{ type: "time_info" }],
+    background: null,
+    backgroundOpacity: 1,
+    modeInjectionIds: [],
+    lorebookIds: [],
+    enabledSkills: [],
+    enableTimeReminder: false,
+    allowConversationSystemPrompt: false,
+  };
+}
+
+function defaultSettings(): Settings {
+  const assistant = defaultAssistant();
+  return {
+    dynamicColor: true,
+    themeId: "default",
+    developerMode: false,
+    displaySetting: {
+      userAvatar: { type: "dummy" },
+      userNickname: "",
+      showUserAvatar: true,
+      showAssistantBubble: false,
+      showModelIcon: true,
+      showModelName: true,
+      showTokenUsage: true,
+      showThinkingContent: true,
+      uiFontFamily: "Noto Sans SC",
+      chatFontFamily: "",
+      uiFontFamilyCss: "\"Noto Sans SC\", \"Microsoft YaHei\", sans-serif",
+      chatFontFamilyCss: "",
+      autoCloseThinking: true,
+      codeBlockAutoWrap: false,
+      codeBlockAutoCollapse: false,
+      showLineNumbers: false,
+      sendOnEnter: false,
+      enableAutoScroll: true,
+      fontSizeRatio: 1,
+      pasteLongTextAsFile: false,
+      pasteLongTextThreshold: 1000,
+      // User-resizable chat input height in px (null = default min). Persisted across
+      // restarts via displaySetting. PC-only — stripped before syncing to Android.
+      chatInputHeight: null,
+    },
+    enableWebSearch: false,
+    favoriteModels: [],
+    chatModelId: DEFAULT_AUTO_MODEL_ID,
+    titleModelId: DEFAULT_AUTO_MODEL_ID,
+    translateModeId: DEFAULT_AUTO_MODEL_ID,
+    translateThinkingBudget: 0,
+    suggestionModelId: DEFAULT_AUTO_MODEL_ID,
+    imageGenerationModelId: "",
+    ocrModelId: "",
+    compressModelId: DEFAULT_AUTO_MODEL_ID,
+    promptOptimizeModelId: "",
+    promptOptimizePrompt: DEFAULT_PROMPT_OPTIMIZE_PROMPT,
+    titlePrompt: DEFAULT_TITLE_PROMPT,
+    translatePrompt: DEFAULT_TRANSLATION_PROMPT,
+    suggestionPrompt: DEFAULT_SUGGESTION_PROMPT,
+    ocrPrompt: DEFAULT_OCR_PROMPT,
+    compressPrompt: DEFAULT_COMPRESS_PROMPT,
+    asrProviders: [],
+    selectedASRProviderId: null,
+    ttsProviders: defaultTtsProviders(),
+    selectedTTSProviderId: DEFAULT_SYSTEM_TTS_ID,
+    assistantId: assistant.id,
+    providers: defaultProviders(),
+    assistants: [
+      assistant,
+      {
+        ...defaultAssistant(),
+        id: "3d47790c-c415-4b90-9388-751128adb0a0",
+        systemPrompt:
+          "You are a helpful assistant, called {{char}}, based on model {{model_name}}.\n\n## Info\n- Time: {{cur_datetime}}\n- Locale: {{locale}}\n- Timezone: {{timezone}}\n- Device Info: {{device_info}}\n- System Version: {{system_version}}\n- User Nickname: {{user}}\n\n## Hint\n- If the user does not specify a language, reply in the user's primary language.\n- Remember to use Markdown syntax for formatting, and use latex for mathematical expressions.\n\n## Search\n- You must use English keywords when searching to get higher quality sources.\n- Chinese sources are generally of low quality.",
+      },
+    ],
+    assistantTags: [],
+    searchServices: [
+      { type: "bing_local", id: id(), name: "Bing" },
+      { type: "rikkahub", id: id(), name: "RikkaHub", apiKey: "", depth: "standard" },
+      { type: "tavily", id: id(), name: "Tavily", apiKey: "", depth: "advanced" },
+      { type: "exa", id: id(), name: "Exa", apiKey: "" },
+      { type: "zhipu", id: id(), name: "智谱", apiKey: "" },
+      { type: "tinyfish", id: id(), name: "Tinyfish", apiKey: "" },
+      { type: "perplexity", id: id(), name: "Perplexity", apiKey: "" },
+      { type: "bocha", id: id(), name: "博查", apiKey: "" },
+      { type: "linkup", id: id(), name: "LinkUp", apiKey: "", depth: "standard" },
+      { type: "metaso", id: id(), name: "秘塔", apiKey: "" },
+      { type: "ollama", id: id(), name: "Ollama", apiKey: "" },
+      { type: "jina", id: id(), name: "Jina", apiKey: "" },
+      { type: "firecrawl", id: id(), name: "Firecrawl", apiKey: "" },
+      { type: "grok", id: id(), name: "Grok", apiKey: "", customUrl: "https://api.x.ai/v1/responses", model: "grok-4-fast" },
+    ],
+    searchCommonOptions: { resultSize: 10 },
+    searchServiceSelected: 0,
+    mcpServers: [],
+    modeInjections: [
+      {
+        type: "mode",
+        id: DEFAULT_LEARNING_MODE_ID,
+        name: "Learning Mode",
+        enabled: true,
+        priority: 0,
+        position: "after_system_prompt",
+        content: "Use Socratic guidance. Ask questions, give hints, and help the user build understanding.",
+        injectDepth: 4,
+        role: "USER",
+      },
+    ],
+    lorebooks: [],
+    quickMessages: [],
+    webDavConfig: {
+      url: "",
+      username: "",
+      password: "",
+      path: "rikkahub_backups",
+      items: ["DATABASE", "FILES"],
+    },
+    s3Config: {
+      endpoint: "",
+      accessKeyId: "",
+      secretAccessKey: "",
+      bucket: "",
+      region: "auto",
+      pathStyle: true,
+      items: ["DATABASE", "FILES"],
+    },
+    proxyConfig: {
+      url: "",
+      username: "",
+      password: "",
+    },
+    webServerJwtEnabled: false,
+    preferredPort: null,
+  };
+}
+
+function defaultState(): State {
+  return {
+    settings: defaultSettings(),
+    conversations: [],
+    files: [],
+    generatedImages: [],
+    logs: [],
+    stats: defaultRequestStats(),
+    memories: [],
+    nextFileId: 1,
+    nextMemoryId: 1,
+    nextGeneratedImageId: 1,
+    launchCount: 0,
+  };
+}
+
+function normalizeState(input: Partial<State>): State {
+  const fresh = defaultState();
+  const parsedSettings = input.settings ?? fresh.settings;
+  const normalized: State = {
+    ...fresh,
+    ...input,
+    settings: {
+      ...fresh.settings,
+      ...parsedSettings,
+    },
+    conversations: Array.isArray(input.conversations)
+      ? input.conversations.map((conversation) => ({
+          ...conversation,
+          systemPrompt: typeof conversation.systemPrompt === "string" ? conversation.systemPrompt : null,
+        }))
+      : [],
+    files: Array.isArray(input.files) ? input.files : [],
+    generatedImages: Array.isArray(input.generatedImages) ? input.generatedImages : [],
+    logs: [],  // 内存态:启动清空,对齐移动端(performStateSave 写盘排除)
+    stats: normalizeRequestStats(input.stats, Array.isArray(input.logs) ? input.logs : []),
+    memories: Array.isArray(input.memories) ? input.memories.filter(isRecord).map((memory, index) => {
+      const now = Date.now();
+      // Pre-2026-05 PC builds saved global-scope memories under "global" (without underscores).
+      // Migrate any legacy records so they continue to surface for assistants with
+      // `useGlobalMemory: true`, matching the Android schema literal.
+      const rawAssistantId = String(memory.assistantId ?? memory.assistant_id ?? GLOBAL_MEMORY_ID);
+      const assistantId = rawAssistantId === "global" ? GLOBAL_MEMORY_ID : rawAssistantId;
+      return {
+        id: Number(memory.id ?? index + 1),
+        assistantId,
+        content: String(memory.content ?? ""),
+        createdAt: Number(memory.createdAt ?? memory.created_at ?? now),
+        updatedAt: Number(memory.updatedAt ?? memory.updated_at ?? now),
+      };
+    }).filter((memory) => memory.content.trim()) : [],
+    nextFileId: typeof input.nextFileId === "number" ? input.nextFileId : 1,
+    nextMemoryId: typeof input.nextMemoryId === "number" ? input.nextMemoryId : 1,
+    nextGeneratedImageId: typeof input.nextGeneratedImageId === "number" ? input.nextGeneratedImageId : 1,
+    launchCount: typeof input.launchCount === "number" ? input.launchCount : 0,
+  };
+  const defaults = defaultSettings();
+  normalized.settings.providers = mergeById(normalized.settings.providers ?? [], defaults.providers);
+  normalized.settings.providers = normalized.settings.providers.map((providerItem) => ({
+    ...providerItem,
+    promptCaching: providerItem.type === "claude" ? providerItem.promptCaching === true : providerItem.promptCaching,
+    promptCacheTtl: providerItem.promptCacheTtl === "1h" ? "1h" : "5m",
+    models: (providerItem.models ?? []).map((item) => enrichModel(item)),
+  }));
+  normalized.settings.assistants = mergeById(normalized.settings.assistants ?? [], defaults.assistants);
+  // Backfill mcpToolOverrides for assistants saved before this field existed. Default empty
+  // object = inherit all globally-enabled tools, no per-assistant overrides applied.
+  normalized.settings.assistants = normalized.settings.assistants.map((assistant) => ({
+    ...assistant,
+    mcpToolOverrides: isRecord(assistant.mcpToolOverrides)
+      ? assistant.mcpToolOverrides as Record<string, Record<string, { enable?: boolean; needsApproval?: boolean }>>
+      : {},
+  }));
+  normalized.settings.displaySetting = { ...defaults.displaySetting, ...(normalized.settings.displaySetting ?? {}) };
+  if (!String(normalized.settings.displaySetting.uiFontFamily ?? "").trim()) {
+    normalized.settings.displaySetting.uiFontFamily = defaults.displaySetting.uiFontFamily;
+    normalized.settings.displaySetting.uiFontFamilyCss = defaults.displaySetting.uiFontFamilyCss;
+  }
+  normalized.settings.titlePrompt = normalized.settings.titlePrompt || DEFAULT_TITLE_PROMPT;
+  normalized.settings.translatePrompt = normalized.settings.translatePrompt || DEFAULT_TRANSLATION_PROMPT;
+  normalized.settings.suggestionPrompt = normalized.settings.suggestionPrompt || DEFAULT_SUGGESTION_PROMPT;
+  normalized.settings.ocrPrompt = normalized.settings.ocrPrompt || DEFAULT_OCR_PROMPT;
+  normalized.settings.compressPrompt = normalized.settings.compressPrompt || DEFAULT_COMPRESS_PROMPT;
+  normalized.settings.promptOptimizePrompt = normalized.settings.promptOptimizePrompt || DEFAULT_PROMPT_OPTIMIZE_PROMPT;
+  normalized.settings.titlePrompt = normalized.settings.titlePrompt.replace(/not exceed 10 characters/gi, "not exceed 15 characters");
+  normalized.settings.suggestionPrompt = normalized.settings.suggestionPrompt.replace(/not exceed 10 characters/gi, "not exceed 18 characters");
+  // Backfill REASONING ability for previously-saved models (e.g. claude-opus-4-6) whose
+  // abilities array was set before the inference regex covered them. Only adds — never removes.
+  normalized.settings.providers = normalized.settings.providers.map((providerItem) => ({
+    ...providerItem,
+    models: (providerItem.models ?? []).map((modelItem) => {
+      const inferred = inferModelAbilities(modelItem.modelId);
+      const current = Array.isArray(modelItem.abilities) ? modelItem.abilities : [];
+      const merged = uniqueStrings([...current, ...inferred]);
+      return merged.length === current.length ? modelItem : { ...modelItem, abilities: merged };
+    }),
+  }));
+  // 下架清理(见 SUNSET_PROVIDER_IDS):仅删老用户 state 里残留、且从未配置 apiKey 的。
+  normalized.settings.providers = normalized.settings.providers.filter(
+    (providerItem) => !SUNSET_PROVIDER_IDS.has(providerItem.id) || String(providerItem.apiKey ?? "").trim() !== "",
+  );
+  // 1.1.1 供应商迁移:
+  // (a) 腾讯 Hunyuan 改名为"腾讯混元"(mergeById 保留老 name,这里强制按 id 改名,配置不变)。
+  // (b) 钠API 给从未配置过的老用户(models 为空)补上预置模型;已自定义 models 的不覆盖。
+  normalized.settings.providers = normalized.settings.providers.map((providerItem) => {
+    if (providerItem.id === TENCENT_PROVIDER_ID) {
+      return { ...providerItem, name: "腾讯混元" };
+    }
+    if (providerItem.id === NA_API_PROVIDER_ID && (providerItem.models ?? []).length === 0) {
+      return { ...providerItem, models: NA_API_PRESET_MODELS.map((mid) => model(mid)) };
+    }
+    return providerItem;
+  });
+  // 1.1.1:按预置顺序重排内置供应商(老用户也生效)。用户新增的自定义供应商不在
+  // BUILTIN_PROVIDER_ORDER 里,rank 都是 MAX_SAFE_INTEGER,稳定排序后仍按原相对顺序
+  // 排在内置供应商之后,不会被重排打乱。这是一次性迁移——记录在 appliedMigrations,
+  // 升级后用户的后续手动排序不会再被覆盖。
+  const PROVIDER_REORDER_MIGRATION = "provider-reorder-1.1.1";
+  const appliedMigrations = Array.isArray(normalized.appliedMigrations) ? normalized.appliedMigrations : [];
+  if (!appliedMigrations.includes(PROVIDER_REORDER_MIGRATION)) {
+    normalized.settings.providers = [...normalized.settings.providers].sort(
+      (a, b) => builtinProviderRank(a) - builtinProviderRank(b),
+    );
+    normalized.appliedMigrations = [...appliedMigrations, PROVIDER_REORDER_MIGRATION];
+  }
+  normalized.settings.searchServices = normalized.settings.searchServices?.length
+    ? normalized.settings.searchServices
+    : defaults.searchServices;
+  normalized.settings.webDavConfig = normalizeWebDavConfig(normalized.settings.webDavConfig);
+  normalized.settings.s3Config = normalizeS3Config(normalized.settings.s3Config);
+  normalized.settings.proxyConfig = normalizeProxyConfig(normalized.settings.proxyConfig);
+  normalized.settings.preferredPort = normalizePreferredPort(normalized.settings.preferredPort);
+  if (!normalized.settings.searchServices.some((service) => String((service as Record<string, JsonValue>).type ?? "").toLowerCase() === "tinyfish")) {
+    normalized.settings.searchServices = [
+      ...normalized.settings.searchServices,
+      { type: "tinyfish", id: id(), name: "Tinyfish", apiKey: "" },
+    ];
+  }
+  // Backfill 2026-05 search service additions for existing installs.
+  if (!normalized.settings.searchServices.some((service) => String((service as Record<string, JsonValue>).type ?? "").toLowerCase() === "firecrawl")) {
+    normalized.settings.searchServices = [
+      ...normalized.settings.searchServices,
+      { type: "firecrawl", id: id(), name: "Firecrawl", apiKey: "" },
+    ];
+  }
+  if (!normalized.settings.searchServices.some((service) => String((service as Record<string, JsonValue>).type ?? "").toLowerCase() === "grok")) {
+    normalized.settings.searchServices = [
+      ...normalized.settings.searchServices,
+      { type: "grok", id: id(), name: "Grok", apiKey: "", customUrl: "https://api.x.ai/v1/responses", model: "grok-4-fast" },
+    ];
+  }
+  normalized.settings.asrProviders = normalizeAsrProviders(normalized.settings.asrProviders);
+  normalized.settings.selectedASRProviderId = normalized.settings.asrProviders.some((provider) => provider.id === normalized.settings.selectedASRProviderId)
+    ? normalized.settings.selectedASRProviderId
+    : normalized.settings.asrProviders[0]?.id ?? null;
+  normalized.settings.ttsProviders = normalizeTtsProviders(normalized.settings.ttsProviders);
+  normalized.settings.ttsProviders = normalized.settings.ttsProviders.filter(
+    (providerItem) => !SUNSET_TTS_PROVIDER_IDS.has(providerItem.id) || String(providerItem.apiKey ?? "").trim() !== "",
+  );
+  normalized.settings.selectedTTSProviderId = normalized.settings.ttsProviders.some((provider) => provider.id === normalized.settings.selectedTTSProviderId)
+    ? normalized.settings.selectedTTSProviderId
+    : normalized.settings.ttsProviders[0]?.id ?? null;
+  normalized.nextFileId = Math.max(
+    normalized.nextFileId,
+    ...normalized.files.map((file) => file.id + 1),
+    1,
+  );
+  normalized.nextMemoryId = Math.max(
+    normalized.nextMemoryId,
+    ...normalized.memories.map((memory) => memory.id + 1),
+    1,
+  );
+  normalized.nextGeneratedImageId = Math.max(
+    normalized.nextGeneratedImageId,
+    ...normalized.generatedImages.map((image) => Number(image.id) + 1).filter((value) => Number.isFinite(value)),
+    1,
+  );
+  return normalized;
+}
+
+function defaultAsrProvider(type: AsrProvider["type"] = "openai_realtime"): AsrProvider {
+  if (type === "dashscope") {
+    return {
+      type,
+      id: id(),
+      name: "DashScope ASR",
+      apiKey: "",
+      websocketUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
+      model: "qwen3-asr-flash-realtime",
+      language: "",
+      sampleRate: 16000,
+      vadThreshold: 0.2,
+      silenceDurationMs: 800,
+    };
+  }
+  if (type === "volcengine") {
+    return {
+      type,
+      id: id(),
+      name: "Volcengine ASR",
+      apiKey: "",
+      websocketUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
+      resourceId: "volc.seedasr.sauc.duration",
+      language: "",
+    };
+  }
+  return {
+    type: "openai_realtime",
+    id: id(),
+    name: "OpenAI Realtime ASR",
+    apiKey: "",
+    websocketUrl: "wss://api.openai.com/v1/realtime?intent=transcription",
+    model: "gpt-4o-transcribe",
+    language: "",
+    prompt: "",
+    sampleRate: 24000,
+    vadThreshold: 0.5,
+    prefixPaddingMs: 300,
+    silenceDurationMs: 500,
+  };
+}
+
+function defaultTtsProvider(type: TtsProvider["type"] = "system"): TtsProvider {
+  if (type === "openai") {
+    return {
+      type,
+      id: id(),
+      name: "OpenAI TTS",
+      apiKey: "",
+      baseUrl: "https://api.openai.com/v1",
+      model: "gpt-4o-mini-tts",
+      voice: "alloy",
+    };
+  }
+  if (type === "gemini") {
+    return {
+      type,
+      id: id(),
+      name: "Gemini TTS",
+      apiKey: "",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      model: "gemini-2.5-flash-preview-tts",
+      voiceName: "Kore",
+    };
+  }
+  if (type === "minimax") {
+    return {
+      type,
+      id: id(),
+      name: "MiniMax TTS",
+      apiKey: "",
+      baseUrl: "https://api.minimaxi.com/v1",
+      model: "speech-2.6-turbo",
+      voiceId: "female-shaonv",
+      // Empty string == "自动" in the UI dropdown == omit the `emotion` field entirely from
+      // the request body so MiniMax picks an emotion based on the text. Switching the default
+      // from "calm" to auto matches Android's default behavior on the Kotlin side.
+      emotion: "",
+      speed: 1,
+    };
+  }
+  if (type === "qwen") {
+    return {
+      type,
+      id: id(),
+      name: "Qwen TTS",
+      apiKey: "",
+      baseUrl: "https://dashscope.aliyuncs.com/api/v1",
+      model: "qwen3-tts-flash",
+      voice: "Cherry",
+      languageType: "Auto",
+    };
+  }
+  if (type === "groq") {
+    return {
+      type,
+      id: id(),
+      name: "Groq TTS",
+      apiKey: "",
+      baseUrl: "https://api.groq.com/openai/v1",
+      model: "canopylabs/orpheus-v1-english",
+      voice: "austin",
+    };
+  }
+  if (type === "xai") {
+    return {
+      type,
+      id: id(),
+      name: "xAI TTS",
+      apiKey: "",
+      baseUrl: "https://api.x.ai/v1",
+      voiceId: "eve",
+      language: "auto",
+    };
+  }
+  if (type === "mimo") {
+    return {
+      type,
+      id: id(),
+      name: "MiMo TTS",
+      apiKey: "",
+      baseUrl: "https://api.xiaomimimo.com/v1",
+      model: "mimo-v2-tts",
+      voice: "mimo_default",
+    };
+  }
+  return {
+    type: "system",
+    id: DEFAULT_SYSTEM_TTS_ID,
+    name: "System TTS",
+    apiKey: "",
+    baseUrl: "",
+    speechRate: 1,
+    pitch: 1,
+  };
+}
+
+function defaultTtsProviders(): TtsProvider[] {
+  return [
+    defaultTtsProvider("system"),
+  ];
+}
+
+function normalizeAsrProviders(value: unknown): AsrProvider[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(isRecord)
+    .map((item) => {
+      const type = ["dashscope", "volcengine", "openai_realtime"].includes(String(item.type))
+        ? String(item.type) as AsrProvider["type"]
+        : "openai_realtime";
+      const base = defaultAsrProvider(type);
+      return {
+        ...base,
+        ...item,
+        type,
+        id: String(item.id ?? base.id),
+        name: String(item.name ?? base.name),
+        apiKey: String(item.apiKey ?? ""),
+        websocketUrl: String(item.websocketUrl ?? base.websocketUrl),
+      };
+    });
+}
+
+function normalizeTtsProviders(value: unknown): TtsProvider[] {
+  const defaults = defaultTtsProviders();
+  const raw = Array.isArray(value) ? value.filter(isRecord) : [];
+  const normalized = raw.map((item) => {
+    const type = ["system", "openai", "gemini", "minimax", "qwen", "groq", "xai", "mimo"].includes(String(item.type))
+      ? String(item.type) as TtsProvider["type"]
+      : "system";
+    const base = defaultTtsProvider(type);
+    return {
+      ...base,
+      ...item,
+      type,
+      id: String(item.id ?? base.id),
+      name: String(item.name ?? base.name),
+      apiKey: String(item.apiKey ?? ""),
+      baseUrl: String(item.baseUrl ?? base.baseUrl),
+    };
+  });
+  return mergeById(normalized, defaults);
+}
+
+// 1.2.6 会话迁移标记。写入 state.json.appliedMigrations 后,conversations 不再落进
+// state.json(瘦身),活库成为会话唯一来源。
+// ⚠️ 这两个声明必须在 `let state = loadState()`(下方)之前——loadState 会赋值
+// conversationsDb、读 CONVERSATIONS_SQLITE_MIGRATION。let/const 不提升(有 TDZ),
+// 放在 loadState 调用之后会触发 ReferenceError: Cannot access ... before initialization。
+const CONVERSATIONS_SQLITE_MIGRATION = "conversations-sqlite-1.2.6";
+let conversationsDb: InstanceType<typeof Database> | null = null;
+
+function loadState(): State {
+  mkdirSync(filesDir, { recursive: true });
+  mkdirSync(skillsDir, { recursive: true });
+  // 1.2.6:会话从 state.json 迁入 SQLite 活库(rikka_hub.db)。state.json 瘦身后只保留
+  // settings/files/images/memories/stats 等非会话状态;conversations 启动时从活库读。
+  conversationsDb = openConversationsDb();
+
+  // 读 state.json(旧版含 conversations / 新版瘦身 / 不存在)
+  let parsed: Partial<State>;
+  if (!existsSync(statePath)) {
+    parsed = defaultState();
+  } else {
+    try {
+      parsed = JSON.parse(readFileSync(statePath, "utf8")) as Partial<State>;
+    } catch (err) {
+      // state.json 损坏:尝试 pre-sqlite 备份;都没有则默认状态。
+      console.error("[loadState] state.json 解析失败,尝试 pre-sqlite.bak", err);
+      const bakPath = join(dataDir, "state.json.pre-sqlite.bak");
+      try {
+        parsed = existsSync(bakPath)
+          ? (JSON.parse(readFileSync(bakPath, "utf8")) as Partial<State>)
+          : defaultState();
+      } catch (err2) {
+        console.error("[loadState] pre-sqlite.bak 也失败,用默认状态", err2);
+        parsed = defaultState();
+      }
+    }
+  }
+
+  // 迁移 + 瘦身(首次升级)。返回 true=从活库读;false=迁移失败,本次用 parsed.conversations。
+  const migrated = migrateConversationsIfNeeded(parsed);
+
+  const conversations = migrated
+    ? loadConversationsFromDbWithFallback()
+    : (Array.isArray(parsed.conversations) ? parsed.conversations : []);
+
+  const state = normalizeState(parsed);
+  state.conversations = conversations;
+  return state;
+}
+
+function mergeById<T extends { id: string }>(current: T[], defaults: T[]): T[] {
+  const byId = new Set(current.map((item) => item.id));
+  return [...current, ...defaults.filter((item) => !byId.has(item.id))];
+}
+
+// Streaming path throttles disk writes: token deltas can arrive 30-50/s for fast providers, and
+// serializing+writing the full state on every chunk turns smooth streams into stutter. We coalesce
+// writes inside `touchStream` to ~5/s while still broadcasting every chunk to SSE clients in real
+// time. A final saveState() at end-of-generation makes the persisted state authoritative.
+let pendingThrottledSave: ReturnType<typeof setTimeout> | null = null;
+let lastSaveStateMs = 0;
+const STREAM_SAVE_INTERVAL_MS = 200;
+function scheduleThrottledSaveState() {
+  const now = Date.now();
+  const elapsed = now - lastSaveStateMs;
+  if (elapsed >= STREAM_SAVE_INTERVAL_MS) {
+    if (pendingThrottledSave) {
+      clearTimeout(pendingThrottledSave);
+      pendingThrottledSave = null;
+    }
+    saveState();
+    return;
+  }
+  if (pendingThrottledSave) return;
+  pendingThrottledSave = setTimeout(() => {
+    pendingThrottledSave = null;
+    saveState();
+  }, STREAM_SAVE_INTERVAL_MS - elapsed);
+}
+
+// Streaming clients receive a node_update per chunk. Since each update carries the full growing
+// MessageNode (cumulative text), naive per-chunk broadcasts turn into O(N^2) bytes over SSE and
+// browsers fall behind — the user sees "stuck then dump" instead of smooth streaming, and the stop
+// button feels laggy because old events keep flushing. We coalesce broadcasts to ~30 fps while
+// always flushing the final state at end-of-generation.
+const STREAM_BROADCAST_INTERVAL_MS = 33;
+const pendingBroadcasts = new Map<string, { conversation: Conversation; node: MessageNode; timer: ReturnType<typeof setTimeout> | null; lastFlush: number }>();
+function flushNodeBroadcast(key: string) {
+  const entry = pendingBroadcasts.get(key);
+  if (!entry) return;
+  if (entry.timer) {
+    clearTimeout(entry.timer);
+    entry.timer = null;
+  }
+  entry.lastFlush = Date.now();
+  broadcastNodeUpdateNow(entry.conversation, entry.node);
+}
+function scheduleNodeBroadcast(conversation: Conversation, node: MessageNode) {
+  const key = `${conversation.id}::${node.id}`;
+  const now = Date.now();
+  const existing = pendingBroadcasts.get(key);
+  if (!existing) {
+    pendingBroadcasts.set(key, { conversation, node, timer: null, lastFlush: now });
+    broadcastNodeUpdateNow(conversation, node);
+    return;
+  }
+  // Always keep the freshest references — the node object identity can stay but the parts mutate.
+  existing.conversation = conversation;
+  existing.node = node;
+  const elapsed = now - existing.lastFlush;
+  if (elapsed >= STREAM_BROADCAST_INTERVAL_MS) {
+    flushNodeBroadcast(key);
+    return;
+  }
+  if (existing.timer) return;
+  existing.timer = setTimeout(() => flushNodeBroadcast(key), STREAM_BROADCAST_INTERVAL_MS - elapsed);
+}
+function clearNodeBroadcast(conversation: Conversation, node: MessageNode) {
+  const key = `${conversation.id}::${node.id}`;
+  const entry = pendingBroadcasts.get(key);
+  if (!entry) return;
+  if (entry.timer) clearTimeout(entry.timer);
+  pendingBroadcasts.delete(key);
+}
+
+// === Effective proxy resolution ============================================================
+// Two-tier model so non-technical users get zero-config behavior, while power users keep full
+// control via 设置 → 代理:
+//
+//   1. If the user filled in `settings.proxyConfig.url` → use it verbatim (with optional
+//      basic-auth credentials composed into the URL).
+//   2. Otherwise, read Windows registry (HKCU\…\Internet Settings\ProxyServer) the same way
+//      browsers and Clash/V2Ray "规则代理 / 系统代理" mode set it. This is the path that
+//      "just works" for users who have a proxy tool running.
+//
+// The result is mirrored into `HTTPS_PROXY`/`HTTP_PROXY` env vars because Bun's `fetch()`
+// reads those dynamically — so every LLM / search / MCP request picks up the proxy. We
+// refresh every 10 s so toggling Clash on/off propagates without restarting the app.
+
+const SYSTEM_PROXY_REFRESH_MS = 10_000;
+const USER_SET_HTTPS_PROXY = process.env.HTTPS_PROXY?.trim();
+const USER_SET_HTTP_PROXY = process.env.HTTP_PROXY?.trim();
+const USER_SET_NO_PROXY = process.env.NO_PROXY?.trim();
+let lastAppliedEffectiveProxy: string | undefined;
+let lastDetectedSystemProxy: string | undefined;
+
+function parseProxyServerValue(value: string): string | undefined {
+  if (!value) return undefined;
+  // `ProxyServer` can be either a single endpoint ("127.0.0.1:7890") or per-protocol
+  // ("http=127.0.0.1:7890;https=127.0.0.1:7891;ftp=..."). Prefer the https= variant for
+  // outbound API calls; fall back to http= or the bare endpoint.
+  if (value.includes("=")) {
+    const map = new Map<string, string>();
+    for (const piece of value.split(";")) {
+      const [k, v] = piece.split("=");
+      if (k && v) map.set(k.trim().toLowerCase(), v.trim());
+    }
+    const target = map.get("https") ?? map.get("http") ?? map.get("socks");
+    if (!target) return undefined;
+    return /^https?:\/\//i.test(target) ? target : `http://${target}`;
+  }
+  return /^https?:\/\//i.test(value) ? value : `http://${value}`;
+}
+
+function readWindowsSystemProxy(): string | undefined {
+  if (process.platform !== "win32") return undefined;
+  try {
+    const key = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+    const enableProc = Bun.spawnSync(["reg", "query", key, "/v", "ProxyEnable"]);
+    if (enableProc.exitCode !== 0) return undefined;
+    const enableOut = new TextDecoder().decode(enableProc.stdout ?? new Uint8Array());
+    if (!/ProxyEnable\s+REG_DWORD\s+0x1/i.test(enableOut)) return undefined;
+    const serverProc = Bun.spawnSync(["reg", "query", key, "/v", "ProxyServer"]);
+    if (serverProc.exitCode !== 0) return undefined;
+    const serverOut = new TextDecoder().decode(serverProc.stdout ?? new Uint8Array());
+    const match = serverOut.match(/ProxyServer\s+REG_SZ\s+([^\r\n]+)/i);
+    if (!match) return undefined;
+    return parseProxyServerValue(match[1].trim());
+  } catch {
+    return undefined;
+  }
+}
+
+function composeProxyUrl(base: string, username: string, password: string): string {
+  const trimmed = base.trim();
+  if (!trimmed) return "";
+  if (!username && !password) return trimmed;
+  try {
+    const url = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`);
+    // The WHATWG URL setter encodes the value itself — don't pre-encode or we end up
+    // double-escaping characters like "@" in `user@example.com` into "user%2540example.com".
+    if (username) url.username = username;
+    if (password) url.password = password;
+    return url.toString();
+  } catch {
+    return trimmed;
+  }
+}
+
+function resolveEffectiveProxy(): { url: string | undefined; source: "manual" | "system" | "none" } {
+  const cfg = state?.settings?.proxyConfig;
+  const manual = cfg?.url?.trim();
+  if (manual) {
+    return { url: composeProxyUrl(manual, cfg!.username ?? "", cfg!.password ?? ""), source: "manual" };
+  }
+  const system = readWindowsSystemProxy();
+  lastDetectedSystemProxy = system;
+  if (system) return { url: system, source: "system" };
+  return { url: undefined, source: "none" };
+}
+
+function applyEffectiveProxy() {
+  const { url, source } = resolveEffectiveProxy();
+  if (url === lastAppliedEffectiveProxy) return;
+  lastAppliedEffectiveProxy = url;
+  if (!USER_SET_HTTPS_PROXY) {
+    if (url) process.env.HTTPS_PROXY = url;
+    else delete process.env.HTTPS_PROXY;
+  }
+  if (!USER_SET_HTTP_PROXY) {
+    if (url) process.env.HTTP_PROXY = url;
+    else delete process.env.HTTP_PROXY;
+  }
+  if (!USER_SET_NO_PROXY) {
+    // localhost/loopback must always bypass — the sidecar's own webview and smoke tests
+    // talk to 127.0.0.1 and would otherwise loop through the proxy.
+    process.env.NO_PROXY = "localhost,127.0.0.1,::1";
+  }
+  console.log(url ? `[proxy] ${source}: ${redactProxyForLog(url)}` : "[proxy] direct (no proxy)");
+}
+
+function redactProxyForLog(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.password) parsed.password = "***";
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+function proxyStatusPayload() {
+  const { url, source } = resolveEffectiveProxy();
+  // Strip credentials from the URL we send back to the UI — the UI shows the username/password
+  // fields separately, no need to echo them in the "active proxy" footer.
+  let displayUrl: string | undefined;
+  if (url) {
+    try {
+      const parsed = new URL(url);
+      parsed.username = "";
+      parsed.password = "";
+      displayUrl = parsed.toString().replace(/\/$/, "");
+    } catch {
+      displayUrl = url;
+    }
+  }
+  return {
+    activeUrl: displayUrl ?? null,
+    source, // "manual" | "system" | "none"
+    detectedSystemProxy: lastDetectedSystemProxy ?? null,
+  };
+}
+
+let state = loadState();
+state.launchCount += 1;
+
+applyEffectiveProxy();
+setInterval(applyEffectiveProxy, SYSTEM_PROXY_REFRESH_MS).unref();
+
+
+
+// Async write queue — serializes saves so two callers can't race the temp-file rename
+// dance, but each write is non-blocking on the event loop so other HTTP handlers (image
+// fetches, conversation GETs, streaming SSE) can continue while disk I/O is in flight.
+// Before this change, `saveState()` was fully synchronous (writeFileSync + busy-wait retry
+// + pretty-printed JSON.stringify of the entire state). On a state.json grown into the
+// 100+ MB range after an Android backup import, a single save would block the event loop
+// for seconds — every concurrent request queued behind it, eventually tripping ky's 30 s
+// timeout. The user-visible symptom: a streaming reply freezes, then ALL conversation
+// GETs fail with "Request timed out" and the app becomes unusable until restart.
+let activeSaveStatePromise: Promise<void> | null = null;
+let coalescedSaveRequested = false;
+
+async function performStateSave(): Promise<void> {
+  lastSaveStateMs = Date.now();
+  mkdirSync(dataDir, { recursive: true });
+  // No pretty-printing — state.json is read by the server, not humans. On a large state
+  // (post-import), the indentation alone can double serialize CPU cost.
+  // logs 是内存态运行时缓冲(对齐移动端,重启清空),不写入 state.json。
+  // JSON.stringify 对值为 undefined 的属性会省略键,故 logs 不会落盘。
+  // conversations:仅当迁移标记(conversations-sqlite-1.2.6)已写时才排除——此时活库是
+  // 权威源,state.json 瘦身。迁移未完成时必须保留 conversations,确保 state.json 始终是
+  // 合法的重试源:若迁移失败后这里把会话抹空,下次启动 parsed.conversations 为空、活库也空,
+  // 会话永久丢失(详见 migrateConversationsIfNeeded 的方案 B 兜底)。
+  const convSqliteMigrated = Array.isArray(state.appliedMigrations)
+    && state.appliedMigrations.includes(CONVERSATIONS_SQLITE_MIGRATION);
+  const content = JSON.stringify({
+    ...state,
+    logs: undefined,
+    ...(convSqliteMigrated ? { conversations: undefined } : {}),
+  });
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const tempPath = `${statePath}.${process.pid}.${Date.now()}.${attempt}.tmp`;
+    try {
+      // Bun.write is non-blocking — yields to the event loop while the OS does the I/O.
+      await Bun.write(tempPath, content);
+      // fs.promises.rename is also non-blocking. The atomic temp-then-rename pattern
+      // protects against torn writes if the process is killed mid-save.
+      await fsPromises.rename(tempPath, statePath);
+      return;
+    } catch (errorValue) {
+      lastError = errorValue;
+      try { await fsPromises.unlink(tempPath); } catch { /* cleanup best-effort */ }
+      // Backoff via setTimeout/await rather than busy-wait — frees the event loop during
+      // the retry delay. Windows occasionally holds locks on state.json briefly (e.g.
+      // virus scanners), so the retries are still worth keeping.
+      await new Promise<void>((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+    }
+  }
+  try {
+    await Bun.write(statePath, content);
+  } catch {
+    try { await Bun.write(`${statePath}.recovery-${Date.now()}.json`, content); } catch { /* last-ditch */ }
+    console.warn("Failed to save state", lastError);
+  }
+}
+
+function saveState(): void {
+  // Cancel any pending throttled save — its work is about to be done by this call.
+  if (pendingThrottledSave) {
+    clearTimeout(pendingThrottledSave);
+    pendingThrottledSave = null;
+  }
+  // If a save is already in flight, mark that another save is needed; it'll run when
+  // the current one completes. Coalesces a burst of saves into at most two writes
+  // (current + one trailing) instead of N synchronous serializations.
+  if (activeSaveStatePromise) {
+    coalescedSaveRequested = true;
+    return;
+  }
+  const run = async (): Promise<void> => {
+    try {
+      await performStateSave();
+    } finally {
+      if (coalescedSaveRequested) {
+        coalescedSaveRequested = false;
+        // Snapshot the latest state — performStateSave reads `state` at call time, so
+        // re-running it will pick up any changes that landed during the previous write.
+        activeSaveStatePromise = run();
+      } else {
+        activeSaveStatePromise = null;
+      }
+    }
+  };
+  activeSaveStatePromise = run();
+  // Surface unhandled rejections to the console rather than crashing the process —
+  // every saveState call is treated as fire-and-forget by the existing call sites.
+  activeSaveStatePromise.catch((err) => console.warn("saveState failed", err));
+}
+
+/** Used by graceful shutdown paths to ensure the final write completes on disk. */
+async function flushSaveState(): Promise<void> {
+  if (activeSaveStatePromise) {
+    try { await activeSaveStatePromise; } catch { /* already logged */ }
+  }
+}
+
+// 顶层启动写盘：必须放在 activeSaveStatePromise / coalescedSaveRequested 这些 let
+// 声明之后调用，否则会撞 TDZ 触发模块加载时的 ReferenceError，导致服务直接起不来。
+saveState();
+
+function classifyRequestGroup(kind: string, toolName: string): string {
+  if (kind.startsWith("mcp:")) return "MCP 请求";
+  if (kind.startsWith("search:") || kind.startsWith("tool:search") || kind.startsWith("tool:scrape") || toolName === "search_web" || toolName === "scrape_web") return "搜索引擎请求";
+  return "模型请求";
+}
+
+function defaultRequestStats(): RequestStats {
+  return { totalRequests: 0, failedRequests: 0, byProvider: {}, byGroup: {} };
+}
+
+// 把一条请求日志的计数累加进 stats(既用于实时累加,也用于老用户一次性迁移)。
+function bumpStatsCounters(stats: RequestStats, log: { ok: boolean; providerName: string; kind?: string; toolName?: string }): void {
+  stats.totalRequests += 1;
+  if (!log.ok) stats.failedRequests += 1;
+  const prov = stats.byProvider[log.providerName] ?? { ok: 0, failed: 0 };
+  if (log.ok) prov.ok += 1; else prov.failed += 1;
+  stats.byProvider[log.providerName] = prov;
+  const group = classifyRequestGroup(String(log.kind ?? ""), String(log.toolName ?? ""));
+  const grp = stats.byGroup[group] ?? { ok: 0, failed: 0 };
+  if (log.ok) grp.ok += 1; else grp.failed += 1;
+  stats.byGroup[group] = grp;
+}
+
+// 老用户的 state.json 没有 stats 字段(统计以前藏在持久化 logs 里)。加载时把旧 logs
+// 的统计一次性累加进 stats —— 之后 logs 改内存态会丢弃,但累计统计得以保留,老用户重启
+// 后统计页不会归零。新版本已有 stats 字段时直接沿用,不重复迁移(避免双算)。
+function normalizeRequestStats(raw: unknown, legacyLogs: RequestLog[]): RequestStats {
+  if (isRecord(raw) && (typeof raw.totalRequests === "number" || isRecord(raw.byProvider) || isRecord(raw.byGroup))) {
+    const base = defaultRequestStats();
+    base.totalRequests = typeof raw.totalRequests === "number" ? raw.totalRequests : 0;
+    base.failedRequests = typeof raw.failedRequests === "number" ? raw.failedRequests : 0;
+    if (isRecord(raw.byProvider)) {
+      for (const [k, v] of Object.entries(raw.byProvider)) {
+        if (isRecord(v) && typeof v.ok === "number" && typeof v.failed === "number") base.byProvider[k] = { ok: v.ok, failed: v.failed };
+      }
+    }
+    if (isRecord(raw.byGroup)) {
+      for (const [k, v] of Object.entries(raw.byGroup)) {
+        if (isRecord(v) && typeof v.ok === "number" && typeof v.failed === "number") base.byGroup[k] = { ok: v.ok, failed: v.failed };
+      }
+    }
+    return base;
+  }
+  const migrated = defaultRequestStats();
+  for (const log of legacyLogs) bumpStatsCounters(migrated, log);
+  return migrated;
+}
+
+function addLog(input: Omit<RequestLog, "id" | "at">) {
+  bumpStatsCounters(state.stats, input);
+  state.logs.unshift({ id: id(), at: Date.now(), ...input });
+  state.logs = state.logs.slice(0, 100);
+  saveState();
+}
+
+const settingsClients = new Set<ReadableStreamDefaultController<Uint8Array>>();
+const listClients = new Set<ReadableStreamDefaultController<Uint8Array>>();
+const conversationClients = new Map<string, Set<ReadableStreamDefaultController<Uint8Array>>>();
+const encoder = new TextEncoder();
+
+function sseFrame(event: string, data: JsonValue | object) {
+  return encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+function openSse(
+  initial: () => Array<[string, JsonValue | object]>,
+  register: (controller: ReadableStreamDefaultController<Uint8Array>) => () => void,
+) {
+  let cleanup = () => {};
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      cleanup = register(controller);
+      for (const [event, payload] of initial()) {
+        controller.enqueue(sseFrame(event, payload));
+      }
+      const heartbeat = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(": heartbeat\n\n"));
+        } catch {
+          clearInterval(heartbeat);
+        }
+      }, 15000);
+      cleanup = ((old) => () => {
+        clearInterval(heartbeat);
+        old();
+      })(cleanup);
+    },
+    cancel() {
+      cleanup();
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
+}
+
+function broadcastSettings() {
+  for (const client of settingsClients) client.enqueue(sseFrame("update", state.settings));
+}
+
+function broadcastList() {
+  const payload = { type: "invalidate", assistantId: state.settings.assistantId, timestamp: Date.now() };
+  for (const client of listClients) client.enqueue(sseFrame("invalidate", payload));
+}
+
+function broadcastConversation(conversation: Conversation, event = "snapshot") {
+  const payload = {
+    type: "snapshot",
+    seq: Date.now(),
+    conversation: toConversationDto(conversation),
+    serverTime: Date.now(),
+  };
+  for (const client of conversationClients.get(conversation.id) ?? []) {
+    client.enqueue(sseFrame(event, payload));
+  }
+  broadcastList();
+}
+
+function broadcastNodeUpdateNow(conversation: Conversation, node: MessageNode) {
+  const payload = {
+    type: "node_update",
+    seq: Date.now(),
+    serverTime: Date.now(),
+    conversationId: conversation.id,
+    nodeId: node.id,
+    nodeIndex: conversation.messages.findIndex((item) => item.id === node.id),
+    node,
+    updateAt: conversation.updateAt,
+    isGenerating: generating.has(conversation.id),
+  };
+  for (const client of conversationClients.get(conversation.id) ?? []) {
+    client.enqueue(sseFrame("node_update", payload));
+  }
+  // NOTE: deliberately NOT calling broadcastList() here. This used to fire on every chunk
+  // during streaming (~30 times/sec via scheduleNodeBroadcast), which made the conversation
+  // list SSE issue an `invalidate` event 30x/sec, which made the frontend re-fetch
+  // `/api/conversations/p?offset=0&limit=30` 30x/sec. With Chrome's 6-connection-per-host
+  // limit, that storm was rapidly exhausting the frontend's HTTP connection pool, queuing
+  // any other request (including the conversation-detail GET) past ky's 30s timeout. That
+  // matches the user-reported "even fresh conversations stall" + "list also times out"
+  // pattern that the saveState-blocking fix alone couldn't explain.
+  //
+  // The conversation list only needs to refresh when the metadata it actually displays
+  // changes (title, isPinned, isGenerating-state-transition, last-message-preview). Per-
+  // chunk content updates don't change any of those. We now call broadcastList() at
+  // generation start (server.ts:10358), generation end (server.ts:9601), and on explicit
+  // mutations (rename, pin, delete) — not on every streamed chunk.
+}
+
+// Non-streaming call sites (final flush, tool approval, etc.) flush immediately so callers see
+// the authoritative state without delay. Streaming hot paths go through scheduleNodeBroadcast.
+function broadcastNodeUpdate(conversation: Conversation, node: MessageNode) {
+  clearNodeBroadcast(conversation, node);
+  broadcastNodeUpdateNow(conversation, node);
+}
+
+function abortConversationGeneration(conversationId: string) {
+  const wasGenerating = generating.has(conversationId);
+  generating.get(conversationId)?.abort();
+  generating.delete(conversationId);
+  // Mirror completeConversationGeneration: when the user manually stops generation,
+  // the sidebar's per-conversation streaming indicator also needs to flip off, and
+  // since broadcastNodeUpdateNow no longer calls broadcastList on every chunk we
+  // have to refresh the list explicitly here.
+  if (wasGenerating) broadcastList();
+  // 1.2.6:用户中止也要 reconcile 活库——abort 提前 delete 了 generating,后续
+  // completeConversationGeneration 的 if 会失败而跳过 reconcile,所以这里补一次全量
+  // persistConversation。流式中删会话(deleteConversationsById 先调本函数)时
+  // getConversation 仍返回会话(filter 删除在后),persist 后由 deletePcConversations 清掉,幂等无害。
+  flushConvDirtyNow();
+  const conv = getConversation(conversationId);
+  if (conv) persistConversation(conv);
+}
+
+function deleteConversationsById(ids: Set<string>) {
+  for (const conversationId of ids) {
+    abortConversationGeneration(conversationId);
+    conversationClients.delete(conversationId);
+  }
+  // 先删内存,再删活库——避免删活库后残余脏标记 flush 又把节点 upsert 回来
+  // (flushConvDirty 检查 state.conversations 存在性,内存没了就跳过)。
+  state.conversations = state.conversations.filter((item) => !ids.has(item.id));
+  deletePcConversations(Array.from(ids));
+  saveState();
+  broadcastList();
+}
+
+function json(data: JsonValue | object, init: ResponseInit = {}) {
+  return new Response(JSON.stringify(data), {
+    ...init,
+    headers: { "Content-Type": "application/json", ...(init.headers ?? {}) },
+  });
+}
+
+function error(message: string, status = 400) {
+  return json({ error: message, code: status }, { status });
+}
+
+async function readJson<T>(request: Request): Promise<T> {
+  if (request.headers.get("content-length") === "0") return {} as T;
+  return (await request.json().catch(() => ({}))) as T;
+}
+
+function findAssistant(idValue = state.settings.assistantId) {
+  return state.settings.assistants.find((assistant) => assistant.id === idValue) ?? state.settings.assistants[0];
+}
+
+function findModel(modelId: string | null | undefined) {
+  const wanted = modelId || state.settings.chatModelId;
+  for (const provider of state.settings.providers) {
+    const modelItem = provider.models.find((item) => item.id === wanted || item.modelId === wanted);
+    if (modelItem) {
+      // Per-model provider override: if this model carries a `providerOverwrite` object,
+      // it replaces the parent provider entirely for outbound requests (baseUrl, apiKey,
+      // type, etc.). Mirrors Android's `Model.findProvider()` (PreferencesStore.kt:648):
+      //   if (providerOverwrite != null) return providerOverwrite.copyProvider(models=[])
+      // We spread the override on top of the parent so any fields the override omits
+      // (like `enabled`, `id`, `testPassed`) fall through to the parent — these are
+      // bookkeeping fields the override doesn't need to redefine. `models: []` is also
+      // forced because the override carries its own (irrelevant) model list in Android;
+      // we use the parent's `modelItem` regardless.
+      const overwrite = (modelItem as { providerOverwrite?: Partial<Provider> | null }).providerOverwrite;
+      if (overwrite && typeof overwrite === "object" && overwrite.type) {
+        const effectiveProvider = { ...provider, ...overwrite, id: provider.id, models: [] } as Provider;
+        return { provider: effectiveProvider, model: modelItem };
+      }
+      return { provider, model: modelItem };
+    }
+  }
+  return { provider: state.settings.providers.find((item) => item.enabled) ?? state.settings.providers[0], model: model("auto", "Auto") };
+}
+
+function toConversationDto(conversation: Conversation) {
+  return { ...conversation, isGenerating: generating.has(conversation.id) };
+}
+
+function toListDto(conversation: Conversation) {
+  return {
+    id: conversation.id,
+    assistantId: conversation.assistantId,
+    title: conversation.title,
+    isPinned: conversation.isPinned,
+    createAt: conversation.createAt,
+    updateAt: conversation.updateAt,
+    isGenerating: generating.has(conversation.id),
+  };
+}
+
+function getConversation(idValue: string) {
+  return state.conversations.find((conversation) => conversation.id === idValue);
+}
+
+function ensureConversation(idValue: string) {
+  let conversation = getConversation(idValue);
+  if (!conversation) {
+    const now = Date.now();
+    const assistant = findAssistant(state.settings.assistantId);
+    conversation = {
+      id: idValue,
+      assistantId: assistant.id,
+      systemPrompt: null,
+      title: "",
+      messages: presetMessageNodes(assistant),
+      truncateIndex: -1,
+      chatSuggestions: [],
+      isPinned: false,
+      createAt: now,
+      updateAt: now,
+    };
+    state.conversations.unshift(conversation);
+    // 1.2.6:新建会话 persist 进活库(建会话行),否则后续流式 upsert 该会话的节点时
+    // FK 失败(pc_message_node.conversation_id 引用 pc_conversation.id),且流式中崩溃
+    // 会丢会话行。
+    persistConversation(conversation);
+  }
+  return conversation;
+}
+
+function roleFromPreset(value: unknown): Message["role"] {
+  const role = String(value ?? "USER").toUpperCase();
+  if (role === "ASSISTANT" || role === "SYSTEM" || role === "TOOL") return role;
+  return "USER";
+}
+
+function partsFromPreset(value: unknown): JsonValue[] {
+  if (Array.isArray(value)) return value as JsonValue[];
+  if (typeof value === "string") return [{ type: "text", text: value }];
+  if (isRecord(value) && Array.isArray(value.parts)) return value.parts;
+  if (isRecord(value) && typeof value.content === "string") return [{ type: "text", text: value.content }];
+  return [];
+}
+
+function presetMessageNodes(assistant: Assistant): MessageNode[] {
+  return (Array.isArray(assistant.presetMessages) ? assistant.presetMessages : [])
+    .map((preset) => {
+      if (!isRecord(preset)) return null;
+      const msg = message(roleFromPreset(preset.role), partsFromPreset(preset), String(preset.modelId ?? "") || null);
+      if (typeof preset.id === "string") msg.id = preset.id;
+      if (typeof preset.createdAt === "string") msg.createdAt = preset.createdAt;
+      if (typeof preset.finishedAt === "string" || preset.finishedAt === null) msg.finishedAt = preset.finishedAt as string | null;
+      return { id: id(), messages: [msg], selectIndex: 0 };
+    })
+    .filter(Boolean) as MessageNode[];
+}
+
+function message(role: Message["role"], parts: JsonValue[], modelId: string | null = null): Message {
+  const now = new Date().toISOString();
+  return {
+    id: id(),
+    role,
+    parts,
+    annotations: [],
+    createdAt: now,
+    finishedAt: role === "ASSISTANT" ? now : null,
+    modelId,
+    usage: null,
+    translation: null,
+  };
+}
+
+function finishMessage(msg: Message, parts: JsonValue[], usage: JsonValue | null = msg.usage) {
+  msg.parts = parts;
+  msg.finishedAt = new Date().toISOString();
+  msg.usage = usage;
+}
+
+function appendTextPart(msg: Message, text: string) {
+  const last = msg.parts[msg.parts.length - 1];
+  if (last && typeof last === "object" && !Array.isArray(last) && last.type === "text") {
+    last.text = String(last.text ?? "") + text;
+  } else {
+    msg.parts.push({ type: "text", text });
+  }
+}
+
+function applyThinkTagTransform(msg: Message) {
+  if (msg.role !== "ASSISTANT") return;
+  const now = new Date().toISOString();
+  const transformed: JsonValue[] = [];
+  const thinkRegex = /<think>([\s\S]*?)(?:<\/think>|$)/gi;
+  for (const part of msg.parts) {
+    if (!isRecord(part) || part.type !== "text") {
+      transformed.push(part);
+      continue;
+    }
+    const text = String(part.text ?? "");
+    if (!/<think>/i.test(text)) {
+      transformed.push(part);
+      continue;
+    }
+    let reasoning = "";
+    const stripped = text.replace(thinkRegex, (_match, capture) => {
+      reasoning += `${reasoning ? "\n" : ""}${String(capture ?? "").trim()}`;
+      return "";
+    }).replace(/<\/think>/gi, "");
+    if (reasoning.trim()) {
+      transformed.push({
+        type: "reasoning",
+        reasoning: reasoning.trim(),
+        createdAt: msg.createdAt,
+        finishedAt: now,
+      });
+    }
+    if (stripped.trim()) transformed.push({ ...part, text: stripped });
+  }
+  msg.parts = transformed;
+}
+
+function regexScopes(value: unknown) {
+  return new Set(getStringArray(value).map((item) => item.toUpperCase()));
+}
+
+function activeRegexesForScope(assistant: Assistant, scope: "USER" | "ASSISTANT") {
+  return Array.isArray(assistant.regexes)
+    ? assistant.regexes.filter((regex) =>
+        isRecord(regex) &&
+        regex.enabled !== false &&
+        regex.visualOnly !== true &&
+        regexScopes(regex.affectingScope).has(scope) &&
+        String(regex.findRegex ?? "").trim(),
+      )
+    : [];
+}
+
+function applyRegexesToText(text: string, regexes: JsonValue[]) {
+  let value = text;
+  for (const regex of regexes) {
+    if (!isRecord(regex)) continue;
+    try {
+      value = value.replace(new RegExp(String(regex.findRegex ?? ""), "g"), String(regex.replaceString ?? ""));
+    } catch {
+      // Match Android's fault tolerance: invalid regex leaves content unchanged.
+    }
+  }
+  return value;
+}
+
+function applyInputRegexTransformParts(parts: JsonValue[], assistant: Assistant) {
+  const activeRegexes = activeRegexesForScope(assistant, "USER");
+  if (activeRegexes.length === 0) return parts;
+  return parts.map((part) =>
+    isRecord(part) && part.type === "text"
+      ? { ...part, text: applyRegexesToText(String(part.text ?? ""), activeRegexes) }
+      : part,
+  );
+}
+
+function applyRegexOutputTransform(msg: Message, assistant: Assistant) {
+  if (msg.role !== "ASSISTANT" || !Array.isArray(assistant.regexes) || assistant.regexes.length === 0) return;
+  const activeRegexes = activeRegexesForScope(assistant, "ASSISTANT");
+  if (activeRegexes.length === 0) return;
+  msg.parts = msg.parts.map((part) => {
+    if (!isRecord(part) || (part.type !== "text" && part.type !== "reasoning")) return part;
+    const key = part.type === "reasoning" ? "reasoning" : "text";
+    return { ...part, [key]: applyRegexesToText(String(part[key] ?? ""), activeRegexes) };
+  });
+}
+
+function applyOutputTransforms(msg: Message, assistant: Assistant) {
+  applyThinkTagTransform(msg);
+  applyRegexOutputTransform(msg, assistant);
+}
+
+function hasTextPart(msg: Message, marker: string) {
+  return msg.parts.some((part) =>
+    part && typeof part === "object" && !Array.isArray(part) && part.type === "text" && String(part.text ?? "").includes(marker)
+  );
+}
+
+function imageParts(parts: JsonValue[]) {
+  return parts.filter((part): part is Record<string, JsonValue> =>
+    !!part && typeof part === "object" && !Array.isArray(part) && part.type === "image" && typeof part.url === "string"
+  );
+}
+
+function setMessageLoading(msg: Message, label = "正在生成回复") {
+  if (msg.parts.length > 0) return;
+  msg.parts = [{ type: "loading", label }];
+}
+
+function finishReasoningParts(msg: Message) {
+  const now = new Date().toISOString();
+  msg.parts = msg.parts.map((part) => {
+    if (part && typeof part === "object" && !Array.isArray(part) && part.type === "reasoning" && !part.finishedAt) {
+      return { ...part, finishedAt: now };
+    }
+    return part;
+  });
+}
+
+function hasOpenReasoningPart(msg: Message) {
+  return msg.parts.some((part) =>
+    part && typeof part === "object" && !Array.isArray(part) && part.type === "reasoning" && !part.finishedAt
+  );
+}
+
+function replaceLoadingReasoningWithTool(msg: Message, toolPart: JsonValue) {
+  markStreamFirstContent(msg);
+  msg.parts = msg.parts.filter((part) => !(
+    part &&
+    typeof part === "object" &&
+    !Array.isArray(part) &&
+    (part.type === "loading" || (part.type === "reasoning" && part.reasoning === "正在生成回复"))
+  ));
+  msg.parts.push(toolPart);
+}
+
+function textFromParts(parts: JsonValue[]) {
+  return parts
+    .map((part) => {
+      if (part && typeof part === "object" && !Array.isArray(part) && part.type === "text") return String(part.text ?? "");
+      return "";
+    })
+    .join("\n")
+    .trim();
+}
+
+function formatLocalDate(date = new Date()) {
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "full" }).format(date);
+}
+
+function formatLocalTime(date = new Date()) {
+  return new Intl.DateTimeFormat(undefined, { timeStyle: "medium" }).format(date);
+}
+
+function renderTemplate(template: string, variables: Record<string, string>) {
+  return template.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (match, key) => variables[key] ?? match);
+}
+
+function applyPlaceholders(template: string, variables: Record<string, string>) {
+  return template
+    .replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (match, key) => variables[key] ?? match)
+    .replace(/\{\s*([a-zA-Z0-9_]+)\s*\}/g, (match, key) => variables[key] ?? match);
+}
+
+function localeDisplayName() {
+  const locale = Intl.DateTimeFormat().resolvedOptions().locale;
+  try {
+    return new Intl.DisplayNames([locale], { type: "language" }).of(locale.split("-")[0]) ?? locale;
+  } catch {
+    return locale;
+  }
+}
+
+function summaryAsText(msg: Message) {
+  return `[${msg.role}]: ${textFromParts(msg.parts)}`;
+}
+
+function selectedConversationMessages(conversation: Conversation) {
+  return conversation.messages
+    .map((node) => node.messages[node.selectIndex] ?? node.messages[0])
+    .filter(Boolean);
+}
+
+function estimateTokens(text: string) {
+  const cjk = (text.match(/[\u3400-\u9fff]/g) ?? []).length;
+  const other = Math.max(0, text.length - cjk);
+  return Math.max(1, Math.ceil(cjk * 0.9 + other / 4));
+}
+
+function estimatePromptTokensForConversation(conversation: Conversation) {
+  return selectedConversationMessages(conversation)
+    .filter((msg) => msg.role !== "ASSISTANT")
+    .reduce((sum, msg) => sum + estimateTokens(textFromParts(msg.parts)), 0);
+}
+
+function ensureUsage(msg: Message, conversation?: Conversation) {
+  const existing = msg.usage;
+  if (existing && typeof existing === "object" && !Array.isArray(existing)) return;
+  const completionTokens = estimateTokens(textFromParts(msg.parts) || reasoningFromParts(msg.parts));
+  const promptTokens = conversation ? estimatePromptTokensForConversation(conversation) : 0;
+  msg.usage = {
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    cachedTokens: 0,
+    estimated: true,
+  };
+  fillContextLimit(msg);
+}
+
+function toolApprovalType(part: JsonValue) {
+  return isRecord(part) && isRecord(part.approvalState) ? String(part.approvalState.type ?? "auto") : "auto";
+}
+
+function hasToolParts(msg: Message) {
+  return msg.parts.some((part) => isRecord(part) && part.type === "tool");
+}
+
+function hasPendingToolApproval(msg: Message) {
+  return msg.parts.some((part) => isRecord(part) && part.type === "tool" && toolApprovalType(part) === "pending");
+}
+
+function canResumeToolExecution(part: JsonValue) {
+  const type = toolApprovalType(part);
+  return type === "approved" || type === "denied" || type === "answered";
+}
+
+function hasResumableToolParts(msg: Message) {
+  return msg.parts.some((part) =>
+    isRecord(part) &&
+    part.type === "tool" &&
+    (!Array.isArray(part.output) || part.output.length === 0) &&
+    canResumeToolExecution(part)
+  );
+}
+
+// 把上一条 ASSISTANT 消息里所有处于 pending 状态的工具（典型场景：ask_user
+// 没等用户点选项，用户直接发了下一条消息或要求重生成）标记为"用户已取消"，
+// 让本轮生成能干净地接续——对齐安卓 commit 05c12488 的 finishInterruptedPendingTools。
+// 返回 true 表示发生了修改，调用方需要广播状态变更。
+function finishInterruptedPendingToolsInConversation(conversation: Conversation): boolean {
+  const lastNode = conversation.messages[conversation.messages.length - 1];
+  if (!lastNode) return false;
+  const lastMessage = lastNode.messages[lastNode.selectIndex] ?? lastNode.messages[0];
+  if (!lastMessage || lastMessage.role !== "ASSISTANT") return false;
+  let changed = false;
+  lastMessage.parts = lastMessage.parts.map((part) => {
+    if (!isRecord(part) || part.type !== "tool") return part;
+    if (toolApprovalType(part) !== "pending") return part;
+    changed = true;
+    return {
+      ...part,
+      approvalState: {
+        type: "denied",
+        reason: "User cancelled by sending a new message",
+      },
+      output: Array.isArray(part.output) && part.output.length > 0 ? part.output : [
+        { type: "text", text: "Tool execution cancelled by user (new message sent)." },
+      ],
+    };
+  });
+  if (!changed) return false;
+  if (!lastMessage.finishedAt) lastMessage.finishedAt = new Date().toISOString();
+  // 清理 loading 占位符（如果旧 generation 留下了）
+  lastMessage.parts = lastMessage.parts.filter((part) =>
+    !(isRecord(part) && part.type === "loading"),
+  );
+  return true;
+}
+
+function templateVariables(messageText: string, role: string, assistant: Assistant, modelItem: Model) {
+  const now = new Date();
+  const display = state.settings.displaySetting;
+  const user = String(display.userNickname ?? "").trim() || "User";
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const locale = Intl.DateTimeFormat().resolvedOptions().locale;
+  return {
+    message: messageText,
+    role,
+    time: formatLocalTime(now),
+    date: formatLocalDate(now),
+    cur_time: formatLocalTime(now),
+    cur_date: formatLocalDate(now),
+    cur_datetime: new Intl.DateTimeFormat(undefined, { dateStyle: "full", timeStyle: "medium" }).format(now),
+    timezone,
+    locale,
+    user,
+    nickname: user,
+    char: assistant.name?.trim() || "Assistant",
+    model_id: modelItem.modelId,
+    model_name: modelItem.displayName?.trim() || modelItem.modelId,
+    system_version: `${osType()} PC (${process.platform})`,
+    device_info: "RikkaHub PC",
+    battery_level: "unknown",
+  };
+}
+
+function renderAssistantMessageTemplate(template: string, messageText: string, role: string) {
+  const variables = {
+    message: messageText,
+    role: role.toLowerCase(),
+    time: formatLocalTime(new Date()),
+    date: formatLocalDate(new Date()),
+  };
+  return renderTemplate(template || "{{ message }}", variables);
+}
+
+function transformedTextPart(part: JsonValue, text: string): JsonValue {
+  return isRecord(part) ? { ...part, text } : part;
+}
+
+function applyMessageTemplateToParts(parts: JsonValue[], role: string, template: string) {
+  return parts.map((part) => {
+    if (!isRecord(part) || part.type !== "text") return part;
+    return transformedTextPart(part, renderAssistantMessageTemplate(template, String(part.text ?? ""), role));
+  });
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function dateKey(timestamp: number | string) {
+  return formatKeyLocal(new Date(timestamp));
+}
+
+function formatKeyLocal(date: Date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function computeStats() {
+  const daily = new Map<string, DailyStat>();
+  let userMessages = 0;
+  let assistantMessages = 0;
+  let characters = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  const models = new Map<string, { id: string; name: string; providerName: string; count: number }>();
+  const requestGroups = new Map<string, { ok: number; failed: number }>();
+  const providers = new Map<string, { ok: number; failed: number }>();
+  const modelLookup = new Map<string, { name: string; providerName: string }>();
+  for (const provider of state.settings.providers) {
+    for (const modelItem of provider.models ?? []) {
+      modelLookup.set(modelItem.id, {
+        name: modelItem.displayName || modelItem.modelId,
+        providerName: provider.name,
+      });
+    }
+  }
+
+  for (const conversation of state.conversations) {
+    const conversationDate = dateKey(conversation.createAt);
+    const row = daily.get(conversationDate) ?? { date: conversationDate, messages: 0, conversations: 0, characters: 0 };
+    row.conversations += 1;
+    daily.set(conversationDate, row);
+
+    for (const node of conversation.messages) {
+      for (const msg of node.messages) {
+        const msgDate = dateKey(msg.createdAt);
+        const item = daily.get(msgDate) ?? { date: msgDate, messages: 0, conversations: 0, characters: 0 };
+        const text = textFromParts(msg.parts);
+        item.messages += 1;
+        item.characters += text.length;
+        daily.set(msgDate, item);
+        characters += text.length;
+        if (msg.role === "USER") userMessages += 1;
+        if (msg.role === "ASSISTANT") assistantMessages += 1;
+        if (msg.usage && typeof msg.usage === "object" && !Array.isArray(msg.usage)) {
+          inputTokens += Number(msg.usage.promptTokens ?? msg.usage.inputTokens ?? 0);
+          outputTokens += Number(msg.usage.completionTokens ?? msg.usage.outputTokens ?? 0);
+        }
+        if (msg.modelId) {
+          const info = modelLookup.get(msg.modelId) ?? { name: msg.modelId, providerName: "" };
+          const row = models.get(msg.modelId) ?? { id: msg.modelId, name: info.name, providerName: info.providerName, count: 0 };
+          row.count += 1;
+          models.set(msg.modelId, row);
+        }
+      }
+    }
+  }
+
+  // 请求统计来自持久化累加器 state.stats(logs 已改内存态,不再遍历)。
+  for (const [name, value] of Object.entries(state.stats.byProvider)) providers.set(name, { ...value });
+  for (const [name, value] of Object.entries(state.stats.byGroup)) requestGroups.set(name, { ...value });
+
+  return {
+    totals: {
+      conversations: state.conversations.length,
+      messages: userMessages + assistantMessages,
+      userMessages,
+      assistantMessages,
+      characters,
+      inputTokens,
+      outputTokens,
+      launchCount: state.launchCount,
+      requests: state.stats.totalRequests,
+      failedRequests: state.stats.failedRequests,
+    },
+    daily: [...daily.values()].sort((a, b) => a.date.localeCompare(b.date)),
+    models: [...models.values()].sort((a, b) => b.count - a.count),
+    requestGroups: [...requestGroups.entries()].map(([name, value]) => ({ name, ...value })).sort((a, b) => (b.ok + b.failed) - (a.ok + a.failed)),
+    providers: [...providers.entries()].map(([name, value]) => ({ name, ...value })).sort((a, b) => (b.ok + b.failed) - (a.ok + a.failed)),
+  };
+}
+
+function getStringArray(value: unknown) {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function normalizeWebDavConfig(value: unknown): WebDavConfig {
+  const raw = isRecord(value) ? value : {};
+  const items = getStringArray(raw.items).filter((item) => item === "DATABASE" || item === "FILES");
+  return {
+    url: String(raw.url ?? ""),
+    username: String(raw.username ?? ""),
+    password: String(raw.password ?? ""),
+    path: String(raw.path ?? "rikkahub_backups") || "rikkahub_backups",
+    items: items.length ? items : ["DATABASE", "FILES"],
+  };
+}
+
+function normalizeS3Config(value: unknown): S3Config {
+  const raw = isRecord(value) ? value : {};
+  const items = getStringArray(raw.items).filter((item) => item === "DATABASE" || item === "FILES");
+  // 对齐 APP 字段。兼容旧 PC 值:forcePathStyle → pathStyle(语义相同);prefix 已废弃(APP 用硬编码
+  // rikkahub_backups/),忽略。pathStyle/forcePathStyle 都缺失时默认 true(与 APP 默认一致)。
+  const hasPath = "pathStyle" in raw;
+  const hasForce = "forcePathStyle" in raw;
+  const pathStyle = hasPath ? raw.pathStyle === true : hasForce ? raw.forcePathStyle === true : true;
+  return {
+    endpoint: String(raw.endpoint ?? ""),
+    accessKeyId: String(raw.accessKeyId ?? ""),
+    secretAccessKey: String(raw.secretAccessKey ?? ""),
+    bucket: String(raw.bucket ?? ""),
+    region: String(raw.region ?? "auto") || "auto",
+    pathStyle,
+    items: items.length ? items : ["DATABASE", "FILES"],
+  };
+}
+
+function normalizeProxyConfig(value: unknown): ProxyConfig {
+  const raw = isRecord(value) ? value : {};
+  return {
+    url: String(raw.url ?? "").trim(),
+    username: String(raw.username ?? ""),
+    password: String(raw.password ?? ""),
+  };
+}
+
+// Port setting: integer in [1, 65535] or null (auto). Anything out of range / wrong type
+// normalizes back to null so a corrupt state.json can never wedge the server on an invalid port.
+function normalizePreferredPort(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const n = Math.trunc(value);
+    if (n >= 1 && n <= 65535) return n;
+  }
+  return null;
+}
+
+function hasJsonItemId(items: unknown, idValue: string) {
+  return Array.isArray(items) && items.some((item) => isRecord(item) && String(item.id ?? "") === idValue);
+}
+
+function validateKnownJsonIds(items: unknown, ids: unknown, fieldName: string) {
+  const requested = getStringArray(ids);
+  const unknownId = requested.find((itemId) => !hasJsonItemId(items, itemId));
+  if (unknownId) throw new Error(`${fieldName} contains unknown id: ${unknownId}`);
+  return requested;
+}
+
+// 对齐移动端:日志存完整请求/响应体(供前端 JsonTree 展开),默认不再字符级截断。
+// 可选 limit 仅保留给少数需要硬截断的场景(如错误摘要)。
+function jsonBody(value: unknown, limit?: number): string {
+  const text = JSON.stringify(value, null, 2);
+  if (limit !== undefined && text.length > limit) return `${text.slice(0, limit)}\n\n... [truncated ${text.length - limit} chars]`;
+  return text;
+}
+
+function textBody(value: string, limit?: number): string {
+  if (limit !== undefined && value.length > limit) return `${value.slice(0, limit)}\n\n... [truncated ${value.length - limit} chars]`;
+  return value;
+}
+
+function getByPath(value: unknown, path: string): unknown {
+  const expression = path.trim();
+  if (!expression) return value;
+  const tokens = expression.match(/[^.[\]]+|\[(\d+)\]/g) ?? [];
+  let current: any = value;
+  for (const token of tokens) {
+    if (current == null) return undefined;
+    const indexMatch = /^\[(\d+)\]$/.exec(token);
+    current = indexMatch ? current[Number(indexMatch[1])] : current[token];
+  }
+  return current;
+}
+
+function formatBalanceValue(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value.toFixed(2);
+  const text = String(value ?? "").trim();
+  const num = Number(text);
+  return text && Number.isFinite(num) ? num.toFixed(2) : text;
+}
+
+function isRecord(value: unknown): value is Record<string, JsonValue> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function upsertById(items: JsonValue[], item: Record<string, JsonValue>) {
+  const itemId = String(item.id ?? id());
+  const nextItem = { ...item, id: itemId };
+  const exists = items.some((entry) => isRecord(entry) && String(entry.id) === itemId);
+  return {
+    item: nextItem,
+    items: exists ? items.map((entry) => (isRecord(entry) && String(entry.id) === itemId ? nextItem : entry)) : [...items, nextItem],
+  };
+}
+
+function deleteById(items: JsonValue[], idValue: string) {
+  return items.filter((entry) => !(isRecord(entry) && String(entry.id) === idValue));
+}
+
+function reorderByIds<T extends JsonValue>(items: T[], ids: string[]) {
+  const byId = new Map(items.filter(isRecord).map((item) => [String(item.id), item as T]));
+  const ordered = ids.map((itemId) => byId.get(itemId)).filter(Boolean) as T[];
+  const rest = items.filter((item) => !isRecord(item) || !ids.includes(String(item.id)));
+  return [...ordered, ...rest];
+}
+
+function safeSkillDir(skillName: string) {
+  const name = skillName.trim();
+  if (!name || name === "." || name === ".." || /[\\/]/.test(name)) return null;
+  const root = resolve(skillsDir);
+  const target = resolve(root, name);
+  if (dirname(target) !== root) return null;
+  return target;
+}
+
+function safeSkillFile(skillName: string, relativePath: string) {
+  if (!relativePath.trim()) return null;
+  const dir = safeSkillDir(skillName);
+  if (!dir) return null;
+  const root = resolve(dir);
+  const target = resolve(root, relativePath);
+  if (target !== root && !target.startsWith(root + "\\") && !target.startsWith(root + "/")) return null;
+  return target;
+}
+
+function parseSkillFrontmatter(content: string) {
+  const result: Record<string, string> = {};
+  if (!content.startsWith("---")) return result;
+  const match = content.slice(3).match(/\r?\n---(?:\r?\n|$)/);
+  if (!match || match.index === undefined) return result;
+  const yaml = content.slice(3, 3 + match.index).trim();
+  for (const line of yaml.split(/\r?\n/)) {
+    const colon = line.indexOf(":");
+    if (colon <= 0) continue;
+    const key = line.slice(0, colon).trim();
+    const value = line.slice(colon + 1).trim().replace(/^"|"$/g, "");
+    if (key && value) result[key] = value;
+  }
+  return result;
+}
+
+function extractSkillBody(content: string) {
+  if (!content.startsWith("---")) return content;
+  const match = content.slice(3).match(/\r?\n---(?:\r?\n|$)/);
+  if (!match || match.index === undefined) return content;
+  return content.slice(3 + match.index + match[0].length).replace(/^[\r\n]+/, "");
+}
+
+function skillMetadataFromFile(skillName: string): SkillMetadata | null {
+  const file = safeSkillFile(skillName, "SKILL.md");
+  if (!file || !existsSync(file)) return null;
+  const content = readFileSync(file, "utf8");
+  const frontmatter = parseSkillFrontmatter(content);
+  const name = frontmatter.name?.trim();
+  const description = frontmatter.description?.trim();
+  if (!name || !description) return null;
+  return {
+    name,
+    description,
+    compatibility: frontmatter.compatibility,
+    allowedTools: frontmatter["allowed-tools"]?.split(/\s+/).filter(Boolean) ?? [],
+  };
+}
+
+function listSkills(): SkillMetadata[] {
+  mkdirSync(skillsDir, { recursive: true });
+  return readdirSync(skillsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => skillMetadataFromFile(entry.name))
+    .filter(Boolean) as SkillMetadata[];
+}
+
+function readSkillBody(skillName: string) {
+  const file = safeSkillFile(skillName, "SKILL.md");
+  if (!file || !existsSync(file)) return null;
+  return extractSkillBody(readFileSync(file, "utf8"));
+}
+
+function readSkillContent(skillName: string) {
+  const file = safeSkillFile(skillName, "SKILL.md");
+  if (!file || !existsSync(file)) return null;
+  return readFileSync(file, "utf8");
+}
+
+function listSkillFiles(skillName: string) {
+  const dir = safeSkillDir(skillName);
+  if (!dir || !existsSync(dir)) return [];
+  const root = resolve(dir);
+  const result: Array<{ path: string; size: number; type: "file" | "directory" }> = [];
+  const visit = (current: string) => {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      if (entry.name.startsWith(".")) continue;
+      const full = join(current, entry.name);
+      const relativePath = resolve(full).slice(root.length + 1).replace(/\\/g, "/");
+      if (entry.isDirectory()) {
+        result.push({ path: relativePath, size: 0, type: "directory" });
+        visit(full);
+      } else {
+        result.push({ path: relativePath, size: statSync(full).size, type: "file" });
+      }
+    }
+  };
+  visit(root);
+  return result.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function exportSkills() {
+  return listSkills().map((skill) => ({ ...skill, content: readSkillContent(skill.name) ?? "" }));
+}
+
+function importSkills(skills: unknown) {
+  if (!Array.isArray(skills)) return;
+  for (const item of skills) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const name = String(record.name ?? "").trim();
+    const dir = safeSkillDir(name);
+    if (!dir) continue;
+    mkdirSync(dir, { recursive: true });
+    const files = Array.isArray(record.files) ? record.files : [];
+    if (files.length > 0) {
+      for (const file of files) {
+        if (!isRecord(file)) continue;
+        const relativePath = String(file.path ?? "").replace(/\\/g, "/");
+        if (!relativePath || relativePath.includes("..") || relativePath.startsWith("/")) continue;
+        const target = resolve(dir, relativePath);
+        if (!target.startsWith(resolve(dir))) continue;
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, String(file.content ?? ""));
+      }
+      continue;
+    }
+    const content = String(record.content ?? "");
+    if (content) writeFileSync(join(dir, "SKILL.md"), content);
+  }
+}
+
+function defaultSkillContent(name = "new-skill") {
+  return `---\nname: ${name}\ndescription: Describe when this skill should be used\n---\n\nWrite the skill instructions here.\n`;
+}
+
+// 导出备份时剥离移动端无法识别的模型模态(AUDIO/VIDEO/DOCUMENT)。
+// 移动端 Modality 枚举只有 TEXT/IMAGE,kotlinx.serialization 反序列化 List<Modality>
+// 遇到这三个值会抛 SerializationException,导致整个 settings 恢复失败(Issue #11)。
+// 另:LLM 体系里不存在"文档"模态,且 PC/移动端当前都没有音视频对话能力,这些配置对
+// 用户只是无效元数据。
+// 纯函数:深拷贝,绝不改动内存中的运行时 state.settings,只清洗"写入备份文件"的内容。
+const BACKUP_INCOMPATIBLE_MODALITIES = new Set(["AUDIO", "VIDEO", "DOCUMENT"]);
+function sanitizeModelModalitiesForExport(settings: Settings): Settings {
+  return {
+    ...settings,
+    providers: (settings.providers ?? []).map((provider) => ({
+      ...provider,
+      models: (provider.models ?? []).map((modelItem) => {
+        const filterMods = (mods: string[] | undefined): string[] => {
+          const cleaned = (mods ?? []).filter(
+            (m) => !BACKUP_INCOMPATIBLE_MODALITIES.has(String(m).toUpperCase()),
+          );
+          return cleaned.length ? cleaned : ["TEXT"];
+        };
+        return {
+          ...modelItem,
+          inputModalities: filterMods(modelItem.inputModalities),
+          outputModalities: filterMods(modelItem.outputModalities),
+        };
+      }),
+    })),
+  };
+}
+
+function backupPayload() {
+  return {
+    version: 1,
+    app: "RikkaHub PC",
+    exportedAt: new Date().toISOString(),
+    state,
+    skills: exportSkills(),
+    files: state.files.map((file) => ({
+      ...file,
+      data: existsSync(file.path) ? readFileSync(file.path).toString("base64") : null,
+    })),
+  };
+}
+
+// Same shape as backupPayload() but does NOT base64-inline file bytes — file data lives in
+// the surrounding zip's `upload/<displayName>` entries, and only file metadata (id, fileName,
+// mime, size) survives the JSON round-trip. This is the format used inside
+// `pc-backup.json` of a zip backup, and is the only OOM-safe path for users with multi-GB
+// of attachments (the inline-base64 variant above can easily push a couple GB of files into
+// a JS string, blowing the V8 heap limit).
+function backupPayloadMetadataOnly(settingsOverride?: Settings) {
+  const settings = settingsOverride ?? state.settings;
+  return {
+    version: 2,
+    app: "RikkaHub PC",
+    exportedAt: new Date().toISOString(),
+    // Exclude conversations from pc-backup.json — they're exported as rikka_hub.db now.
+    // Including them here caused OOM crashes for users with large imported Android histories.
+    state: {
+      settings,
+      generatedImages: state.generatedImages,
+      files: state.files,
+      memories: state.memories,
+    },
+    skills: exportSkills(),
+    files: state.files.map((file) => ({
+      id: file.id,
+      path: file.path,
+      fileName: file.fileName,
+      mime: file.mime,
+      size: file.size,
+      extractedText: file.extractedText,
+    })),
+  };
+}
+
+function applyBackupPayload(body: { state?: Partial<State>; skills?: unknown; files?: unknown } & Partial<State>) {
+  const incoming = body.state ?? body;
+  if (!incoming || typeof incoming !== "object" || !incoming.settings) {
+    throw new Error("Invalid backup file");
+  }
+  state = normalizeState(incoming);
+  importSkills(body.skills);
+  if (Array.isArray(body.files)) {
+    mkdirSync(filesDir, { recursive: true });
+    for (const file of body.files) {
+      if (!isRecord(file) || typeof file.data !== "string") continue;
+      const fileId = Number(file.id);
+      if (!Number.isFinite(fileId)) continue;
+      const ext = extname(String(file.originalName ?? file.name ?? "")) || extname(String(file.path ?? "")) || "";
+      const target = join(filesDir, `${fileId}${ext}`);
+      writeFileSync(target, Buffer.from(file.data, "base64"));
+      state.files = state.files.map((entry) => (entry.id === fileId ? { ...entry, path: target } : entry));
+    }
+  }
+  finalizeConversationImport();
+  saveState();
+  broadcastSettings();
+  broadcastList();
+}
+
+/**
+ * Try to import an Android-format backup ZIP. The Android client (v2.x) produces a ZIP
+ * containing `settings.json` + Room database files + `upload/` + `skills/`. PC and Android
+ * use different storage layouts (PC: JSON state.json; Android: SQLite via Room), so we can't
+ * literally restore the .db files. Instead we cherry-pick the cross-platform-portable bits:
+ *
+ *   ✓ settings.json → merged into PC settings (providers, search services, assistants,
+ *     mode injections, lorebooks, quick messages, display preferences, etc.)
+ *   ✓ upload/<file> → copied verbatim into pc-data/files/ and registered in state.files[]
+ *     so they're available as attachments by their old filenames
+ *   ✓ skills/<...> → copied into pc-data/skills/ so Agent Skills survive the migration
+ *   ✗ rikka_hub.db / -wal / -shm → SKIPPED. Reading Room SQLite would require duplicating
+ *     Android's schema mapping; conversation history therefore doesn't migrate. The summary
+ *     returned to the UI lists what was and wasn't recovered so the user understands.
+ *
+ * Uses PowerShell's Expand-Archive (ships on every supported Windows) to extract — no
+ * extra dependency in the compiled exe.
+ */
+// PC lossless restore: read `pc-backup.json` (metadata-only state), apply it via
+// `applyBackupPayload`, then re-link the actual file bytes from the zip's `upload/<fileName>`
+// entries by copying them into pc-data/files/<newId>.<ext> and rewriting state.files[].path.
+//
+// This preserves conversations + message tree + tool parts + generatedImages + logs that a
+// pure-Android-format zip can't carry (Android stores those in SQLite, which PC doesn't have).
+// Out-of-memory safety: file bytes are copied with readFileSync→writeFileSync per file, never
+// aggregated into a single buffer.
+function applyPcBackupFromExtractDir(extractDir: string, pcBackupPath: string): { settingsImported: boolean; filesImported: number; skillsImported: number; conversationsImported: number; dbReadError: string | null } {
+  let settingsImported = false;
+  let filesImported = 0;
+  let skillsImported = 0;
+  let conversationsImported = 0;
+  try {
+    const body = JSON.parse(readFileSync(pcBackupPath, "utf-8")) as { state?: Partial<State>; skills?: unknown; files?: unknown } & Partial<State>;
+    const incoming = body.state ?? body;
+    if (!incoming || typeof incoming !== "object" || !incoming.settings) {
+      throw new Error("Invalid pc-backup.json: missing state.settings");
+    }
+    // Wipe state.files first so we can re-add entries from upload/ with fresh IDs and paths
+    // that are valid on THIS machine (the path stored in pc-backup.json points at the source
+    // machine's filesystem and would be wrong here).
+    const incomingState = { ...(incoming as State), files: [], nextFileId: 1 } as State;
+    state = normalizeState(incomingState);
+    settingsImported = true;
+    if (Array.isArray(incoming.conversations)) {
+      conversationsImported = incoming.conversations.length;
+    }
+    // If pc-backup.json doesn't contain conversations (new format), try rikka_hub.db
+    if (!conversationsImported) {
+      const dbFile = join(extractDir, "rikka_hub.db");
+      if (existsSync(dbFile)) {
+        try {
+          conversationsImported = importAndroidConversations(extractDir, dbFile, new Map());
+        } catch (dbErr) {
+          console.warn("[import] rikka_hub.db read failed in PC restore:", dbErr);
+        }
+      }
+    }
+    importSkills((body as { skills?: unknown }).skills);
+    // Re-link file bytes from upload/<fileName>. We trust the metadata in pc-backup.json's
+    // files[] array for mime/extractedText etc., but assign new local ids and paths.
+    const uploadDir = join(extractDir, "upload");
+    const incomingFiles = Array.isArray((incoming as State).files) ? (incoming as State).files : [];
+    if (existsSync(uploadDir) && incomingFiles.length > 0) {
+      mkdirSync(filesDir, { recursive: true });
+      // Build a lookup by display name → metadata so we can match upload/ entries back to
+      // their saved metadata (mime, extractedText, original id).
+      const metaByName = new Map<string, StoredFile>();
+      for (const meta of incomingFiles) {
+        if (meta && typeof meta.fileName === "string") metaByName.set(meta.fileName, meta);
+      }
+      for (const entry of readdirSync(uploadDir)) {
+        const srcPath = join(uploadDir, entry);
+        const stats = statSync(srcPath);
+        if (!stats.isFile()) continue;
+        const newId = state.nextFileId++;
+        const ext = extname(entry) || "";
+        const targetPath = join(filesDir, `${newId}${ext}`);
+        writeFileSync(targetPath, readFileSync(srcPath));
+        const meta = metaByName.get(entry);
+        state.files.push({
+          id: newId,
+          path: targetPath,
+          fileName: meta?.fileName ?? entry,
+          mime: meta?.mime ?? guessMimeFromExt(ext),
+          size: meta?.size ?? stats.size,
+          extractedText: meta?.extractedText,
+        });
+        filesImported += 1;
+      }
+    }
+    // Skills are restored via importSkills() above; count them from the skills array if present.
+    if (Array.isArray((body as { skills?: unknown }).skills)) {
+      skillsImported = ((body as { skills?: unknown[] }).skills as unknown[]).length;
+    }
+    finalizeConversationImport();
+    saveState();
+    broadcastSettings();
+    broadcastList();
+  } catch (err) {
+    console.warn("[import] pc-backup.json apply failed", err);
+    throw err;
+  }
+  return { settingsImported, filesImported, skillsImported, conversationsImported, dbReadError: null };
+}
+
+function applyAndroidZipBackupFromPath(zipPath: string): { settingsImported: boolean; filesImported: number; skillsImported: number; conversationsImported: number; dbReadError: string | null } {
+  // Caller is expected to have already written the zip to disk (streamed from request.body
+  // for the large-file path). We accept a path rather than a Buffer because users have
+  // reported backups in the 1-10 GB range — buffering those in JS heap is not feasible.
+  const tmpRoot = dirname(zipPath);
+  const extractDir = join(tmpRoot, "extracted");
+  rmSync(extractDir, { recursive: true, force: true });
+  mkdirSync(extractDir, { recursive: true });
+  if (process.platform === "win32") {
+    const script = [
+      "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+      `[System.IO.Compression.ZipFile]::ExtractToDirectory('${zipPath.replace(/'/g, "''")}', '${extractDir.replace(/'/g, "''")}')`,
+    ].join("; ");
+    const proc = Bun.spawnSync(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]);
+    if (proc.exitCode !== 0) {
+      throw new Error(`Failed to extract backup zip: ${new TextDecoder().decode(proc.stderr ?? new Uint8Array()).slice(0, 300)}`);
+    }
+  } else {
+    const proc = Bun.spawnSync(["unzip", "-o", zipPath, "-d", extractDir]);
+    if (proc.exitCode !== 0) {
+      throw new Error(`Failed to extract backup zip: ${new TextDecoder().decode(proc.stderr ?? new Uint8Array()).slice(0, 300)}`);
+    }
+  }
+
+  // PC-origin zip fast path: if pc-backup.json exists, this came from a PC export — restore
+  // settings + generatedImages + memories + files metadata (from pc-backup.json) and
+  // conversations (from rikka_hub.db), then re-link file bytes from upload/. logs/stats are
+  // machine-local (in-memory / per-install accumulator) and are NOT carried in the backup.
+  // The Android settings.json path below still exists for Android-origin zips, which don't
+  // ship pc-backup.json.
+  const pcBackupPath = join(extractDir, "pc-backup.json");
+  if (existsSync(pcBackupPath)) {
+    return applyPcBackupFromExtractDir(extractDir, pcBackupPath);
+  }
+
+  let settingsImported = false;
+  let filesImported = 0;
+  let skillsImported = 0;
+  let conversationsImported = 0;
+  let dbReadError: string | null = null;
+
+  const settingsPath = join(extractDir, "settings.json");
+  if (existsSync(settingsPath)) {
+    try {
+      const raw = JSON.parse(readFileSync(settingsPath, "utf-8")) as Record<string, unknown>;
+      // APP→PC 导入的 settings 合并(七层策略,灵活处理):
+      //   1) ...app 基底:APP 全字段进来,含 PC 不认识的 APP 独有字段(customThemes / fastModelId /
+      //      enableSuggestion / webServer* / backupReminderConfig 等),不漏。PC 运行时不读的多余字段
+      //      原样保留,saveState 写回、PC→APP 回导还能用。
+      //   2) 标量配置(默认模型选择 / 各类 prompt / 主题 / 布尔开关):PC 缺失或仍=出厂默认 = 用户没在
+      //      PC 定制 → 采用 APP(APP 是主力端);PC 已定制 → 保 PC。pick() 同时判 null 和 ===。
+      //   3) 含 apiKey 的集合(providers/asr/tts):mergeById(PC, APP) PC 优先,保 PC 的 key 与定义,
+      //      APP 独有条目追加。searchServices 单独处理——两端 id 都是随机生成(defaultSettings 用 id()、
+      //      Android 用 Uuid.random()),mergeById 按 id 去重会翻倍,改按 type 去重(见 mergeSearchByType)。
+      //   4) 用户内容集合(assistants/mcpServers/lorebooks/quickMessages/modeInjections/assistantTags):
+      //      mergeById(APP, PC) APP 优先(改名/配置进来),PC 独有追加。id 是 UUID 且两端默认空,撞 id
+      //      极罕见——MCP 凭证在 commonOptions.headers,撞 id 时可能丢 PC token,可接受。
+      //   5) favoriteModels:元素是 model UUID(string)非 {id} 对象,用 Set 去重取并集。
+      //   6) displaySetting / searchCommonOptions:对象 shallow merge,APP 字段进来、PC 独有保留;
+      //      displaySetting.userNickname 非空、userAvatar 非 Dummy 才覆盖;chatFontFamily 永远保 PC
+      //      (APP 是 enum 字符串、PC 是字体名,手机端字体 PC 未必安装)。
+      //   7) webDav/s3:两端结构对齐后,PC 已配置保 PC、PC 空采用 APP(APP 也有此功能)。
+      //      proxy/jwt/port/promptOptimize* 是 PC 独有(Android 无),永远保 PC。
+      // 历史:{...PC,...APP} 浅合并丢 key;Plan B 全 PC 优先把 APP 同 id 助手/MCP/世界书挡在外面;
+      //      三轮分流只覆盖 10 个集合,标量全走 PC 基底→默认模型/提示词/主题/收藏/标签全丢;七层方案补齐
+      //      后又发现 searchServices 两端随机 id 致 mergeById 翻倍、webDav 误判 PC 独有被丢——本轮修正。
+      const pc = state.settings;
+      const app = raw as Record<string, JsonValue>;
+      const defaults = defaultSettings();
+      // 标量:APP 有该字段、且 PC 缺失(null)或仍=出厂默认 → 采用 APP;否则保 PC。APP 没该字段时保 PC。
+      const pick = (key: string): unknown => {
+        const pcVal = (pc as Record<string, unknown>)[key];
+        if (!(key in app)) return pcVal;
+        const defVal = (defaults as Record<string, unknown>)[key];
+        return pcVal == null || pcVal === defVal ? app[key] : pcVal;
+      };
+      // searchServices 两端 id 都是随机生成(defaultSettings 用 id()、Android 用 Uuid.random()),mergeById
+      // 按 id 去重会把 APP 的全部追加 → 搜索服务翻倍。改按 type 去重:同 type 时 APP 配了 apiKey 而 PC
+      // 对应项没有 → 用 APP(把 key 带过来);否则保 PC;APP 独有 type 追加。无 type 的脏数据当独有项追加。
+      const mergeSearchByType = (
+        pcList: { type?: string; apiKey?: JsonValue; id: string }[],
+        appList: { type?: string; apiKey?: JsonValue; id: string }[],
+      ) => {
+        const result = [...pcList];
+        const typeToIdx = new Map<string, number>();
+        result.forEach((s, i) => {
+          const t = String(s.type ?? "");
+          if (t && !typeToIdx.has(t)) typeToIdx.set(t, i);
+        });
+        for (const appSvc of appList) {
+          const t = String(appSvc.type ?? "");
+          if (!t) { result.push(appSvc); continue; }
+          const idx = typeToIdx.get(t);
+          if (idx === undefined) {
+            typeToIdx.set(t, result.length);
+            result.push(appSvc);
+          } else if (String(appSvc.apiKey ?? "").trim() && !String(result[idx].apiKey ?? "").trim()) {
+            result[idx] = appSvc; // APP 有 key、PC 没有 → 用 APP
+          }
+        }
+        return result;
+      };
+      const mergedSearchServices = mergeSearchByType(
+        (Array.isArray(pc.searchServices) ? pc.searchServices : []) as { type?: string; apiKey?: JsonValue; id: string }[],
+        (Array.isArray(app.searchServices) ? app.searchServices : []) as { type?: string; apiKey?: JsonValue; id: string }[],
+      );
+      // searchServiceSelected 存的是数组下标,合并后顺序变了。PC 段在合并列表前部、顺序不变,故 PC 非默认
+      // 时其索引仍有效直接保;PC=默认(0)= 用户没在 PC 选过 → 采用 APP 选中意图:取 APP 选中服务的 type
+      // 在合并列表重新定位,找不到回退 0(脏数据 / APP 列表为空时兜底)。
+      const resolveSearchSelected = (): number => {
+        if (pc.searchServiceSelected !== defaults.searchServiceSelected) return pc.searchServiceSelected;
+        const appIdx = Number(app.searchServiceSelected);
+        const appList = (Array.isArray(app.searchServices) ? app.searchServices : []) as { type?: string }[];
+        const targetType = String(appList[appIdx]?.type ?? "");
+        if (!targetType) return 0;
+        const found = mergedSearchServices.findIndex((s) => String(s.type ?? "") === targetType);
+        return found >= 0 ? found : 0;
+      };
+      // displaySetting 两端字段不同(PC 有 uiFontFamilyCss/chatInputHeight,APP 有 showDateTimeInMessage/
+      // 触觉/通知等)。shallow merge;身份字段 + chatFontFamily 做兜底。APP 的 userAvatar type 可能是
+      // Android FQN(...Avatar.Dummy),rewriteAvatarsInSettings 后续转 PC 短格式,这里同时兜住 FQN 与短格式。
+      // chatFontFamily:APP 是 enum 字符串(DEFAULT/MONOSPACE/CUSTOM)、PC 是字体名,且手机端字体 PC 未必
+      // 安装,类型与可用性都不一致 → 永远保 PC,不接管 APP 值。
+      const pcDisplay = (pc.displaySetting ?? {}) as Record<string, JsonValue>;
+      const appDisplay = (app.displaySetting as Record<string, JsonValue> | undefined) ?? {};
+      const mergedDisplay: Record<string, JsonValue> = { ...pcDisplay };
+      for (const [k, v] of Object.entries(appDisplay)) {
+        if (k === "userNickname") {
+          if (typeof v === "string" && v.trim()) mergedDisplay.userNickname = v;
+        } else if (k === "userAvatar") {
+          const avatarType = String((v as Record<string, JsonValue> | null)?.type ?? "");
+          if (v && !/\.Dummy$/i.test(avatarType) && avatarType.toLowerCase() !== "dummy") {
+            mergedDisplay.userAvatar = v;
+          }
+        } else if (k === "chatFontFamily") {
+          // 字体两端语义/可用性不同 → 保 PC
+        } else {
+          mergedDisplay[k] = v;
+        }
+      }
+      // WebDavConfig 两端结构完全一致(url/username/password/path/items)。PC 已配置(url 非空)= PC 上
+      // 验证过能用且含密钥 → 保 PC;PC 空(url 空)= 用户没在 PC 配过 → 采用 APP 的(主力端配置)。
+      const mergedWebDav = String((pc.webDavConfig as Record<string, JsonValue> | null)?.url ?? "").trim()
+        ? pc.webDavConfig
+        : (app.webDavConfig ?? pc.webDavConfig);
+      // S3Config 对齐 APP 后两端结构一致。PC 已配置(endpoint 非空)→ 保 PC;PC 空 → 采用 APP。
+      const mergedS3 = String((pc.s3Config as Record<string, JsonValue> | null)?.endpoint ?? "").trim()
+        ? pc.s3Config
+        : (app.s3Config ?? pc.s3Config);
+      const merged = {
+        ...app,
+        dynamicColor: pick("dynamicColor"),
+        themeId: pick("themeId"),
+        developerMode: pick("developerMode"),
+        enableWebSearch: pick("enableWebSearch"),
+        chatModelId: pick("chatModelId"),
+        titleModelId: pick("titleModelId"),
+        translateModeId: pick("translateModeId"),
+        suggestionModelId: pick("suggestionModelId"),
+        imageGenerationModelId: pick("imageGenerationModelId"),
+        ocrModelId: pick("ocrModelId"),
+        compressModelId: pick("compressModelId"),
+        translateThinkingBudget: pick("translateThinkingBudget"),
+        titlePrompt: pick("titlePrompt"),
+        translatePrompt: pick("translatePrompt"),
+        suggestionPrompt: pick("suggestionPrompt"),
+        ocrPrompt: pick("ocrPrompt"),
+        compressPrompt: pick("compressPrompt"),
+        selectedASRProviderId: pick("selectedASRProviderId"),
+        selectedTTSProviderId: pick("selectedTTSProviderId"),
+        assistantId: pick("assistantId"),
+        providers: mergeById(pc.providers ?? [], (Array.isArray(app.providers) ? app.providers : []) as { id: string }[]),
+        searchServices: mergedSearchServices,
+        searchServiceSelected: resolveSearchSelected(),
+        asrProviders: mergeById(pc.asrProviders ?? [], (Array.isArray(app.asrProviders) ? app.asrProviders : []) as { id: string }[]),
+        ttsProviders: mergeById(pc.ttsProviders ?? [], (Array.isArray(app.ttsProviders) ? app.ttsProviders : []) as { id: string }[]),
+        assistants: mergeById((Array.isArray(app.assistants) ? app.assistants : []) as { id: string }[], pc.assistants ?? []),
+        mcpServers: mergeById((Array.isArray(app.mcpServers) ? app.mcpServers : []) as { id: string }[], pc.mcpServers ?? []),
+        lorebooks: mergeById((Array.isArray(app.lorebooks) ? app.lorebooks : []) as { id: string }[], pc.lorebooks ?? []),
+        quickMessages: mergeById((Array.isArray(app.quickMessages) ? app.quickMessages : []) as { id: string }[], pc.quickMessages ?? []),
+        modeInjections: mergeById((Array.isArray(app.modeInjections) ? app.modeInjections : []) as { id: string }[], pc.modeInjections ?? []),
+        assistantTags: mergeById((Array.isArray(app.assistantTags) ? app.assistantTags : []) as { id: string }[], pc.assistantTags ?? []),
+        favoriteModels: Array.from(new Set([
+          ...(Array.isArray(pc.favoriteModels) ? pc.favoriteModels : []),
+          ...(Array.isArray(app.favoriteModels) ? (app.favoriteModels as string[]) : []),
+        ])),
+        displaySetting: mergedDisplay,
+        searchCommonOptions: {
+          ...(pc.searchCommonOptions ?? {}),
+          ...((app.searchCommonOptions as Record<string, JsonValue> | undefined) ?? {}),
+        },
+        webDavConfig: mergedWebDav,
+        s3Config: mergedS3,
+        proxyConfig: pc.proxyConfig,
+        webServerJwtEnabled: pc.webServerJwtEnabled,
+        preferredPort: pc.preferredPort,
+        promptOptimizeModelId: pc.promptOptimizeModelId,
+        promptOptimizePrompt: pc.promptOptimizePrompt,
+      } as State["settings"];
+      const adjusted = rewriteAvatarsInSettings(merged, ANDROID_AVATAR_TYPE_TO_PC, "to-pc");
+      state = normalizeState({ ...state, settings: adjusted as State["settings"] });
+      settingsImported = true;
+    } catch (err) {
+      console.warn("[import] failed to parse Android settings.json", err);
+    }
+  }
+
+  // Copy upload/ files into pc-data/files/ with fresh ids and register them in state.files.
+  // We do this BEFORE importing conversations so that the filename→PC-file-id map is
+  // available when rewriting `file://…/upload/<uuid>.png` URLs embedded in message parts —
+  // without that rewrite, the imported messages would all show "Failed to load image"
+  // because the on-disk file was renamed from `<uuid>.png` to `<numeric-id>.png`.
+  const androidFilenameToPcId = new Map<string, number>();
+  const uploadDir = join(extractDir, "upload");
+  if (existsSync(uploadDir)) {
+    mkdirSync(filesDir, { recursive: true });
+    for (const entry of readdirSync(uploadDir)) {
+      const srcPath = join(uploadDir, entry);
+      const stats = statSync(srcPath);
+      if (!stats.isFile()) continue;
+      const fileId = state.nextFileId++;
+      const ext = extname(entry) || "";
+      const targetName = `${fileId}${ext}`;
+      const targetPath = join(filesDir, targetName);
+      writeFileSync(targetPath, readFileSync(srcPath));
+      state.files.push({
+        id: fileId,
+        path: targetPath,
+        fileName: entry,
+        mime: guessMimeFromExt(ext),
+        size: stats.size,
+      });
+      androidFilenameToPcId.set(entry, fileId);
+      filesImported += 1;
+    }
+  }
+
+  // Conversation history: Android stores them in a Room SQLite db (`rikka_hub.db`) with two
+  // tables — ConversationEntity for metadata + message_node for the per-node messages array.
+  // We open the file via Bun's native SQLite and rebuild PC's Conversation[] shape, which
+  // happens to be a near-1:1 mapping because both sides serialize messages with the same
+  // kotlinx.serialization-compatible JSON format. The filename map built from upload/ is
+  // passed in so we can rewrite `file://…/upload/<uuid>.png` refs to `/api/files/<id>/content`.
+  const dbPath = join(extractDir, "rikka_hub.db");
+  if (existsSync(dbPath)) {
+    try {
+      conversationsImported = importAndroidConversations(extractDir, dbPath, androidFilenameToPcId);
+      // Keep a copy of the original Android db for re-export. Open it first to
+      // checkpoint any WAL data (Android exports with WAL that may contain schema
+      // updates like identity_hash changes), then serialize the consolidated db.
+      const cachedDbPath = join(dataDir, "rikka_hub_cached.db");
+      try {
+        const cacheDb = new Database(dbPath, { readonly: true });
+        const bytes = cacheDb.serialize();
+        cacheDb.close();
+        writeFileSync(cachedDbPath, bytes);
+      } catch { /* best-effort */ }
+    } catch (err) {
+      dbReadError = err instanceof Error ? err.message : String(err);
+      console.warn("[import] failed to read Android SQLite database:", dbReadError);
+    }
+  }
+
+  // skills/ — copy the directory tree verbatim into pc-data/skills/.
+  const skillsSrc = join(extractDir, "skills");
+  if (existsSync(skillsSrc) && skillsDir) {
+    mkdirSync(skillsDir, { recursive: true });
+    skillsImported = copyDirRecursive(skillsSrc, skillsDir);
+  }
+
+  finalizeConversationImport();
+  saveState();
+  broadcastSettings();
+  broadcastList();
+
+  // Clean up the extracted/ subdir; the caller owns and cleans tmpRoot (which still holds
+  // the original streamed zip until they decide to remove the whole thing).
+  rmSync(extractDir, { recursive: true, force: true });
+  return { settingsImported, filesImported, skillsImported, conversationsImported, dbReadError };
+}
+
+/**
+ * Reads `rikka_hub.db` (Android Room) and reconstructs PC `Conversation[]` entries by
+ * joining ConversationEntity with message_node (ordered by node_index). Returns the count
+ * of imported conversations.
+ *
+ * Conversations are merged into `state.conversations` by id — Android UUIDs effectively
+ * never collide with PC-generated ones, so this is functionally an append. If the user
+ * imports the same backup twice the second import overwrites prior copies (idempotent).
+ *
+ * The Android-side `messages` column is JSON `List<UIMessage>` serialized by kotlinx, which
+ * matches PC's `Message` shape directly (role enum, parts/annotations/usage as JsonValue
+ * passthroughs, ISO-string timestamps). We do shape-coercion as a defensive pass — bad rows
+ * are skipped, not thrown, so a single corrupt node doesn't lose the rest of the history.
+ */
+function importAndroidConversations(extractDir: string, dbPath: string, androidFilenameToPcId: Map<string, number>): number {
+  // SQLite resolves WAL siblings as `${dbfile}-wal` / `${dbfile}-shm`, but Android exports
+  // them with the original (extension-less) database name `rikka_hub-wal` / `rikka_hub-shm`.
+  // Without renaming, any uncommitted writes still sitting in the WAL are silently ignored.
+  for (const [src, dest] of [
+    ["rikka_hub-wal", "rikka_hub.db-wal"],
+    ["rikka_hub-shm", "rikka_hub.db-shm"],
+  ]) {
+    const s = join(extractDir, src);
+    const d = join(extractDir, dest);
+    if (existsSync(s) && !existsSync(d)) {
+      try { renameSync(s, d); } catch (err) { console.warn(`[import] WAL rename failed: ${err}`); }
+    }
+  }
+
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    // Use dynamic column access (SELECT *) so we don't blow up on older Android schemas
+    // missing a column. Defaults are applied per-field below.
+    const convRows = db.query("SELECT * FROM ConversationEntity").all() as Record<string, unknown>[];
+    const nodeStmt = db.query("SELECT * FROM message_node WHERE conversation_id = ? ORDER BY node_index ASC");
+
+    let imported = 0;
+    const existingById = new Map(state.conversations.map((conv) => [conv.id, conv]));
+
+    for (const row of convRows) {
+      const convId = String(row.id ?? "");
+      if (!convId) continue;
+
+      const nodeRows = nodeStmt.all(convId) as Record<string, unknown>[];
+      const messageNodes: MessageNode[] = nodeRows.map((node) => {
+        const rawMessages = typeof node.messages === "string" ? node.messages : "[]";
+        let parsed: unknown[] = [];
+        try {
+          const decoded = JSON.parse(rawMessages);
+          if (Array.isArray(decoded)) parsed = decoded;
+        } catch {
+          parsed = [];
+        }
+        const messages: Message[] = parsed
+          .map(normalizeAndroidMessage)
+          .filter((m): m is Message => m !== null)
+          .map((m) => ({
+            ...m,
+            // Walk parts deeply and rewrite any Android upload paths into PC file refs. Done
+            // per-message so a corrupted node only affects itself, not the whole conversation.
+            parts: rewriteAndroidFileUrlsDeep(m.parts, androidFilenameToPcId) as JsonValue[],
+          }));
+        return {
+          id: String(node.id ?? Bun.randomUUIDv7()),
+          messages,
+          selectIndex: typeof node.select_index === "number" ? node.select_index : 0,
+        };
+      });
+
+      let chatSuggestions: string[] = [];
+      try {
+        const decoded = JSON.parse(typeof row.suggestions === "string" ? row.suggestions : "[]");
+        if (Array.isArray(decoded)) chatSuggestions = decoded.filter((x): x is string => typeof x === "string");
+      } catch { /* keep empty */ }
+
+      const conv: Conversation = {
+        id: convId,
+        assistantId: String(row.assistant_id ?? DEFAULT_ASSISTANT_ID) || DEFAULT_ASSISTANT_ID,
+        systemPrompt: row.custom_system_prompt ? String(row.custom_system_prompt) : null,
+        title: String(row.title ?? ""),
+        messages: messageNodes,
+        truncateIndex: 0, // No Android equivalent — start unindented.
+        chatSuggestions,
+        isPinned: row.is_pinned === 1 || row.is_pinned === true,
+        createAt: Number(row.create_at ?? Date.now()),
+        updateAt: Number(row.update_at ?? Date.now()),
+      };
+
+      existingById.set(conv.id, conv);
+      imported += 1;
+    }
+
+    // Re-sort by updateAt desc so the imported conversations land in the natural "most
+    // recent first" order alongside any PC-side conversations the user already had.
+    state.conversations = Array.from(existingById.values()).sort((a, b) => b.updateAt - a.updateAt);
+
+    // 助手记忆:Android 存在同库的 MemoryEntity 表(字段 id / assistant_id / content,无时间戳),
+    // PC 之前只读 ConversationEntity + message_node,完全漏了这张表。按 (assistantId, content) 去重
+    // merge 进 state.memories——PC 已有的相同内容不重复导入;Android 的 Int 自增 id 和 PC 的 id 空间
+    // 不一致,统一用 state.nextMemoryId 重新分配。global 记忆的 assistant_id 两端都是 "__global__"。
+    // MemoryEntity 不存在(老版本 APP / 空库)时查询抛错,静默跳过。
+    try {
+      const memoryRows = db.query("SELECT assistant_id, content FROM MemoryEntity").all() as Record<string, unknown>[];
+      const now = Date.now();
+      const seen = new Set(state.memories.map((m) => `${m.assistantId} ${m.content}`));
+      for (const row of memoryRows) {
+        const assistantId = String(row.assistant_id ?? GLOBAL_MEMORY_ID) || GLOBAL_MEMORY_ID;
+        const content = String(row.content ?? "").trim();
+        if (!content) continue;
+        const key = `${assistantId} ${content}`;
+        if (seen.has(key)) continue;
+        state.memories.push({
+          id: state.nextMemoryId++,
+          assistantId,
+          content,
+          createdAt: now,
+          updatedAt: now,
+        });
+        seen.add(key);
+      }
+    } catch (err) {
+      console.warn("[import] failed to read MemoryEntity table:", err);
+    }
+    return imported;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Deep-walk a JsonValue rewriting any string that matches Android's upload URL pattern
+ * (`file:///…/upload/<filename>` or just `…/upload/<filename>`) into PC's
+ * `/api/files/<id>/content` form, using the filename→pcFileId map built during the upload
+ * folder copy.
+ *
+ * Conservative — only matches the literal segment `upload/<filename>` and only rewrites
+ * when the filename is in our map. URLs we don't recognize pass through untouched, so
+ * tool-output JSON with arbitrary http/https URLs is unaffected.
+ */
+function rewriteAndroidFileUrlsDeep(value: JsonValue, map: Map<string, number>): JsonValue {
+  if (typeof value === "string") {
+    return rewriteAndroidFileUrl(value, map);
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => rewriteAndroidFileUrlsDeep(v, map));
+  }
+  if (value && typeof value === "object") {
+    const result: Record<string, JsonValue> = {};
+    for (const [k, v] of Object.entries(value)) {
+      result[k] = rewriteAndroidFileUrlsDeep(v as JsonValue, map);
+    }
+    return result;
+  }
+  return value;
+}
+
+function rewriteAndroidFileUrl(url: string, map: Map<string, number>): string {
+  // Match the last `upload/<filename>` segment. Android URI is `file:///data/.../files/upload/<uuid>.<ext>`;
+  // we strip everything up to and including the final `upload/` and use the trailing name.
+  const match = url.match(/(?:^|[/\\])upload[/\\]([^/\\?#]+)/);
+  if (!match) return url;
+  const filename = match[1];
+  const pcId = map.get(filename);
+  if (pcId === undefined) return url;
+  return `/api/files/${pcId}/content`;
+}
+
+/**
+ * Defensive shape-coercion from Android UIMessage JSON to PC Message. Bad rows return null
+ * (caller filters). Role enum is whitelisted to PC's 4 known values; anything else falls
+ * back to "USER" rather than producing an unrecognized role.
+ */
+function normalizeAndroidMessage(raw: unknown): Message | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const role = typeof r.role === "string" ? r.role.toUpperCase() : "USER";
+  const allowedRoles: Message["role"][] = ["USER", "ASSISTANT", "SYSTEM", "TOOL"];
+  const mappedRole: Message["role"] = (allowedRoles as string[]).includes(role)
+    ? (role as Message["role"])
+    : "USER";
+  return {
+    id: typeof r.id === "string" ? r.id : Bun.randomUUIDv7(),
+    role: mappedRole,
+    parts: Array.isArray(r.parts) ? (r.parts as JsonValue[]) : [],
+    annotations: Array.isArray(r.annotations) ? (r.annotations as JsonValue[]) : [],
+    createdAt: typeof r.createdAt === "string" ? r.createdAt : new Date().toISOString(),
+    finishedAt: typeof r.finishedAt === "string" ? r.finishedAt : null,
+    modelId: typeof r.modelId === "string" ? r.modelId : null,
+    usage: (r.usage ?? null) as JsonValue | null,
+    translation: typeof r.translation === "string" ? r.translation : null,
+  };
+}
+
+function guessMimeFromExt(ext: string): string {
+  const e = ext.toLowerCase().replace(/^\./, "");
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(e)) return `image/${e === "jpg" ? "jpeg" : e}`;
+  if (e === "pdf") return "application/pdf";
+  if (e === "docx") return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (e === "txt" || e === "md") return "text/plain";
+  return "application/octet-stream";
+}
+
+function copyDirRecursive(src: string, dest: string): number {
+  let count = 0;
+  for (const entry of readdirSync(src)) {
+    const srcPath = join(src, entry);
+    const destPath = join(dest, entry);
+    const stats = statSync(srcPath);
+    if (stats.isDirectory()) {
+      mkdirSync(destPath, { recursive: true });
+      count += copyDirRecursive(srcPath, destPath);
+    } else {
+      writeFileSync(destPath, readFileSync(srcPath));
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function webDavAuthHeader(config: WebDavConfig) {
+  return config.username || config.password
+    ? { Authorization: `Basic ${Buffer.from(`${config.username}:${config.password}`).toString("base64")}` }
+    : {};
+}
+
+function webDavUrl(config: WebDavConfig, fileName = "") {
+  const base = config.url.trim().replace(/\/+$/, "");
+  if (!base) throw new Error("WebDAV URL 为空");
+  const parts = [config.path, fileName]
+    .map((part) => String(part ?? "").trim().replace(/^\/+|\/+$/g, ""))
+    .filter(Boolean)
+    .map((part) => part.split("/").map(encodeURIComponent).join("/"));
+  return parts.length ? `${base}/${parts.join("/")}` : base;
+}
+
+async function webDavRequest(config: WebDavConfig, method: string, fileName = "", init: RequestInit & { timeoutMs?: number } = {}) {
+  const headers = {
+    ...webDavAuthHeader(config),
+    ...(init.headers as Record<string, string> | undefined ?? {}),
+  };
+  const timeoutMs = init.timeoutMs ?? 30_000;
+  const controller = new AbortController();
+  const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+  try {
+    return await fetch(webDavUrl(config, fileName), { ...init, method, headers, signal: controller.signal });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function webDavEnsureCollection(config: WebDavConfig) {
+  const check = await webDavRequest(config, "PROPFIND", "", {
+    headers: { Depth: "0", "Content-Type": "application/xml; charset=utf-8" },
+    body: "<D:propfind xmlns:D=\"DAV:\"><D:prop><D:resourcetype/></D:prop></D:propfind>",
+  });
+  if (check.ok || check.status === 207) return;
+  const create = await webDavRequest(config, "MKCOL");
+  if (!create.ok && create.status !== 405) {
+    throw new Error(`WebDAV 创建目录失败：${create.status} ${(await create.text()).slice(0, 500)}`);
+  }
+}
+
+// Wraps the current PC state in a zip that's:
+//   1) cross-platform compatible — Android's S3Sync / WebDavSync importer reads
+//      `settings.json` + `upload/<fileName>` + `skills/<name>/<...>` entries
+//   2) PC lossless — an additional `pc-backup.json` entry carries the full PC state
+//      (conversations, message tree, generatedImages, logs, etc.) WITHOUT inlining file
+//      bytes as base64. The Android side simply ignores the unknown entry; the PC side
+//      reads it on re-import for a full-fidelity round-trip.
+//
+// OOM safety: file bytes never go through the JS heap. PowerShell's Compress-Archive
+// streams them directly from the staging dir into the zip. This is the difference between
+// "exports a 5 GB attachment library cleanly" vs "OOM at JSON.stringify because we tried
+// to base64 every file into a single string".
+//
+// Entries written:
+//   settings.json          ← state.settings only (Android-compatible)
+//   pc-backup.json         ← full PC state w/o file bytes (PC-only fast lossless path)
+//   upload/<fileName>      ← raw file bytes for each state.files[]
+//   skills/<name>/<...>    ← recursive copy of context.filesDir/skills/
+//   (rikka_hub.db is intentionally absent — PC has no SQLite db.)
+
+// kotlinx.serialization uses the FQN of @Serializable subclasses as the polymorphic
+// discriminator value (no @SerialName annotation on Avatar.Dummy / Emoji / Image, so the
+// FQN is the default). PC internally uses short names — "dummy"/"emoji"/"image" — for
+// brevity in the UI code paths. When we hand off settings.json to Android we must rewrite
+// the avatar.type field to the FQN form, otherwise Android's BackupVM crashes with
+// "Serializer for subclass 'dummy' is not found in the polymorphic scope of 'Avatar'".
+// Same transform is applied in reverse when we import an Android-origin settings.json.
+const PC_AVATAR_TYPE_TO_ANDROID: Record<string, string> = {
+  dummy: "me.rerere.rikkahub.data.model.Avatar.Dummy",
+  emoji: "me.rerere.rikkahub.data.model.Avatar.Emoji",
+  image: "me.rerere.rikkahub.data.model.Avatar.Image",
+  url: "me.rerere.rikkahub.data.model.Avatar.Image",
+};
+const ANDROID_AVATAR_TYPE_TO_PC: Record<string, string> = Object.fromEntries(
+  Object.entries(PC_AVATAR_TYPE_TO_ANDROID).map(([pc, android]) => [android, pc]),
+);
+
+function mapAvatarType(value: JsonValue, mapping: Record<string, string>): JsonValue {
+  if (!isRecord(value)) return value;
+  const type = String(value.type ?? "");
+  if (!type || !mapping[type]) return value;
+  return { ...value, type: mapping[type] };
+}
+
+/** 方向感知的 settings 转换。
+ *  - "to-android"(默认,PC→APP 导出):映射 avatar + strip PC-only 字段 + role/reasoningLevel
+ *    转小写 + 空 UUID 填随机。strip 是 Android kotlinx.serialization 的硬要求——PC-only 字段
+ *    进去 Android 无法反序列化、Android Uuid 反序列化拒空串。
+ *  - "to-pc"(APP→PC 导入):只映射 avatar(Android FQN → PC 短格式)。不 strip、不填 UUID、不动
+ *    role——PC 端接受 null/大写,且 PC-only 字段(proxyConfig / preferredPort / 字体 / 助手的
+ *    mcpToolOverrides 等)必须原样保留,否则一次导入就会清空 PC 上已配置的代理、端口、字体
+ *    与 MCP 覆盖,也会把未选模型的 null chatModelId 填成不存在的随机 UUID。 */
+function rewriteAvatarsInSettings(settings: any, mapping: Record<string, string>, direction: "to-android" | "to-pc" = "to-android"): any {
+  if (!isRecord(settings)) return settings;
+  const stripPcOnly = direction === "to-android";
+  const copy: any = { ...settings };
+  if (Array.isArray(copy.assistants)) {
+    copy.assistants = copy.assistants.map((a: any) => {
+      if (!isRecord(a)) return a;
+      const fixed: any = { ...a };
+      if (fixed.avatar) fixed.avatar = mapAvatarType(fixed.avatar, mapping);
+      if (stripPcOnly) {
+        // reasoningLevel: PC uses "AUTO", Android expects "auto"
+        if (typeof fixed.reasoningLevel === "string") fixed.reasoningLevel = fixed.reasoningLevel.toLowerCase();
+        // presetMessages role: PC uses "USER"/"ASSISTANT", Android expects "user"/"assistant"
+        if (Array.isArray(fixed.presetMessages)) {
+          fixed.presetMessages = fixed.presetMessages.map((pm: any) =>
+            isRecord(pm) && typeof pm.role === "string" ? { ...pm, role: pm.role.toLowerCase() } : pm,
+          );
+        }
+        // Strip PC-only assistant fields that Android doesn't have
+        delete fixed.mcpToolOverrides;
+        delete fixed.allowConversationSystemPrompt;
+      }
+      return fixed;
+    });
+  }
+  // modeInjections role: PC uses "USER", Android expects "user"
+  if (stripPcOnly && Array.isArray(copy.modeInjections)) {
+    copy.modeInjections = copy.modeInjections.map((mi: any) =>
+      isRecord(mi) && typeof mi.role === "string" ? { ...mi, role: mi.role.toLowerCase() } : mi,
+    );
+  }
+  if (isRecord(copy.displaySetting)) {
+    const displaySetting = { ...(copy.displaySetting as Record<string, JsonValue>) };
+    if (displaySetting.userAvatar) {
+      displaySetting.userAvatar = mapAvatarType(displaySetting.userAvatar, mapping);
+    }
+    if (stripPcOnly) {
+      // Strip PC-only displaySetting fields that Android can't deserialize:
+      // - chatFontFamily: PC uses "" (empty string) which isn't a valid Android enum value
+      // - chatFontFamilyCss: PC-only CSS field
+      // - uiFontSize / chatFontSize: PC-only font size fields
+      const pcOnlyDisplayFields = ["chatFontFamily", "chatFontFamilyCss", "uiFontSize", "chatFontSize", "chatInputHeight"];
+      for (const field of pcOnlyDisplayFields) {
+        if (field in displaySetting) delete displaySetting[field];
+      }
+    }
+    copy.displaySetting = displaySetting;
+  }
+  if (stripPcOnly) {
+    // Strip PC-only top-level fields
+    delete copy.proxyConfig;
+    delete copy.preferredPort;
+    // Fix empty-string UUID fields — Android's Uuid deserializer rejects ""
+    const uuidFields = ["chatModelId", "titleModelId", "translateModeId", "suggestionModelId", "imageGenerationModelId", "ocrModelId", "compressModelId", "assistantId", "selectedTTSProviderId", "selectedASRProviderId"];
+    for (const field of uuidFields) {
+      if (field in copy && (copy[field] === "" || copy[field] === null || copy[field] === undefined)) {
+        copy[field] = crypto.randomUUID();
+      }
+    }
+  }
+  return copy;
+}
+
+/** Generate a Room-compatible SQLite database from PC's conversation data so Android can
+ *  restore chat history from a PC-origin backup zip. The schema matches Android's
+ *  rikka_hub.db exactly (ConversationEntity + message_node + room_master_table). */
+function generateRikkaHubDb(dbPath: string): boolean {
+  const cachedDbPath = join(dataDir, "rikka_hub_cached.db");
+  if (!existsSync(cachedDbPath)) return false;
+  try {
+    const cachedDb = new Database(cachedDbPath, { readonly: true });
+    const schemaRows = cachedDb.query("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 ELSE 3 END, name").all() as any[];
+    const uv = (cachedDb.query("PRAGMA user_version").get() as any)?.user_version ?? 18;
+    const roomRows = cachedDb.query("SELECT id, identity_hash FROM room_master_table").all() as any[];
+    const metaRows = cachedDb.query("SELECT locale FROM android_metadata").all() as any[];
+    cachedDb.close();
+    const db = new Database(":memory:");
+    db.exec(`PRAGMA user_version = ${uv}`);
+    for (const row of schemaRows) {
+      if (row.name === 'android_metadata' || row.name === 'room_master_table') {
+        try { db.exec(row.sql); } catch { /* */ }
+      }
+    }
+    for (const m of metaRows) { try { db.exec(`INSERT INTO android_metadata VALUES ('${m.locale}')`); } catch { /* */ } }
+    for (const r of roomRows as any[]) { try { db.exec(`INSERT INTO room_master_table VALUES (${r.id}, '${r.identity_hash}')`); } catch { /* */ } }
+    // FTS5 虚拟表(message_fts)及其影子表都必须排除——APP 端 Room 会在 onOpen 自行重建。
+    // 影子表(message_fts_data / _idx / _content / _config / _docsize)在 sqlite_master 里
+    // 是普通 CREATE TABLE,不含 "USING fts5",单纯正则命中不到;若作为孤儿表落进备份 .db,
+    // APP 端 Room onOpen 执行 CREATE VIRTUAL TABLE ... USING fts5 时,FTS5 会尝试再建影子表,
+    // 撞 "table 'message_fts_data' already exists" 直接崩溃(只要做过手机端适配,之后任何带
+    // 会话的 PC 导出导入 APP 都必崩)。先收集所有 FTS5 虚拟表名,再按 <vtab>_ 前缀排除影子表。
+    const ftsVirtualTableNames = new Set<string>();
+    for (const row of schemaRows) {
+      if (row.type === "table" && row.name && /\bUSING\s+fts5\b/i.test(row.sql ?? "")) {
+        ftsVirtualTableNames.add(row.name);
+      }
+    }
+    const isFtsShadowTable = (name: string) =>
+      [...ftsVirtualTableNames].some((vtab) => name.startsWith(vtab + "_"));
+    for (const row of schemaRows) {
+      if (row.name === 'android_metadata' || row.name === 'room_master_table') continue;
+      if (row.name?.startsWith('sqlite_')) continue;
+      if (/\bUSING\s+fts5\b/i.test(row.sql ?? "")) continue;
+      if (row.name && isFtsShadowTable(row.name)) continue;
+      try { db.exec(row.sql); } catch { /* */ }
+    }
+    insertConversationsIntoDb(db);
+    writeFileSync(dbPath, db.serialize());
+    db.close();
+    return true;
+  } catch (err) {
+    console.warn("[backup] cached db schema read failed:", err);
+    return false;
+  }
+}
+
+// ============================================================================
+// 会话活库(SQLite,1.2.6 引入)
+//
+// 会话从 state.json 搬进 rikka_hub.db,采用 Android APP 节点级 schema 的 PC 超集
+// (pc_conversation / pc_message_node,含 system_prompt / truncate_index——Android 备份库
+// 没有这两列)。内存模型 state.conversations 不变,启动时从这里整批读入;运行时:
+//   - 流式热路径:只 upsert 当前在长的那个 pc_message_node 行(脏标记 + 200ms 节流),
+//     SQLite 只把脏页追加进 WAL,开销与总会话数/总数据量无关——这是根除"每 200ms 全量
+//     重写 state.json"的关键。
+//   - 非流式变更(改名/编辑/分叉/导入/流结束):persistConversation 全量 reconcile。
+//
+// 与下方 insertConversationsIntoDb(写 Android 的 ConversationEntity/message_node)是不同
+// 文件、不同表名、不同 schema:备份库须 Android 兼容(有损、无 PC 超集列),活库须 PC 完整。
+// 备份始终从内存 state.conversations 现场生成,代码不动。详见设计文档。
+// ============================================================================
+
+// 活库行类型(SELECT 结果)。is_pinned 存 0/1;system_prompt 空 string 对应 null。
+interface PcConversationRow {
+  id: string;
+  assistant_id: string;
+  title: string;
+  system_prompt: string;
+  truncate_index: number;
+  suggestions: string;
+  is_pinned: number;
+  create_at: number;
+  update_at: number;
+}
+interface PcMessageNodeRow {
+  id: string;
+  node_index: number;
+  messages: string;
+  select_index: number;
+}
+
+/** 打开/创建会话活库并建表(幂等)。每次启动调一次,返回长连接。 */
+function openConversationsDb(): InstanceType<typeof Database> {
+  mkdirSync(dataDir, { recursive: true });
+  try {
+    return openConversationsDbUnsafe();
+  } catch (err) {
+    // 活库损坏(杀软隔离 / 磁盘错误 / 非 SQLite 文件 / 旧版残留)。1.2.5 前无 DB 依赖、服务
+    // 总能起来;1.2.6 不能因活库损坏让整个服务起不来。保留坏文件供事后取证,清旁文件,重建
+    // 空库。后续恢复:未迁移过 → migrateConversationsIfNeeded 从 state.json(方案 A 保住的
+    // 重试源)或 pre-sqlite.bak(方案 B)重新灌库;已迁移过 → 空库起步,坏文件已留存,用户
+    // 可用 sqlite3 .recover 手动 salvage。不自动用 stale 的 .bak 覆盖(已迁移后会话已变动,
+    // 回滚到迁移前会静默丢新增/复活已删,比空库更迷惑)。
+    console.error("[conv-db] 活库打开/建表失败,尝试隔离坏文件并重建:", err);
+    try {
+      if (existsSync(conversationsDbPath)) {
+        const corruptPath = `${conversationsDbPath}.corrupt-${Date.now()}`;
+        try { renameSync(conversationsDbPath, corruptPath); }
+        catch { /* 文件锁/权限:尽力而为,继续清旁文件重建 */ }
+      }
+      for (const suffix of ["-wal", "-shm"]) {
+        const sidecar = `${conversationsDbPath}${suffix}`;
+        if (existsSync(sidecar)) { try { unlinkSync(sidecar); } catch { /* best-effort */ } }
+      }
+      return openConversationsDbUnsafe();
+    } catch (err2) {
+      console.error("[conv-db] 重建活库仍失败,会话持久化不可用", err2);
+      throw err2;
+    }
+  }
+}
+
+/** 实际打开 + PRAGMA + 建表。抛错时确保关闭句柄(Windows 文件锁),否则 rename 会失败。 */
+function openConversationsDbUnsafe(): InstanceType<typeof Database> {
+  const db = new Database(conversationsDbPath, { create: true, readwrite: true });
+  try {
+    // WAL:脏页进 -wal 旁文件,不重写主库——这是"增量写"的根本机制。
+    // synchronous=NORMAL:WAL 下足够安全且更快(每次 commit 不强制 fsync)。
+    // foreign_keys=ON:CASCADE 删除依赖它(删会话行自动带走其节点)。
+    // busy_timeout:并发写竞争时等待而非立即报 SQLITE_BUSY。
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA synchronous = NORMAL");
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec("PRAGMA busy_timeout = 5000");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS pc_conversation (
+        id              TEXT PRIMARY KEY NOT NULL,
+        assistant_id    TEXT NOT NULL,
+        title           TEXT NOT NULL DEFAULT '',
+        system_prompt   TEXT NOT NULL DEFAULT '',
+        truncate_index  INTEGER NOT NULL DEFAULT -1,
+        suggestions     TEXT NOT NULL DEFAULT '[]',
+        is_pinned       INTEGER NOT NULL DEFAULT 0,
+        create_at       INTEGER NOT NULL,
+        update_at       INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS pc_message_node (
+        id              TEXT PRIMARY KEY NOT NULL,
+        conversation_id TEXT NOT NULL,
+        node_index      INTEGER NOT NULL,
+        messages        TEXT NOT NULL DEFAULT '[]',
+        select_index    INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY (conversation_id) REFERENCES pc_conversation(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pc_msg_node_conv ON pc_message_node(conversation_id);
+    `);
+    return db;
+  } catch (err) {
+    try { db.close(); } catch { /* best-effort:句柄随 GC 释放 */ }
+    throw err;
+  }
+}
+
+// 会话列表顺序 = state.conversations 数组顺序(GET /api/conversations 不排序,直接返回
+// 数组顺序)。而会话只在 unshift 时入数组(新建 L2057 / fork L14678),且 unshift 时刻
+// createAt = Date.now(),从不 sort/reorder/push。因此数组顺序严格等价于 createAt 倒序——
+// 这里用 ORDER BY create_at DESC, id DESC 还原,无需 sort_order 列、无需改内存模型。
+/** 读取全部会话(会话行 + 各自节点),组装成内存 Conversation[]。 */
+function loadAllConversationsFromDb(db: InstanceType<typeof Database>): Conversation[] {
+  const convRows = db.prepare(
+    "SELECT id, assistant_id, title, system_prompt, truncate_index, suggestions, is_pinned, create_at, update_at FROM pc_conversation ORDER BY create_at DESC, id DESC",
+  ).all() as PcConversationRow[];
+  const nodeStmt = db.prepare(
+    "SELECT id, node_index, messages, select_index FROM pc_message_node WHERE conversation_id = ? ORDER BY node_index ASC",
+  );
+  const conversations: Conversation[] = [];
+  for (const row of convRows) {
+    const nodeRows = nodeStmt.all(row.id) as PcMessageNodeRow[];
+    conversations.push({
+      id: row.id,
+      assistantId: row.assistant_id,
+      systemPrompt: row.system_prompt || null,
+      title: row.title ?? "",
+      messages: nodeRows.map((nr) => ({
+        id: nr.id,
+        messages: safeParseMessageArray(nr.messages),
+        selectIndex: nr.select_index ?? 0,
+      })),
+      truncateIndex: typeof row.truncate_index === "number" ? row.truncate_index : -1,
+      chatSuggestions: safeParseStringArray(row.suggestions),
+      isPinned: row.is_pinned === 1,
+      createAt: row.create_at,
+      updateAt: row.update_at,
+    });
+  }
+  return conversations;
+}
+
+function safeParseMessageArray(raw: string): Message[] {
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as Message[]) : [];
+  } catch {
+    return [];
+  }
+}
+function safeParseStringArray(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map((v) => String(v)) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** upsert 单个会话行(不含节点)。流式中 updateAt/title 变化、以及全量 reconcile 复用。 */
+function upsertConversationRow(conv: Conversation): void {
+  if (!conversationsDb) throw new Error("conversationsDb not open");
+  conversationsDb.prepare(
+    "INSERT OR REPLACE INTO pc_conversation (id, assistant_id, title, system_prompt, truncate_index, suggestions, is_pinned, create_at, update_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  ).run(
+    conv.id,
+    conv.assistantId || DEFAULT_ASSISTANT_ID,
+    conv.title || "",
+    conv.systemPrompt ?? "",
+    typeof conv.truncateIndex === "number" ? conv.truncateIndex : -1,
+    JSON.stringify(conv.chatSuggestions ?? []),
+    conv.isPinned ? 1 : 0,
+    conv.createAt || Date.now(),
+    conv.updateAt || Date.now(),
+  );
+}
+
+/** upsert 单个节点行(INSERT OR REPLACE)。流式热路径用,nodeIndex 由调用方提供。 */
+function upsertMessageNode(convId: string, node: MessageNode, nodeIndex: number): void {
+  if (!conversationsDb) throw new Error("conversationsDb not open");
+  conversationsDb.prepare(
+    "INSERT OR REPLACE INTO pc_message_node (id, conversation_id, node_index, messages, select_index) VALUES (?, ?, ?, ?, ?)",
+  ).run(
+    node.id,
+    convId,
+    nodeIndex,
+    JSON.stringify(node.messages ?? []),
+    node.selectIndex ?? 0,
+  );
+}
+
+/**
+ * 全量 reconcile:事务内 upsert 会话行 + 删除该会话全部旧节点 + 按当前顺序重插。
+ * 给非流式一次性变更用(改名/置顶/编辑/分叉/导入/流结束)。处理节点增删/重排,显而易见
+ * 地正确;一次用户动作调一次,可承受。
+ */
+function persistConversation(conv: Conversation): void {
+  if (!conversationsDb) throw new Error("conversationsDb not open");
+  const db = conversationsDb;
+  const deleteNodes = db.prepare("DELETE FROM pc_message_node WHERE conversation_id = ?");
+  const insertNode = db.prepare(
+    "INSERT OR REPLACE INTO pc_message_node (id, conversation_id, node_index, messages, select_index) VALUES (?, ?, ?, ?, ?)",
+  );
+  const txn = db.transaction(() => {
+    upsertConversationRow(conv);
+    deleteNodes.run(conv.id);
+    for (let i = 0; i < (conv.messages ?? []).length; i += 1) {
+      const node = conv.messages[i];
+      if (!node?.id) continue;
+      insertNode.run(node.id, conv.id, i, JSON.stringify(node.messages ?? []), node.selectIndex ?? 0);
+    }
+  });
+  txn();
+}
+
+/** 删除会话(CASCADE 带走其节点行,依赖 foreign_keys=ON)。 */
+function deletePcConversations(ids: string[]): void {
+  if (!conversationsDb || ids.length === 0) return;
+  const stmt = conversationsDb.prepare("DELETE FROM pc_conversation WHERE id = ?");
+  const txn = conversationsDb.transaction(() => {
+    for (const idValue of ids) stmt.run(idValue);
+  });
+  txn();
+}
+
+/** 会话总数。迁移校验/自测用。 */
+function countPcConversations(db: InstanceType<typeof Database>): number {
+  const row = db.prepare("SELECT COUNT(*) AS n FROM pc_conversation").get() as { n: number } | null;
+  return row?.n ?? 0;
+}
+
+// ----- 流式脏标记 + 节流 flush(仅会话活库用)-----
+//
+// 流式热路径不再走 scheduleThrottledSaveState(那会全量重写 state.json)。改成:每个 chunk
+// 把"正在长的会话行 + 节点"标脏,200ms 合并后逐个 upsert 进活库。多路流式并发时,脏集合
+// 累积各自 (convId, nodeId),flush 时从内存 state 算出正确 nodeIndex 逐行 upsert,SQLite
+// WAL 自带写串行化。bun:sqlite 同步,但单行 upsert 亚毫秒,阻塞可忽略。
+
+const dirtyConversationIds = new Set<string>();
+const dirtyNodeKeys = new Set<string>(); // `${convId}::${nodeId}`
+let pendingConvFlush: ReturnType<typeof setTimeout> | null = null;
+let lastConvFlushMs = 0;
+const CONV_FLUSH_INTERVAL_MS = 200;
+
+function markConversationRowDirty(convId: string): void {
+  dirtyConversationIds.add(convId);
+}
+function markMessageNodeDirty(convId: string, nodeId: string): void {
+  dirtyNodeKeys.add(`${convId}::${nodeId}`);
+}
+
+/**
+ * 遍历脏集合逐行 upsert,然后清空。从内存 state 解析 nodeIndex;若会话/节点已被并发删除
+ * (如流式中删会话),跳过——避免 INSERT OR REPLACE 把已删的行又建回来。
+ */
+function flushConvDirty(): void {
+  if (!conversationsDb) return;
+  lastConvFlushMs = Date.now();
+  const convIds = Array.from(dirtyConversationIds);
+  dirtyConversationIds.clear();
+  const nodeKeys = Array.from(dirtyNodeKeys);
+  dirtyNodeKeys.clear();
+  for (const convId of convIds) {
+    const conv = state.conversations.find((c) => c.id === convId);
+    if (!conv) continue;
+    try {
+      upsertConversationRow(conv);
+    } catch (err) {
+      console.warn("[conv-db] upsert conversation row failed", convId, err);
+    }
+  }
+  for (const key of nodeKeys) {
+    const sep = key.indexOf("::");
+    if (sep < 0) continue;
+    const convId = key.slice(0, sep);
+    const nodeId = key.slice(sep + 2);
+    const conv = state.conversations.find((c) => c.id === convId);
+    if (!conv) continue; // 删除正在流的会话竞态:会话已不在内存,不重建行
+    const idx = conv.messages.findIndex((n) => n.id === nodeId);
+    if (idx < 0) continue; // 节点已被删除/替换
+    try {
+      upsertMessageNode(convId, conv.messages[idx], idx);
+    } catch (err) {
+      console.warn("[conv-db] upsert message node failed", convId, nodeId, err);
+    }
+  }
+}
+
+/** 200ms 节流合并(镜像 scheduleThrottledSaveState 的结构,但同步执行——单行 upsert 亚毫秒)。 */
+function scheduleThrottledConvFlush(): void {
+  const now = Date.now();
+  const elapsed = now - lastConvFlushMs;
+  if (elapsed >= CONV_FLUSH_INTERVAL_MS) {
+    if (pendingConvFlush) {
+      clearTimeout(pendingConvFlush);
+      pendingConvFlush = null;
+    }
+    flushConvDirty();
+    return;
+  }
+  if (pendingConvFlush) return;
+  pendingConvFlush = setTimeout(() => {
+    pendingConvFlush = null;
+    flushConvDirty();
+  }, CONV_FLUSH_INTERVAL_MS - elapsed);
+}
+
+/** 立即 flush 并取消 pending 定时器。关停/流结束/导入前用。 */
+function flushConvDirtyNow(): void {
+  if (pendingConvFlush) {
+    clearTimeout(pendingConvFlush);
+    pendingConvFlush = null;
+  }
+  flushConvDirty();
+}
+
+// ----- 1.2.6 迁移:state.json conversations → 活库(一次性,P1)-----
+//
+// 触发条件:state.json 仍含 conversations 数组 且 appliedMigrations 不含
+// "conversations-sqlite-1.2.6"。流程(崩溃安全):
+//   ① 备份 state.json → state.json.pre-sqlite.bak(降级安全网,已存在不覆盖)
+//   ② 灌库(单事务,INSERT OR REPLACE 幂等)
+//   ③ 写瘦 state.json(删 conversations + 加迁移标记,temp+rename 原子)
+// 崩在 ①②:state.json 未变,重跑幂等;崩在 ③:temp 未 rename,重跑。无数据丢失。
+
+/**
+ * 批量灌库(单事务)。比逐个 persistConversation 快(1 个事务 vs N 个)。迁移用。
+ * INSERT OR REPLACE 幂等——中途失败重跑不重复/不冲突。
+ */
+function migrateConversationsIntoDb(db: InstanceType<typeof Database>, conversations: Conversation[]): void {
+  const upsertConv = db.prepare(
+    "INSERT OR REPLACE INTO pc_conversation (id, assistant_id, title, system_prompt, truncate_index, suggestions, is_pinned, create_at, update_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  const insertNode = db.prepare(
+    "INSERT OR REPLACE INTO pc_message_node (id, conversation_id, node_index, messages, select_index) VALUES (?, ?, ?, ?, ?)",
+  );
+  const txn = db.transaction(() => {
+    for (const conv of conversations) {
+      upsertConv.run(
+        conv.id,
+        conv.assistantId || DEFAULT_ASSISTANT_ID,
+        conv.title || "",
+        conv.systemPrompt ?? "",
+        typeof conv.truncateIndex === "number" ? conv.truncateIndex : -1,
+        JSON.stringify(conv.chatSuggestions ?? []),
+        conv.isPinned ? 1 : 0,
+        conv.createAt || Date.now(),
+        conv.updateAt || Date.now(),
+      );
+      for (let i = 0; i < (conv.messages ?? []).length; i += 1) {
+        const node = conv.messages[i];
+        if (!node?.id) continue;
+        insertNode.run(node.id, conv.id, i, JSON.stringify(node.messages ?? []), node.selectIndex ?? 0);
+      }
+    }
+  });
+  txn();
+}
+
+/**
+ * 首次升级到 SQLite 版:① 备份 .bak → ② 灌库 → ③ 写瘦 state.json。
+ * @returns true=已迁移/迁移成功(从活库读);false=灌库失败(本次用 parsed.conversations 兜底,
+ *          state.json 保持原样,下次启动重试)。
+ */
+function migrateConversationsIfNeeded(parsed: Partial<State>): boolean {
+  const appliedMigrations = Array.isArray(parsed.appliedMigrations) ? parsed.appliedMigrations : [];
+  if (appliedMigrations.includes(CONVERSATIONS_SQLITE_MIGRATION)) return true;
+
+  let conversationsToMigrate = Array.isArray(parsed.conversations) ? parsed.conversations : [];
+  const preSqliteBakPath = join(dataDir, "state.json.pre-sqlite.bak");
+
+  // 方案 B(兜底):state.json 已无 conversations,但 pre-sqlite.bak 里有——说明上次迁移
+  // 失败、saveState 把会话从 state.json 抹空了(此路径已被 performStateSave 的标记门闸堵住,
+  // 这里是纵深防御,捕获任何把 state.json 抹空的未知途径)。从 .bak 救回重灌。
+  // 仅在迁移标记未写时执行:已迁移用户的空活库是合法空状态(用户删光了),不能误复活。
+  // 标记已写会在上面 L3888 早退,不会走到这里。
+  if (conversationsToMigrate.length === 0) {
+    const fromBak = recoverConversationsFromBak();
+    if (fromBak.length > 0) {
+      console.log(`[conv-db] 检测到迁移失败残留:从 pre-sqlite.bak 恢复 ${fromBak.length} 条会话`);
+      conversationsToMigrate = fromBak;
+    }
+  }
+
+  // ① 备份(只在有会话、state.json 存在、.bak 不存在时;防覆盖已有备份)
+  if (conversationsToMigrate.length > 0 && existsSync(statePath) && !existsSync(preSqliteBakPath)) {
+    try {
+      copyFileSync(statePath, preSqliteBakPath);
+    } catch (err) {
+      console.warn("[conv-db] pre-sqlite 备份失败(继续迁移)", err);
+    }
+  }
+
+  // ② 灌库(单事务,幂等)。巨量会话卡几秒——这是一次性的。
+  if (conversationsToMigrate.length > 0) {
+    console.log(`[conv-db] 首次升级:迁移 ${conversationsToMigrate.length} 条会话进 SQLite 活库...`);
+    try {
+      migrateConversationsIntoDb(conversationsDb!, conversationsToMigrate);
+      console.log("[conv-db] 会话迁移完成");
+    } catch (err) {
+      console.error("[conv-db] 会话迁移失败,保留 state.json 原样,下次启动重试", err);
+      return false;
+    }
+  }
+
+  // ③ 写瘦 state.json(删 conversations + 加迁移标记)
+  parsed.appliedMigrations = [...appliedMigrations, CONVERSATIONS_SQLITE_MIGRATION];
+  delete (parsed as { conversations?: Conversation[] }).conversations;
+  try {
+    writeSlimStateJsonSync(parsed);
+  } catch (err) {
+    console.warn("[conv-db] 写瘦 state.json 失败(活库已迁移,内存继续)", err);
+  }
+  return true;
+}
+
+/** 同步 temp+rename 写瘦 state.json。loadState 启动阶段用(不能异步)。 */
+function writeSlimStateJsonSync(data: Partial<State>): void {
+  const slimContent = JSON.stringify({ ...data, logs: undefined, conversations: undefined });
+  const tempPath = `${statePath}.migrate.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tempPath, slimContent);
+  try {
+    renameSync(tempPath, statePath);
+  } catch (err) {
+    try { unlinkSync(tempPath); } catch { /* cleanup best-effort */ }
+    throw err;
+  }
+}
+
+/** 从 state.json.pre-sqlite.bak 读 conversations(活库损坏时的最后兜底)。 */
+function recoverConversationsFromBak(): Conversation[] {
+  const bakPath = join(dataDir, "state.json.pre-sqlite.bak");
+  try {
+    if (!existsSync(bakPath)) return [];
+    const bakParsed = JSON.parse(readFileSync(bakPath, "utf8")) as Partial<State>;
+    return Array.isArray(bakParsed.conversations) ? bakParsed.conversations : [];
+  } catch (err) {
+    console.error("[conv-db] pre-sqlite.bak 恢复失败", err);
+    return [];
+  }
+}
+
+function loadConversationsFromDbWithFallback(): Conversation[] {
+  try {
+    return loadAllConversationsFromDb(conversationsDb!);
+  } catch (err) {
+    console.error("[conv-db] 活库读取失败,从 state.json.pre-sqlite.bak 恢复", err);
+    return recoverConversationsFromBak();
+  }
+}
+
+/** 重灌活库为给定会话集:删除所有会话行(CASCADE 带走节点)+ 单事务灌入。
+ *  导入备份用——state.conversations 整体被替换/合并,活库必须同步。 */
+function resetConversationsDbTo(conversations: Conversation[]): void {
+  if (!conversationsDb) throw new Error("conversationsDb not open");
+  const db = conversationsDb;
+  const txn = db.transaction(() => {
+    db.exec("DELETE FROM pc_conversation");
+    migrateConversationsIntoDb(db, conversations);
+  });
+  txn();
+}
+
+/** 导入备份收尾:中止所有流 + 清脏 + 重灌活库为当前 state.conversations。
+ *  state.conversations 在导入流程里被整体替换/合并,活库必须同步重灌,否则重启后
+ *  loadAllConversationsFromDb 读到旧活库、导入的会话丢失。中止所有流 + 清脏防竞态
+ *  (流式中导入备份:否则流式循环会继续 upsert 旧节点进刚重灌的活库)。 */
+function finalizeConversationImport(): void {
+  // 中止所有流(手动,不走 abortConversationGeneration 以免它 persist——马上要全量重灌)
+  for (const conversationId of Array.from(generating.keys())) {
+    generating.get(conversationId)?.abort();
+  }
+  generating.clear();
+  if (pendingConvFlush) {
+    clearTimeout(pendingConvFlush);
+    pendingConvFlush = null;
+  }
+  dirtyConversationIds.clear();
+  dirtyNodeKeys.clear();
+  resetConversationsDbTo(state.conversations);
+}
+
+function insertConversationsIntoDb(db: InstanceType<typeof Database>) {
+  const insertConv = db.prepare("INSERT OR REPLACE INTO ConversationEntity (id, assistant_id, title, nodes, create_at, update_at, suggestions, is_pinned) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+  const insertNode = db.prepare("INSERT OR REPLACE INTO message_node (id, conversation_id, node_index, messages, select_index) VALUES (?, ?, ?, ?, ?)");
+  const txn = db.transaction(() => {
+    for (const conv of state.conversations) {
+      try {
+        insertConv.run(conv.id, conv.assistantId || "0950e2dc-9bd5-4801-afa3-aa887aa36b4e", conv.title || "", "[]", conv.createAt || Date.now(), conv.updateAt || Date.now(), JSON.stringify(conv.chatSuggestions || []), conv.isPinned ? 1 : 0);
+        for (let i = 0; i < (conv.messages || []).length; i++) {
+          const node = conv.messages[i];
+          if (!node?.id) continue;
+          const toLocalDt = (v: any) => typeof v === "string" ? v.replace(/Z$/, "").replace(/[+-]\d{2}:\d{2}$/, "") : v;
+          const toInstant = (v: any) => typeof v === "string" && v && !v.endsWith("Z") && !/[+-]\d{2}:\d{2}$/.test(v) ? v + "Z" : v;
+          const fixParts = (parts: any[]) => parts.map((p: any) => {
+            if (!p || typeof p !== "object") return p;
+            const fixed = { ...p };
+            if (fixed.createdAt) fixed.createdAt = toInstant(fixed.createdAt);
+            if (fixed.finishedAt) fixed.finishedAt = toInstant(fixed.finishedAt);
+            return fixed;
+          });
+          const msgs = (node.messages || []).map((m: any) => ({ id: m.id || null, role: String(m.role || "user").toLowerCase(), parts: fixParts(m.parts || []), annotations: m.annotations || [], createdAt: toLocalDt(m.createdAt), finishedAt: toLocalDt(m.finishedAt), modelId: m.modelId || null, usage: m.usage || null, translation: m.translation || null }));
+          insertNode.run(node.id, conv.id, i, JSON.stringify(msgs), node.selectIndex ?? 0);
+        }
+      } catch (err) { console.warn(`[backup] skipping conversation ${conv.id}: ${err}`); }
+    }
+  });
+  txn();
+}
+
+
+
+function createSettingsBackupZip(): Buffer {
+  const tmpRoot = join(tempDir(), `rikkahub-backup-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const stageDir = join(tmpRoot, "stage");
+  mkdirSync(stageDir, { recursive: true });
+  try {
+    // settings.json — Android reads this via SettingsJsonMigrator + Json {ignoreUnknownKeys=true},
+    // so PC-only fields are tolerated. PC's state.settings is structurally aligned with
+    // Android's Settings class (this is a port). Fields Android doesn't recognize fall through
+    // to defaults, which matches what happens when you restore a PC-origin backup to Android.
+    // Rewrite PC's short avatar.type strings into Android's FQN form so the manifest
+    // parses cleanly on the phone. PC's own pc-backup.json keeps the short form (we
+    // round-trip it through our normalize logic).
+    writeFileSync(
+      join(stageDir, "settings.json"),
+      JSON.stringify(rewriteAvatarsInSettings(state.settings, PC_AVATAR_TYPE_TO_ANDROID), null, 2),
+    );
+
+    // pc-backup.json — full PC state for lossless self-restore. Critically, this does NOT
+    // contain file byte data (`backupPayloadMetadataOnly()` strips it); the bytes live in
+    // upload/<fileName> entries below and get re-linked during restoreFromPcBackupExtractDir.
+    // Without this separation a user with multi-GB of attachments would OOM on JSON.stringify.
+    writeFileSync(join(stageDir, "pc-backup.json"), JSON.stringify(backupPayloadMetadataOnly(), null, 2));
+    // Generate rikka_hub.db so Android can restore conversations. PC stores conversations
+    // in state.json; Android stores them in a Room SQLite database. We create a compatible
+    // db from PC's conversation data so the zip is fully restorable on the phone.
+    let dbGenerated = false;
+    if (state.conversations.length > 0) {
+      const dbPath = join(stageDir, "rikka_hub.db");
+      try {
+        dbGenerated = generateRikkaHubDb(dbPath);
+      } catch (dbErr) {
+        console.error("[backup] generateRikkaHubDb failed:", dbErr);
+        if (existsSync(dbPath)) try { rmSync(dbPath); } catch { /* */ }
+      }
+      if (dbGenerated) {
+        for (const suffix of ["-wal", "-shm", "-journal"]) {
+          const p = dbPath + suffix;
+          if (existsSync(p)) try { rmSync(p); } catch { /* */ }
+        }
+        writeFileSync(join(stageDir, "rikka_hub-wal"), Buffer.alloc(0));
+        writeFileSync(join(stageDir, "rikka_hub-shm"), Buffer.alloc(0));
+      } else {
+        if (existsSync(dbPath)) try { rmSync(dbPath); } catch { /* */ }
+      }
+    }
+
+    // upload/<displayName> — Android writes one entry per uploaded file under FileFolders.UPLOAD,
+    // keyed by the file's display name. PC stores files on disk as `<numericId>.<ext>` but tracks
+    // the original display name in state.files[].fileName; we honor that name in the zip so the
+    // Android side can restore them under their original identity. The bytes are copied via
+    // readFileSync/writeFileSync chunk-by-chunk into the staging dir, never held in memory all
+    // at once.
+    if (state.files.length > 0) {
+      const uploadStage = join(stageDir, "upload");
+      mkdirSync(uploadStage, { recursive: true });
+      const usedNames = new Set<string>();
+      let skippedFiles = 0;
+      for (const file of state.files) {
+        // path 可能因跨机器/跨平台迁移 state.json、或 dataDir 漂移而失效(指向不存在的文件)。
+        // PC 文件命名固定为 <id>.<ext>,path 找不到时回退到 filesDir 下按 id 重找,尽量不丢附件。
+        let srcPath = file.path;
+        if (!srcPath || !existsSync(srcPath)) {
+          const ext = extname(file.fileName || "") || extname(file.path || "") || "";
+          const fallback = join(filesDir, `${file.id}${ext}`);
+          srcPath = existsSync(fallback) ? fallback : "";
+        }
+        if (!srcPath) {
+          skippedFiles++;
+          continue;
+        }
+        let name = file.fileName || `${file.id}${extname(srcPath) || ""}`;
+        // Two separately-uploaded files can legitimately share a display name. Disambiguate by
+        // suffixing the PC numeric id so neither gets overwritten in the zip.
+        if (usedNames.has(name)) {
+          const ext = extname(name);
+          const stem = name.slice(0, name.length - ext.length);
+          name = `${stem}_${file.id}${ext}`;
+        }
+        usedNames.add(name);
+        try {
+          // Bun.file().readableStream().pipe-style copy would be ideal but Bun.write supports
+          // a File source which streams under the hood. Use that for OOM safety on huge files.
+          const srcFile = Bun.file(srcPath);
+          // Synchronous variant — keeps the existing single-threaded compile flow. For >2GB
+          // single files this could still spike, but those are rare in the wild and the JS
+          // engine can stream a single file fine; the real OOM risk was the *aggregate*
+          // base64-inlining path, which is now gone.
+          writeFileSync(join(uploadStage, name), readFileSync(srcPath));
+          void srcFile;
+        } catch (copyErr) {
+          console.warn("[backup] failed to stage upload file", srcPath, copyErr);
+        }
+      }
+      if (skippedFiles > 0) {
+        console.warn(`[backup] ⚠️ ${skippedFiles}/${state.files.length} attachment(s) skipped — source file missing (path invalid or file deleted). They will NOT be in the backup.`);
+      }
+    }
+
+    // skills/<skillName>/<...> — Android writes the entire skills directory recursively;
+    // we do the same since PC's on-disk layout (skillsDir/<skillName>/...) matches.
+    if (existsSync(skillsDir)) {
+      const skillsStage = join(stageDir, "skills");
+      mkdirSync(skillsStage, { recursive: true });
+      copyDirRecursive(skillsDir, skillsStage);
+    }
+
+    const zipPath = join(tmpRoot, "backup.zip");
+    if (process.platform === "win32") {
+      const script = [
+        "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+        `[System.IO.Compression.ZipFile]::CreateFromDirectory('${stageDir.replace(/'/g, "''")}', '${zipPath.replace(/'/g, "''")}')`,
+      ].join("; ");
+      const proc = Bun.spawnSync(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]);
+      if (proc.exitCode !== 0) {
+        throw new Error(`Failed to create backup zip: ${new TextDecoder().decode(proc.stderr ?? new Uint8Array()).slice(0, 300)}`);
+      }
+    } else {
+      const proc = Bun.spawnSync(["zip", "-rq", zipPath, "."], { cwd: stageDir });
+      if (proc.exitCode !== 0) {
+        throw new Error(`Failed to create backup zip: ${new TextDecoder().decode(proc.stderr ?? new Uint8Array()).slice(0, 300)}`);
+      }
+    }
+    return readFileSync(zipPath);
+  } finally {
+    try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
+// Variant that writes the zip directly to a caller-provided path and returns its size. Used
+// by the local-export endpoint to avoid pulling the whole zip into a Buffer just to turn
+// around and stream it as the HTTP response — for users with multi-GB attachments, the zip
+// itself can exceed 4 GB and Buffer.from(...) on it is an OOM in waiting.
+function createSettingsBackupZipToPath(targetZipPath: string, onProgress?: (message: string) => void): number {
+  const tmpRoot = join(tempDir(), `rikkahub-backup-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const stageDir = join(tmpRoot, "stage");
+  mkdirSync(stageDir, { recursive: true });
+  try {
+    onProgress?.("正在准备配置文件...");
+    console.log(`[backup] staging settings.json...`);
+    // 导出时剥离移动端不兼容的模型模态(AUDIO/VIDEO/DOCUMENT),避免移动端导入崩溃
+    // (Issue #11)。仅作用于备份文件内容,不改内存中的运行时 state.settings。
+    const sanitizedSettings = sanitizeModelModalitiesForExport(state.settings);
+    writeFileSync(
+      join(stageDir, "settings.json"),
+      safeJsonStringify(rewriteAvatarsInSettings(sanitizedSettings, PC_AVATAR_TYPE_TO_ANDROID)),
+    );
+    console.log(`[backup] staging pc-backup.json...`);
+    writeFileSync(
+      join(stageDir, "pc-backup.json"),
+      safeJsonStringify(backupPayloadMetadataOnly(sanitizedSettings)),
+    );
+    if (state.conversations.length > 0) {
+      onProgress?.("正在生成对话数据库...");
+      const dbPath = join(stageDir, "rikka_hub.db");
+      try {
+        const ok = generateRikkaHubDb(dbPath);
+        if (ok) {
+          for (const suffix of ["-wal", "-shm", "-journal"]) {
+            const p = dbPath + suffix;
+            if (existsSync(p)) try { rmSync(p); } catch { /* */ }
+          }
+          writeFileSync(join(stageDir, "rikka_hub-wal"), Buffer.alloc(0));
+          writeFileSync(join(stageDir, "rikka_hub-shm"), Buffer.alloc(0));
+        } else {
+          if (existsSync(dbPath)) try { rmSync(dbPath); } catch { /* */ }
+        }
+      } catch (dbErr) {
+        console.error("[backup] generateRikkaHubDb failed:", dbErr);
+        if (existsSync(dbPath)) try { rmSync(dbPath); } catch { /* */ }
+      }
+    }
+    if (state.files.length > 0) {
+      const uploadStage = join(stageDir, "upload");
+      mkdirSync(uploadStage, { recursive: true });
+      const usedNames = new Set<string>();
+      const totalFiles = state.files.length;
+      let stagedFiles = 0;
+      let skippedFiles = 0;
+      for (const file of state.files) {
+        // path 可能因跨机器/跨平台迁移 state.json、或 dataDir 漂移而失效(指向不存在的文件)。
+        // PC 文件命名固定为 <id>.<ext>,path 找不到时回退到 filesDir 下按 id 重找,尽量不丢附件。
+        let srcPath = file.path;
+        if (!srcPath || !existsSync(srcPath)) {
+          const ext = extname(file.fileName || "") || extname(file.path || "") || "";
+          const fallback = join(filesDir, `${file.id}${ext}`);
+          srcPath = existsSync(fallback) ? fallback : "";
+        }
+        if (!srcPath) {
+          skippedFiles++;
+          continue;
+        }
+        let name = file.fileName || `${file.id}${extname(srcPath) || ""}`;
+        if (usedNames.has(name)) {
+          const ext = extname(name);
+          const stem = name.slice(0, name.length - ext.length);
+          name = `${stem}_${file.id}${ext}`;
+        }
+        usedNames.add(name);
+        stagedFiles++;
+        onProgress?.(`正在打包附件 (${stagedFiles}/${totalFiles})...`);
+        try {
+          writeFileSync(join(uploadStage, name), readFileSync(srcPath));
+        } catch (copyErr) {
+          console.warn("[backup] failed to stage upload file", srcPath, copyErr);
+        }
+      }
+      if (skippedFiles > 0) {
+        console.warn(`[backup] ⚠️ ${skippedFiles}/${totalFiles} attachment(s) skipped — source file missing (path invalid or file deleted). They will NOT be in the backup.`);
+      }
+    }
+    if (existsSync(skillsDir)) {
+      onProgress?.("正在打包技能文件...");
+      const skillsStage = join(stageDir, "skills");
+      mkdirSync(skillsStage, { recursive: true });
+      copyDirRecursive(skillsDir, skillsStage);
+    }
+    onProgress?.("正在压缩...");
+    if (existsSync(targetZipPath)) rmSync(targetZipPath);
+    console.log(`[backup] creating zip from ${stageDir} → ${targetZipPath} (${readdirSync(stageDir).join(", ")})`);
+    if (process.platform === "win32") {
+      const script = [
+        "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+        `[System.IO.Compression.ZipFile]::CreateFromDirectory('${stageDir.replace(/'/g, "''")}', '${targetZipPath.replace(/'/g, "''")}')`,
+      ].join("; ");
+      const proc = Bun.spawnSync(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], { timeout: 120_000 });
+      if (proc.exitCode !== 0) {
+        const stderr = new TextDecoder().decode(proc.stderr ?? new Uint8Array()).slice(0, 500);
+        const stdout = new TextDecoder().decode(proc.stdout ?? new Uint8Array()).slice(0, 200);
+        console.error("[backup] zip creation failed, exit:", proc.exitCode, "stderr:", stderr, "stdout:", stdout);
+        throw new Error(`Zip creation failed (exit ${proc.exitCode}): ${stderr || stdout || "unknown error"}`);
+      }
+    } else {
+      const proc = Bun.spawnSync(["zip", "-rq", targetZipPath, "."], { cwd: stageDir, timeout: 120_000 });
+      if (proc.exitCode !== 0) {
+        const stderr = new TextDecoder().decode(proc.stderr ?? new Uint8Array()).slice(0, 500);
+        console.error("[backup] zip creation failed, exit:", proc.exitCode, "stderr:", stderr);
+        throw new Error(`Zip creation failed (exit ${proc.exitCode}): ${stderr || "unknown error"}`);
+      }
+    }
+    if (!existsSync(targetZipPath)) {
+      throw new Error("Zip file was not created (file missing after archiver exited 0)");
+    }
+    return statSync(targetZipPath).size;
+  } finally {
+    try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
+// Restore from either a legacy `.json` backup (PC's pre-zip format) or a `.zip` backup
+// (current cross-platform format — same layout whether the zip was written by Android or PC).
+// All zip restores route through applyAndroidZipBackupFromPath, which already understands the
+// Android backup layout (settings.json + upload/ + skills/ + rikka_hub.db).
+function restoreBackupBuffer(buffer: Buffer, fileName: string): void {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith(".zip")) {
+    const tmpRoot = join(tempDir(), `rikkahub-restore-${Date.now()}`);
+    mkdirSync(tmpRoot, { recursive: true });
+    const zipPath = join(tmpRoot, fileName.replace(/[^A-Za-z0-9._\-]/g, "_") || "backup.zip");
+    try {
+      writeFileSync(zipPath, buffer);
+      applyAndroidZipBackupFromPath(zipPath);
+    } finally {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    return;
+  }
+  // Legacy JSON path — backups written by older PC versions before zip support.
+  applyBackupPayload(JSON.parse(buffer.toString("utf-8")));
+}
+
+function safeJsonStringify(value: unknown): string {
+  const seen = new WeakSet();
+  return JSON.stringify(value, (_key, val) => {
+    if (typeof val === "bigint") return Number(val);
+    if (val !== null && typeof val === "object") {
+      if (seen.has(val)) return undefined;
+      seen.add(val);
+    }
+    return val;
+  }, 2);
+}
+
+function backupStamp(): string {
+  // Match Android's DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss") so the filename stamp lines up.
+  return new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "_");
+}
+
+/** Stream an HTTP response body to a temp file (no in-JS-memory buffering) and route the
+ *  saved file through applyAndroidZipBackupFromPath / applyBackupPayload as appropriate.
+ *  Used by s3Restore + webDavRestore. Mirrors the local data/import streaming-path so
+ *  multi-GB backups can be restored from cloud the same way they can from a local picker. */
+async function streamResponseToTempAndRestore(response: Response, fileName: string, onProgress?: (message: string, percent?: number) => void): Promise<void> {
+  const tmpRoot = join(tempDir(), `rikkahub-restore-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  mkdirSync(tmpRoot, { recursive: true });
+  const sanitized = fileName.replace(/[^A-Za-z0-9._\-]/g, "_") || "backup.zip";
+  const onDiskName = sanitized.toLowerCase().endsWith(".zip") || sanitized.toLowerCase().endsWith(".json")
+    ? sanitized
+    : `${sanitized}.zip`;
+  const onDiskPath = join(tmpRoot, onDiskName);
+  try {
+    const body = response.body;
+    if (!body) throw new Error("Empty response body");
+    const totalSize = Number(response.headers.get("Content-Length") || "0");
+    let downloaded = 0;
+    const writer = Bun.file(onDiskPath).writer();
+    const reader = body.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        writer.write(value);
+        downloaded += value.length;
+        if (totalSize > 0) {
+          const pct = Math.round(downloaded / totalSize * 100);
+          onProgress?.(`正在下载 (${pct}%)`, pct);
+        }
+      }
+    } finally {
+      await writer.end();
+    }
+    onProgress?.("正在导入数据...");
+    const magic = new Uint8Array(await Bun.file(onDiskPath).slice(0, 4).arrayBuffer());
+    const isZip = magic.length >= 4 && magic[0] === 0x50 && magic[1] === 0x4B && magic[2] === 0x03 && magic[3] === 0x04;
+    if (isZip) {
+      applyAndroidZipBackupFromPath(onDiskPath);
+    } else {
+      applyBackupPayload(JSON.parse(readFileSync(onDiskPath, "utf-8")));
+    }
+  } finally {
+    try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
+function parseWebDavItems(xml: string) {
+  const blocks = xml.match(/<[^>]*response[\s\S]*?<\/[^>]*response>/gi) ?? [];
+  return blocks.map((block) => {
+    const value = (name: string) => {
+      const match = block.match(new RegExp(`<[^>]*(?:${name})[^>]*>([\\s\\S]*?)<\\/[^>]*(?:${name})>`, "i"));
+      return match ? stripXmlText(match[1]) : "";
+    };
+    const href = value("href");
+    const displayName = value("displayname") || decodeURIComponent(href.replace(/\/$/, "").split("/").pop() ?? "");
+    return {
+      href,
+      displayName,
+      size: Number(value("getcontentlength")) || 0,
+      lastModified: value("getlastmodified"),
+      isCollection: /<[^>]*collection\b/i.test(block),
+    };
+  });
+}
+
+async function webDavListBackups(config: WebDavConfig) {
+  await webDavEnsureCollection(config);
+  const response = await webDavRequest(config, "PROPFIND", "", {
+    headers: { Depth: "1", "Content-Type": "application/xml; charset=utf-8" },
+    body: "<D:propfind xmlns:D=\"DAV:\"><D:prop><D:displayname/><D:getcontentlength/><D:getlastmodified/><D:resourcetype/></D:prop></D:propfind>",
+  });
+  const text = await response.text();
+  if (!response.ok && response.status !== 207) throw new Error(`WebDAV 列表失败：${response.status} ${text.slice(0, 500)}`);
+  return parseWebDavItems(text)
+    // Accept both .zip (current PC + Android format) and .json (legacy PC format) so users
+    // who upgrade from an older PC version still see their old backups, and Android-origin
+    // backups become visible in the PC list.
+    .filter((item) => !item.isCollection && /^backup_.*\.(zip|json)$/i.test(item.displayName))
+    .sort((a, b) => Date.parse(b.lastModified || "") - Date.parse(a.lastModified || ""));
+}
+
+async function webDavBackup(config: WebDavConfig, onProgress?: (message: string, percent?: number) => void) {
+  await webDavEnsureCollection(config);
+  const fileName = `backup_${backupStamp()}.zip`;
+  const tmpRoot = join(tempDir(), `rikkahub-webdav-upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  mkdirSync(tmpRoot, { recursive: true });
+  const zipPath = join(tmpRoot, fileName);
+  try {
+    const size = createSettingsBackupZipToPath(zipPath, (msg) => onProgress?.(msg));
+    onProgress?.("正在上传...", 0);
+    const file = Bun.file(zipPath);
+    let uploaded = 0;
+    const progressStream = new ReadableStream<Uint8Array>({
+      async start(ctrl) {
+        const reader = file.stream().getReader();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            ctrl.enqueue(value);
+            uploaded += value.length;
+            const pct = Math.round(uploaded / size * 100);
+            onProgress?.(`正在上传 (${pct}%)`, pct);
+          }
+          ctrl.close();
+        } catch (err) {
+          ctrl.error(err);
+        }
+      },
+    });
+    const response = await webDavRequest(config, "PUT", fileName, {
+      headers: {
+        "Content-Type": "application/zip",
+        "Content-Length": String(size),
+      },
+      body: progressStream as unknown as BodyInit,
+      timeoutMs: 0,
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`WebDAV 备份失败：${response.status} ${text.slice(0, 500)}`);
+    return { fileName, size };
+  } finally {
+    try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
+async function webDavRestore(config: WebDavConfig, fileName: string, onProgress?: (message: string, percent?: number) => void) {
+  onProgress?.("正在下载...", 0);
+  const response = await webDavRequest(config, "GET", fileName, { timeoutMs: 0 });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`WebDAV 下载失败：${response.status} ${text.slice(0, 500)}`);
+  }
+  await streamResponseToTempAndRestore(response, fileName, onProgress);
+}
+
+async function webDavDelete(config: WebDavConfig, fileName: string) {
+  const response = await webDavRequest(config, "DELETE", fileName);
+  const text = await response.text();
+  if (!response.ok) throw new Error(`WebDAV 删除失败：${response.status} ${text.slice(0, 500)}`);
+}
+
+// AWS Signature Version 4 — see https://docs.aws.amazon.com/general/latest/gr/sigv4_signing.html.
+// Supports standard AWS S3 plus any S3-compatible endpoint (MinIO, R2, OSS, COS) by letting the
+// caller override `endpoint` and `pathStyle`. The signer always emits `s3` as the service
+// and `aws4_request` as the terminator, which is correct for both AWS and all major S3 clones.
+function sha256Hex(payload: string | Buffer) {
+  return createHash("sha256").update(payload).digest("hex");
+}
+function hmacSha256(key: string | Buffer, data: string) {
+  return createHmac("sha256", key).update(data).digest();
+}
+function awsUriEncode(value: string, encodeSlash: boolean) {
+  let result = "";
+  for (const ch of value) {
+    if (/[A-Za-z0-9_.~\-]/.test(ch)) {
+      result += ch;
+    } else if (ch === "/") {
+      result += encodeSlash ? "%2F" : "/";
+    } else {
+      const buf = Buffer.from(ch, "utf-8");
+      for (const byte of buf) result += `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+    }
+  }
+  return result;
+}
+
+// endpoint 空 = 原生 AWS S3,"auto" 不是 AWS 认可的 region,host 与签名都需要真实 region;
+// endpoint 非空 = S3 兼容服务(R2 / MinIO 等),它们对 region 宽容,"auto" 作为签名占位能被接受。
+// 故仅当 endpoint 空且 region 为空/"auto" 时 fallback 到 us-east-1(AWS 通用默认,也是旧 PC 默认),
+// 避免 host 拼成无效的 s3.auto.amazonaws.com、签名 scope 用 AWS 不认的 "auto"。
+function effectiveS3Region(config: S3Config): string {
+  const region = config.region.trim();
+  if (!config.endpoint.trim() && (region === "" || region.toLowerCase() === "auto")) return "us-east-1";
+  return region || "us-east-1";
+}
+
+function s3EndpointHost(config: S3Config) {
+  const explicit = config.endpoint.trim().replace(/\/+$/, "");
+  if (explicit) {
+    const parsed = new URL(/^https?:\/\//i.test(explicit) ? explicit : `https://${explicit}`);
+    return { protocol: parsed.protocol, host: parsed.host, base: `${parsed.protocol}//${parsed.host}` };
+  }
+  // endpoint 空 = 原生 AWS。region "auto" 对 AWS 无效,effectiveS3Region 已 fallback us-east-1。
+  const host = `s3.${effectiveS3Region(config)}.amazonaws.com`;
+  return { protocol: "https:", host, base: `https://${host}` };
+}
+
+function s3RequestUrl(config: S3Config, key: string, query: Record<string, string>) {
+  const { base, host } = s3EndpointHost(config);
+  const pathStyle = config.pathStyle;
+  const path = key ? `/${awsUriEncode(key, false)}` : "/";
+  const url = pathStyle ? `${base}/${config.bucket}${path}` : `${base.replace("//", `//${config.bucket}.`)}${path}`;
+  const finalHost = pathStyle ? host : `${config.bucket}.${host}`;
+  const sortedQuery = Object.entries(query).sort(([a], [b]) => a.localeCompare(b));
+  const canonicalQuery = sortedQuery.map(([k, v]) => `${awsUriEncode(k, true)}=${awsUriEncode(v, true)}`).join("&");
+  const canonicalUri = pathStyle ? `/${awsUriEncode(config.bucket, false)}${path}` : path;
+  return {
+    requestUrl: canonicalQuery ? `${url}?${canonicalQuery}` : url,
+    canonicalUri,
+    canonicalQuery,
+    host: finalHost,
+  };
+}
+
+// `payloadHashOverride` opts the request into AWS's "UNSIGNED-PAYLOAD" SigV4 mode so the
+// caller doesn't have to buffer the whole upload into memory just to compute SHA256.
+// Required for the streaming-zip backup path — a user with multi-GB attachments would
+// otherwise OOM here before the upload even started. Only safe over HTTPS (the AWS docs
+// warn that an MITM could tamper with the body), which every S3-compatible endpoint we
+// target requires anyway.
+function s3Sign(config: S3Config, method: string, key: string, query: Record<string, string>, payload: Buffer, payloadHashOverride?: string) {
+  if (!config.accessKeyId || !config.secretAccessKey) throw new Error("S3 凭据未配置");
+  if (!config.bucket) throw new Error("S3 bucket 未配置");
+  const { requestUrl, canonicalUri, canonicalQuery, host } = s3RequestUrl(config, key, query);
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  const dateStamp = amzDate.slice(0, 8);
+  const payloadHash = payloadHashOverride ?? sha256Hex(payload);
+  const headers: Record<string, string> = {
+    host,
+    "x-amz-content-sha256": payloadHash,
+    "x-amz-date": amzDate,
+  };
+  const sortedHeaderKeys = Object.keys(headers).sort();
+  const canonicalHeaders = sortedHeaderKeys.map((name) => `${name}:${headers[name].trim()}\n`).join("");
+  const signedHeaders = sortedHeaderKeys.join(";");
+  const canonicalRequest = [
+    method.toUpperCase(),
+    canonicalUri,
+    canonicalQuery,
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash,
+  ].join("\n");
+  const region = effectiveS3Region(config);
+  const credentialScope = `${dateStamp}/${region}/s3/aws4_request`;
+  const stringToSign = [
+    "AWS4-HMAC-SHA256",
+    amzDate,
+    credentialScope,
+    sha256Hex(canonicalRequest),
+  ].join("\n");
+  const kDate = hmacSha256(`AWS4${config.secretAccessKey}`, dateStamp);
+  const kRegion = hmacSha256(kDate, region);
+  const kService = hmacSha256(kRegion, "s3");
+  const kSigning = hmacSha256(kService, "aws4_request");
+  const signature = createHmac("sha256", kSigning).update(stringToSign).digest("hex");
+  const authorization = `AWS4-HMAC-SHA256 Credential=${config.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+  return {
+    requestUrl,
+    headers: { ...headers, Authorization: authorization },
+  };
+}
+
+async function s3Request(
+  config: S3Config,
+  method: string,
+  key: string,
+  options: {
+    query?: Record<string, string>;
+    body?: Buffer;
+    /** Streamed upload (ReadableStream from Bun.file().stream() etc.). When provided we
+     *  switch SigV4 to UNSIGNED-PAYLOAD so we never read the whole upload into a Buffer. */
+    bodyStream?: ReadableStream<Uint8Array>;
+    bodyLength?: number;
+    contentType?: string;
+    timeoutMs?: number;
+  } = {},
+) {
+  let payload: Buffer = Buffer.alloc(0);
+  let payloadHashOverride: string | undefined;
+  let bodyForFetch: BodyInit | undefined;
+  let contentLength: string | undefined;
+  if (options.bodyStream) {
+    payloadHashOverride = "UNSIGNED-PAYLOAD";
+    bodyForFetch = options.bodyStream as unknown as BodyInit;
+    if (options.bodyLength != null) contentLength = String(options.bodyLength);
+  } else {
+    payload = options.body ?? Buffer.alloc(0);
+    bodyForFetch = payload.length ? payload : undefined;
+    if (payload.length) contentLength = String(payload.length);
+  }
+  const { requestUrl, headers } = s3Sign(config, method, key, options.query ?? {}, payload, payloadHashOverride);
+  const finalHeaders: Record<string, string> = { ...headers };
+  if (options.contentType) finalHeaders["Content-Type"] = options.contentType;
+  if (contentLength) finalHeaders["Content-Length"] = contentLength;
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const controller = new AbortController();
+  const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+  try {
+    return await fetch(requestUrl, { method, headers: finalHeaders, body: bodyForFetch, signal: controller.signal });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function s3Prefix() {
+  // 对齐 APP:备份前缀硬编码(APP 无 config 字段,固定 rikkahub_backups/)。
+  return "rikkahub_backups/";
+}
+
+async function s3TestConnection(config: S3Config) {
+  // HEAD on the bucket validates credentials + endpoint without listing.
+  const response = await s3Request(config, "GET", "", { query: { "list-type": "2", "max-keys": "1" } });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`S3 测试失败：${response.status} ${text.slice(0, 500)}`);
+}
+
+async function s3ListBackups(config: S3Config) {
+  const prefix = `${s3Prefix()}backup_`;
+  const response = await s3Request(config, "GET", "", { query: { "list-type": "2", prefix } });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`S3 列表失败：${response.status} ${text.slice(0, 500)}`);
+  const items: Array<{ href: string; displayName: string; size: number; lastModified: string }> = [];
+  // Minimal XML scan — S3 ListObjectsV2 has one <Contents> element per object.
+  const blocks = text.match(/<Contents>[\s\S]*?<\/Contents>/g) ?? [];
+  for (const block of blocks) {
+    const keyMatch = block.match(/<Key>([\s\S]*?)<\/Key>/);
+    const sizeMatch = block.match(/<Size>(\d+)<\/Size>/);
+    const lastMatch = block.match(/<LastModified>([\s\S]*?)<\/LastModified>/);
+    if (!keyMatch) continue;
+    const fileKey = keyMatch[1];
+    const displayName = fileKey.split("/").pop() ?? fileKey;
+    // Accept .zip (current cross-platform format) and .json (legacy PC backups).
+    if (!/^backup_.*\.(zip|json)$/i.test(displayName)) continue;
+    items.push({
+      href: fileKey,
+      displayName,
+      size: Number(sizeMatch?.[1] ?? 0),
+      lastModified: lastMatch?.[1] ?? "",
+    });
+  }
+  items.sort((a, b) => Date.parse(b.lastModified || "") - Date.parse(a.lastModified || ""));
+  return items;
+}
+
+async function s3Backup(config: S3Config, onProgress?: (message: string, percent?: number) => void) {
+  const fileName = `backup_${backupStamp()}.zip`;
+  const key = `${s3Prefix()}${fileName}`;
+  const tmpRoot = join(tempDir(), `rikkahub-s3-upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  mkdirSync(tmpRoot, { recursive: true });
+  const zipPath = join(tmpRoot, fileName);
+  try {
+    const size = createSettingsBackupZipToPath(zipPath, (msg) => onProgress?.(msg));
+    onProgress?.("正在上传...", 0);
+    const file = Bun.file(zipPath);
+    let uploaded = 0;
+    const progressStream = new ReadableStream<Uint8Array>({
+      async start(ctrl) {
+        const reader = file.stream().getReader();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            ctrl.enqueue(value);
+            uploaded += value.length;
+            const pct = Math.round(uploaded / size * 100);
+            onProgress?.(`正在上传 (${pct}%)`, pct);
+          }
+          ctrl.close();
+        } catch (err) {
+          ctrl.error(err);
+        }
+      },
+    });
+    const response = await s3Request(config, "PUT", key, {
+      bodyStream: progressStream,
+      bodyLength: size,
+      contentType: "application/zip",
+      timeoutMs: 0,
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`S3 备份失败：${response.status} ${text.slice(0, 500)}`);
+    return { fileName, size };
+  } finally {
+    try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
+async function s3Restore(config: S3Config, fileName: string, onProgress?: (message: string, percent?: number) => void) {
+  const key = `${s3Prefix()}${fileName}`;
+  onProgress?.("正在下载...", 0);
+  const response = await s3Request(config, "GET", key, { timeoutMs: 0 });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`S3 下载失败：${response.status} ${text.slice(0, 500)}`);
+  }
+  await streamResponseToTempAndRestore(response, fileName, onProgress);
+}
+
+async function s3Delete(config: S3Config, fileName: string) {
+  const key = `${s3Prefix()}${fileName}`;
+  const response = await s3Request(config, "DELETE", key);
+  const text = await response.text();
+  if (!response.ok && response.status !== 204) throw new Error(`S3 删除失败：${response.status} ${text.slice(0, 500)}`);
+}
+
+type GitHubSkillInfo = { owner: string; repo: string; branch: string; path: string };
+type GitHubSkillFile = { relativePath: string; downloadUrl: string };
+
+function parseGitHubSkillUrl(repoUrl: string): GitHubSkillInfo | null {
+  const trimmed = repoUrl.trim().replace(/\/+$/, "");
+  const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\/tree\/([^/]+)(?:\/(.*))?)?$/.exec(trimmed);
+  if (!match) return null;
+  return {
+    owner: match[1],
+    repo: match[2].replace(/\.git$/i, ""),
+    branch: match[3] || "HEAD",
+    path: match[4] || "",
+  };
+}
+
+async function githubJson(url: string) {
+  const response = await fetch(url, { headers: { Accept: "application/vnd.github+json", "User-Agent": "RikkaHub-PC" } });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`GitHub ${response.status}: ${text.slice(0, 500) || response.statusText}`);
+  return JSON.parse(text);
+}
+
+async function collectGitHubSkillFiles(info: GitHubSkillInfo, dirPath: string, basePath: string, result: GitHubSkillFile[]) {
+  const apiPath = dirPath ? encodeURI(dirPath).replace(/#/g, "%23") : "";
+  const apiUrl = `https://api.github.com/repos/${info.owner}/${info.repo}/contents/${apiPath}?ref=${encodeURIComponent(info.branch)}`;
+  const payload = await githubJson(apiUrl);
+  const items = Array.isArray(payload) ? payload : [payload];
+  for (const item of items) {
+    const type = String(item.type ?? "");
+    const itemPath = String(item.path ?? "");
+    const relativePath = itemPath.replace(new RegExp(`^${basePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/?`), "");
+    if (type === "file") {
+      const downloadUrl = String(item.download_url ?? "");
+      if (!downloadUrl) throw new Error(`GitHub 文件没有 download_url: ${itemPath}`);
+      result.push({ relativePath: relativePath || itemPath.split("/").pop() || itemPath, downloadUrl });
+    } else if (type === "dir") {
+      await collectGitHubSkillFiles(info, itemPath, basePath, result);
+    }
+  }
+}
+
+async function importSkillFromGitHub(repoUrl: string) {
+  const info = parseGitHubSkillUrl(repoUrl);
+  if (!info) throw new Error("无效的 GitHub 仓库链接。支持 https://github.com/owner/repo 或 /tree/branch/sub/path");
+  const files: GitHubSkillFile[] = [];
+  await collectGitHubSkillFiles(info, info.path, info.path, files);
+  const skillFile = files.find((file) => file.relativePath === "SKILL.md");
+  if (!skillFile) throw new Error("目录中未找到 SKILL.md");
+  const downloaded = new Map<string, Buffer>();
+  for (const file of files) {
+    const response = await fetch(file.downloadUrl, { headers: { "User-Agent": "RikkaHub-PC" } });
+    if (!response.ok) throw new Error(`下载文件失败 ${file.relativePath}: ${response.status}`);
+    downloaded.set(file.relativePath, Buffer.from(await response.arrayBuffer()));
+  }
+  const skillContent = downloaded.get("SKILL.md")?.toString("utf8") ?? "";
+  const frontmatter = parseSkillFrontmatter(skillContent);
+  const name = frontmatter.name?.trim();
+  if (!name) throw new Error("SKILL.md 格式错误：缺少 name 字段");
+  saveSkillFileBytesAtomically(name, downloaded);
+  const metadata = skillMetadataFromFile(name);
+  if (!metadata) throw new Error("Skill frontmatter must include name and description");
+  return { ...metadata, content: skillContent };
+}
+
+// 对齐安卓 SkillManager.saveSkillFileBytesAtomically (commit af9b1f35)：
+// 1) 在 .{name}.staging.<rand>.tmp 中先写完整目录；2) rename 旧目录到
+// .{name}.backup.<rand>.tmp；3) 把 staging 重命名为正式目录；4) 删除 backup。
+// 任意一步失败都回滚到原状态。
+function saveSkillFileBytesAtomically(skillName: string, files: Map<string, Buffer>) {
+  const targetDir = safeSkillDir(skillName);
+  if (!targetDir) throw new Error("Skill name 无效");
+  mkdirSync(skillsDir, { recursive: true });
+  const stagingDir = join(skillsDir, `.${skillName}.staging.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`);
+  const backupDir = join(skillsDir, `.${skillName}.backup.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`);
+  try {
+    mkdirSync(stagingDir, { recursive: true });
+    const root = resolve(stagingDir);
+    for (const [relativePath, content] of files) {
+      const target = resolve(root, relativePath);
+      if (target !== root && !target.startsWith(root + "\\") && !target.startsWith(root + "/")) {
+        throw new Error(`非法文件路径：${relativePath}`);
+      }
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, content);
+    }
+    if (!existsSync(join(stagingDir, "SKILL.md"))) {
+      throw new Error("缺少 SKILL.md 文件");
+    }
+    if (existsSync(targetDir)) renameSync(targetDir, backupDir);
+    renameSync(stagingDir, targetDir);
+    if (existsSync(backupDir)) rmSync(backupDir, { recursive: true, force: true });
+  } catch (err) {
+    if (existsSync(stagingDir)) rmSync(stagingDir, { recursive: true, force: true });
+    if (!existsSync(targetDir) && existsSync(backupDir)) renameSync(backupDir, targetDir);
+    throw err;
+  }
+}
+
+// 规范化 ZIP 条目路径：把反斜杠/前导斜杠/`.` 段抹掉，拒绝 `..`。
+function normalizeZipEntryPath(path: string): string | null {
+  const parts = path.replace(/\\/g, "/").replace(/^\/+/, "").split("/")
+    .filter((part) => part.length > 0 && part !== ".");
+  if (parts.length === 0 || parts.some((part) => part === "..")) return null;
+  return parts.join("/");
+}
+
+function isPathInsideBase(path: string, basePath: string): boolean {
+  return basePath.length === 0 || path === basePath || path.startsWith(`${basePath}/`);
+}
+
+function relativeToSkillBase(path: string, basePath: string): string | null {
+  if (basePath.length === 0) return path;
+  if (path === basePath) return null;
+  const stripped = path.startsWith(`${basePath}/`) ? path.slice(basePath.length + 1) : path;
+  return stripped === path ? null : stripped;
+}
+
+function isZipBuffer(fileName: string, buf: Buffer): boolean {
+  if (fileName.toLowerCase().endsWith(".zip")) return true;
+  if (buf.length < 4) return false;
+  const sig = buf.readUInt32LE(0);
+  // PK\x03\x04 | PK\x05\x06 | PK\x07\x08
+  return sig === 0x04034b50 || sig === 0x06054b50 || sig === 0x08074b50;
+}
+
+// 镜像安卓 SkillsVM.importSkillMarkdown / importSkillsFromZip：
+//  - 单个 markdown：解析 frontmatter，原子写入；
+//  - zip：扫所有 SKILL.md，对每个根目录原子写入一组文件，跳过嵌套技能。
+// 返回成功导入的 skill 名称数组。失败抛错。
+function importSkillFromBuffer(fileName: string, buf: Buffer): string[] {
+  if (isZipBuffer(fileName, buf)) {
+    return importSkillsFromZipBuffer(buf);
+  }
+  const content = buf.toString("utf8");
+  const frontmatter = parseSkillFrontmatter(content);
+  const name = frontmatter.name?.trim();
+  if (!name) throw new Error("SKILL.md 格式错误：缺少 name 字段");
+  if (!frontmatter.description?.trim()) throw new Error("SKILL.md 格式错误：缺少 description 字段");
+  saveSkillFileBytesAtomically(name, new Map([["SKILL.md", Buffer.from(content, "utf8")]]));
+  return [name];
+}
+
+function importSkillsFromZipBuffer(buf: Buffer): string[] {
+  // 用现有的 readZipEntries（仅支持 store/deflate，跟安卓 ZipInputStream 覆盖
+  // 的基础情况一致）。把条目按规范化路径聚合到 Map 里。
+  const rawEntries = readZipEntries(buf);
+  if (rawEntries.length === 0) throw new Error("压缩包为空或无法读取");
+  const files = new Map<string, Buffer>();
+  for (const entry of rawEntries) {
+    const path = normalizeZipEntryPath(entry.name);
+    if (!path) continue;
+    files.set(path, entry.data);
+  }
+
+  const skillMdPaths = Array.from(files.keys())
+    .filter((path) => path.split("/").pop()?.toLowerCase() === "skill.md")
+    .sort();
+  if (skillMdPaths.length === 0) throw new Error("压缩包中未找到 SKILL.md");
+
+  const skillBasePaths = skillMdPaths.map((path) => {
+    const slash = path.lastIndexOf("/");
+    return slash < 0 ? "" : path.slice(0, slash);
+  });
+
+  const importedNames: string[] = [];
+  for (let i = 0; i < skillMdPaths.length; i += 1) {
+    const skillMdPath = skillMdPaths[i];
+    const basePath = skillBasePaths[i];
+    const skillBuf = files.get(skillMdPath);
+    if (!skillBuf) throw new Error(`读取失败：${skillMdPath}`);
+    const skillContent = skillBuf.toString("utf8");
+    const frontmatter = parseSkillFrontmatter(skillContent);
+    const name = frontmatter.name?.trim();
+    if (!name) throw new Error(`${skillMdPath} 格式错误：缺少 name 字段`);
+    if (!frontmatter.description?.trim()) throw new Error(`${skillMdPath} 格式错误：缺少 description 字段`);
+
+    const skillFiles = new Map<string, Buffer>();
+    for (const [path, content] of files) {
+      // 跳过嵌套技能内部文件
+      const insideNested = skillBasePaths.some((otherBase, otherIndex) => {
+        if (otherIndex === i) return false;
+        return isPathInsideBase(path, otherBase) && (basePath.length === 0 || isPathInsideBase(otherBase, basePath));
+      });
+      if (insideNested) continue;
+      const relative = relativeToSkillBase(path, basePath);
+      if (relative == null) continue;
+      const targetPath = relative.toLowerCase() === "skill.md" ? "SKILL.md" : relative;
+      skillFiles.set(targetPath, content);
+    }
+
+    if (!skillFiles.has("SKILL.md")) {
+      // 主入口文件大小写规范化（zip 里可能写成 Skill.md 等）
+      skillFiles.set("SKILL.md", Buffer.from(skillContent, "utf8"));
+    }
+    saveSkillFileBytesAtomically(name, skillFiles);
+    if (!importedNames.includes(name)) importedNames.push(name);
+  }
+  return importedNames;
+}
+
+function normalizeInjectionPosition(value: unknown) {
+  return String(value ?? "").toLowerCase();
+}
+
+function roleForInjection(value: unknown) {
+  return String(value ?? "USER").toLowerCase() === "assistant" ? "assistant" : "user";
+}
+
+function activeModeInjections(assistant: Assistant) {
+  const selected = new Set(getStringArray(assistant.modeInjectionIds));
+  return (state.settings.modeInjections as Array<Record<string, JsonValue>>)
+    .filter((item) => item.enabled !== false && selected.has(String(item.id ?? "")))
+    .sort((left, right) => Number(right.priority ?? 0) - Number(left.priority ?? 0));
+}
+
+function regexMatches(injection: Record<string, JsonValue>, context: string) {
+  if (injection.enabled === false) return false;
+  if (injection.constantActive === true) return true;
+  const keywords = getStringArray(injection.keywords);
+  if (keywords.length === 0) return false;
+  const useRegex = injection.useRegex === true;
+  const caseSensitive = injection.caseSensitive === true;
+  return keywords.some((keyword) => {
+    if (useRegex) {
+      try {
+        return new RegExp(keyword, caseSensitive ? "" : "i").test(context);
+      } catch {
+        return false;
+      }
+    }
+    return caseSensitive ? context.includes(keyword) : context.toLowerCase().includes(keyword.toLowerCase());
+  });
+}
+
+function contextForMatchingMessages(messages: Message[], scanDepth: number) {
+  return messages
+    .filter((message) => message.role !== "SYSTEM")
+    .slice(-Math.max(1, scanDepth || 4))
+    .map((message) => textFromParts(message.parts) || reasoningFromParts(message.parts))
+    .filter(Boolean)
+    .join("\n");
+}
+
+function activeLorebookInjections(assistant: Assistant, messages: Message[]) {
+  const selected = new Set(getStringArray(assistant.lorebookIds));
+  return (state.settings.lorebooks as Array<Record<string, JsonValue>>)
+    .filter((book) => book.enabled !== false && selected.has(String(book.id ?? "")))
+    .flatMap((book) => (Array.isArray(book.entries) ? book.entries : []))
+    .filter(isRecord)
+    .filter((entry) => regexMatches(entry, contextForMatchingMessages(messages, Number(entry.scanDepth ?? 4))))
+    .sort((left, right) => Number(right.priority ?? 0) - Number(left.priority ?? 0));
+}
+
+function activePromptInjections(assistant: Assistant, messages: Message[]) {
+  return [...activeModeInjections(assistant), ...activeLorebookInjections(assistant, messages)]
+    .filter((item) => item.enabled !== false)
+    .sort((left, right) => Number(right.priority ?? 0) - Number(left.priority ?? 0));
+}
+
+function applySystemPromptInjections(systemPrompt: string, injections: Array<Record<string, JsonValue>>) {
+  let before = "";
+  let after = "";
+  for (const injection of injections) {
+    const content = String(injection.content ?? "").trim();
+    if (!content) continue;
+    const position = normalizeInjectionPosition(injection.position);
+    if (position === "before_system_prompt") before += `${content}\n`;
+    if (position === "after_system_prompt") after += `\n${content}`;
+  }
+  return `${before}${systemPrompt}${after}`.trim();
+}
+
+function mergedInjectionMessages(injections: Array<Record<string, JsonValue>>): Message[] {
+  const grouped = new Map<string, string[]>();
+  for (const injection of injections) {
+    const content = String(injection.content ?? "").trim();
+    if (!content) continue;
+    const role = roleForInjection(injection.role).toUpperCase();
+    grouped.set(role, [...(grouped.get(role) ?? []), content]);
+  }
+  return [...grouped.entries()].map(([role, content]) =>
+    message(role === "ASSISTANT" ? "ASSISTANT" : "USER", [{ type: "text", text: content.join("\n") }]),
+  );
+}
+
+function hasAssistantToolsForSafeInsert(messageValue: Message | undefined) {
+  return messageValue?.role === "ASSISTANT" && messageValue.parts.some((part) => isRecord(part) && part.type === "tool");
+}
+
+function findSafeInsertIndex(messages: Message[], targetIndex: number) {
+  let index = Math.max(0, Math.min(targetIndex, messages.length));
+  while (index > 0) {
+    const prev = messages[index - 1];
+    const current = messages[index];
+    if (prev?.role === "USER" && hasAssistantToolsForSafeInsert(current)) index -= 1;
+    else break;
+  }
+  return index;
+}
+
+function insertInjectionMessages(items: Message[], targetIndex: number, injections: Array<Record<string, JsonValue>>) {
+  const messages = mergedInjectionMessages(injections);
+  if (messages.length === 0) return;
+  const insertIndex = findSafeInsertIndex(items, targetIndex);
+  items.splice(insertIndex, 0, ...messages);
+}
+
+function applyPromptInjectionsToMessages(messages: Message[], injections: Array<Record<string, JsonValue>>) {
+  const result = messages.map((item) => cloneJson(item));
+  const systemIndex = result.findIndex((item) => item.role === "SYSTEM");
+  const systemContent = systemIndex >= 0 ? applySystemPromptInjections(textFromParts(result[systemIndex].parts), injections) : "";
+  if (systemIndex >= 0) {
+    if (systemContent) result[systemIndex] = { ...result[systemIndex], parts: [{ type: "text", text: systemContent }] };
+    else result.splice(systemIndex, 1);
+  } else {
+    const injectedSystem = applySystemPromptInjections("", injections);
+    if (injectedSystem) result.unshift(message("SYSTEM", [{ type: "text", text: injectedSystem }]));
+  }
+
+  const firstUserIndex = result.findIndex((item) => item.role === "USER");
+  insertInjectionMessages(
+    result,
+    firstUserIndex >= 0 ? firstUserIndex : result.length,
+    injections.filter((injection) => normalizeInjectionPosition(injection.position) === "top_of_chat"),
+  );
+  insertInjectionMessages(
+    result,
+    Math.max(0, result.length - 1),
+    injections.filter((injection) => normalizeInjectionPosition(injection.position) === "bottom_of_chat"),
+  );
+  for (const depth of [...new Set(injections
+    .filter((injection) => normalizeInjectionPosition(injection.position) === "at_depth")
+    .map((injection) => Math.max(1, Number(injection.injectDepth ?? 4))))].sort((left, right) => right - left)) {
+    insertInjectionMessages(
+      result,
+      Math.max(0, result.length - depth),
+      injections.filter((injection) =>
+        normalizeInjectionPosition(injection.position) === "at_depth" &&
+        Math.max(1, Number(injection.injectDepth ?? 4)) === depth,
+      ),
+    );
+  }
+  return result;
+}
+
+function timeReminderContent(current: Message, previous?: Message) {
+  const currentTime = new Date(current.createdAt);
+  const weekday = new Intl.DateTimeFormat(undefined, { weekday: "long" }).format(currentTime);
+  const timeText = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" }).format(currentTime);
+  if (!previous) return `<time_reminder>Current time: ${weekday}, ${timeText}</time_reminder>`;
+  const gapSeconds = Math.floor((Date.parse(current.createdAt) - Date.parse(previous.createdAt)) / 1000);
+  if (gapSeconds <= 3600) return "";
+  const gapText = gapSeconds < 3600
+    ? `${Math.floor(gapSeconds / 60)} min`
+    : gapSeconds < 86400
+      ? `${Math.floor(gapSeconds / 3600)} h`
+      : `${Math.floor(gapSeconds / 86400)} d`;
+  return `<time_reminder>Current time: ${weekday}, ${timeText} (${gapText} since last message)</time_reminder>`;
+}
+
+function memoriesForAssistant(assistant: Assistant) {
+  const assistantId = assistant.useGlobalMemory ? GLOBAL_MEMORY_ID : assistant.id;
+  return state.memories.filter((memory) => memory.assistantId === assistantId);
+}
+
+function buildMemoryPrompt(assistant: Assistant) {
+  if (!assistant.enableMemory) return "";
+  const memories = memoriesForAssistant(assistant).map((memory) => ({ id: memory.id, content: memory.content }));
+  return `
+**Memories**
+These are memories stored via the memory_tool that you can reference in future conversations.
+${JSON.stringify(memories, null, 2)}
+`.trim();
+}
+
+function buildRecentChatsPrompt(assistant: Assistant, currentConversationId?: string) {
+  if (!assistant.enableRecentChatsReference) return "";
+  const recent = state.conversations
+    .filter((conversation) => conversation.assistantId === assistant.id && conversation.id !== currentConversationId)
+    .sort((left, right) => right.updateAt - left.updateAt)
+    .slice(0, 10)
+    .map((conversation) => ({
+      title: conversation.title || textFromParts(conversation.messages[0]?.messages[0]?.parts ?? []).slice(0, 40) || "New Conversation",
+      last_chat: dateKey(conversation.updateAt),
+    }));
+  if (recent.length === 0) return "";
+  return `
+**Recent Chats**
+These are some of the user's recent conversations. You can use them to understand user preferences:
+${JSON.stringify(recent, null, 2)}
+`.trim();
+}
+
+function buildSkillsContext(assistant: Assistant) {
+  const enabled = new Set(getStringArray(assistant.enabledSkills));
+  const available = listSkills().filter((skill) => enabled.has(skill.name));
+  if (available.length === 0) return "";
+  const body = available
+    .map((skill) => `  <skill>\n    <name>${skill.name}</name>\n    <description>${skill.description}</description>\n  </skill>`)
+    .join("\n");
+  return `**Skills**
+You have access to the following skills. Use the \`use_skill\` tool to load a skill's instructions when the user's request matches.
+<available_skills>
+${body}
+</available_skills>`;
+}
+
+function buildSearchContext() {
+  if (!state.settings.enableWebSearch) return "";
+  const service = state.settings.searchServices[state.settings.searchServiceSelected] as Record<string, JsonValue> | undefined;
+  const serviceName = String(service?.name ?? service?.type ?? "Search");
+  return `
+Available tools: search_web, scrape_web
+Use search_web when the user needs current, external, or verifiable information. The selected service is ${serviceName}. The tool returns source ids as plain numbers. After using search information, cite sources in the format [citation,domain](1), [citation,domain](2). If snippets are not enough, call scrape_web for a specific result URL.
+`.trim();
+}
+
+function selectedSearchService() {
+  return (state.settings.searchServices[state.settings.searchServiceSelected] ??
+    state.settings.searchServices[0] ??
+    { type: "bing_local", name: "Bing" }) as Record<string, JsonValue>;
+}
+
+function nameOfSearchService(service: Record<string, JsonValue>) {
+  return String(service.name ?? service.type ?? "Search");
+}
+
+function searchResultSize(service: Record<string, JsonValue>) {
+  // Mirror Android: each *.SearchService.kt directly uses `commonOptions.resultSize` (default 10
+  // in SearchService.kt:94) with no upper clamp — Tavily/Perplexity/Brave/Exa/etc. all forward
+  // the raw value to the upstream API. The earlier PC code had a hard-coded `Math.min(10, …)`
+  // that silently capped requests at 10 even when the user had configured 15+ in settings;
+  // that cap was invented, not ported, and contradicted the user-visible "结果数量" input which
+  // has no max attribute. PC keeps the per-service `service.resultSize` field for backward
+  // compat with the UI, falling back to the Android-equivalent global `searchCommonOptions.resultSize`.
+  const serviceSize = Number(service.resultSize ?? 0);
+  const commonSize = Number(state.settings.searchCommonOptions?.resultSize ?? 10);
+  // Lower bound 1 prevents nonsensical zero/negative requests. No upper bound — match Android.
+  return Math.max(1, serviceSize || commonSize || 10);
+}
+
+function stripHtml(value: string) {
+  return value
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function domainOfUrl(targetUrl: string) {
+  try {
+    return new URL(targetUrl).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
+function faviconForUrl(targetUrl: string) {
+  const domain = domainOfUrl(targetUrl);
+  return domain ? `https://icons.duckduckgo.com/ip3/${encodeURIComponent(domain)}.ico` : "";
+}
+
+function searchResult(index: number, item: { title?: unknown; url?: unknown; text?: unknown }) {
+  const url = String(item.url ?? "");
+  return {
+    id: `${index + 1}`,
+    title: String(item.title ?? url),
+    url,
+    domain: domainOfUrl(url),
+    icon: faviconForUrl(url),
+    text: String(item.text ?? ""),
+  };
+}
+
+async function parseJsonResponse(response: Response) {
+  const text = await response.text();
+  try {
+    return { text, raw: text ? JSON.parse(text) : {} };
+  } catch {
+    return { text, raw: { text } };
+  }
+}
+
+async function customJsHttpRequest(
+  url: string,
+  method = "GET",
+  headersValue: unknown = {},
+  bodyValue: unknown = null,
+) {
+  const headers = isRecord(headersValue) ? Object.fromEntries(Object.entries(headersValue).map(([key, value]) => [key, String(value)])) : {};
+  const body = bodyValue == null || String(method).toUpperCase() === "GET" || String(method).toUpperCase() === "HEAD"
+    ? undefined
+    : (typeof bodyValue === "string" ? bodyValue : JSON.stringify(bodyValue));
+  const response = await fetch(url, {
+    method: String(method || "GET").toUpperCase(),
+    headers,
+    body,
+  });
+  const text = await response.text();
+  return {
+    status: response.status,
+    ok: response.ok,
+    statusText: response.statusText,
+    url: response.url,
+    body: text,
+  };
+}
+
+async function runCustomJsFunction(service: Record<string, JsonValue>, script: string, invocation: string, args: JsonValue[]) {
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const userFetch = async (targetUrl: string, options: Record<string, JsonValue> = {}) => {
+    const response = await customJsHttpRequest(
+      targetUrl,
+      String(options.method ?? "GET"),
+      options.headers,
+      options.body,
+    );
+    return {
+      status: response.status,
+      ok: response.ok,
+      statusText: response.statusText,
+      url: response.url,
+      text: async () => response.body,
+      json: async () => JSON.parse(response.body),
+    };
+  };
+  const fn = new AsyncFunction("fetch", "args", `"use strict";\n${script}\nconst result = ${invocation}.apply(null, args);\nreturn await result;`);
+  return await fn(userFetch, args);
+}
+
+async function runCustomJsSearch(service: Record<string, JsonValue>, query: string, maxResults: number) {
+  const script = String(service.searchScript ?? "").trim();
+  if (!script) throw new Error("Custom JS search script is empty");
+  const raw = await runCustomJsFunction(service, script, "search", [query, maxResults]);
+  const items = Array.isArray(raw?.items) ? raw.items : [];
+  return {
+    query,
+    service: nameOfSearchService(service),
+    answer: raw?.answer,
+    items: items.slice(0, maxResults).map((item: any, index: number) =>
+      searchResult(index, { title: item.title, url: item.url, text: item.text ?? item.content ?? item.snippet }),
+    ),
+  };
+}
+
+async function runCustomJsScrape(service: Record<string, JsonValue>, target: string) {
+  const script = String(service.scrapeScript ?? "").trim();
+  if (!script) throw new Error("Custom JS scrape script is empty");
+  const raw = await runCustomJsFunction(service, script, "scrape", [[target]]);
+  const item = Array.isArray(raw?.urls) ? raw.urls[0] : raw;
+  return {
+    url: String(item?.url ?? target),
+    title: item?.metadata?.title ?? item?.title,
+    description: item?.metadata?.description ?? item?.description,
+    language: item?.metadata?.language ?? item?.language,
+    text: String(item?.content ?? item?.text ?? "").slice(0, 12000),
+  };
+}
+
+async function runSearchWeb(params: Record<string, JsonValue>) {
+  const started = Date.now();
+  const service = selectedSearchService();
+  const type = String(service.type ?? "bing_local").toLowerCase();
+  const query = String(params.query ?? params.q ?? "").trim();
+  if (!query) throw new Error("search_web requires query");
+  // User's configured `resultSize` takes precedence over whatever the LLM passes — most
+  // models default to emitting `max_results: 5` for safety, which silently overrode the
+  // user-configured count of 10. Match Android: the per-service setting wins, with no
+  // additional upstream-side clamp (Android forwards the value verbatim).
+  const maxResults = Math.max(1, Number(searchResultSize(service)));
+
+  if (type === "tavily") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("Tavily API Key is empty");
+    const requestHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };
+    const response = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify({ query, max_results: maxResults, search_depth: service.depth ?? "basic" }),
+    });
+    const raw = await response.json();
+    addLog({
+      providerId: String(service.id ?? "search"),
+      providerName: nameOfSearchService(service),
+      url: "https://api.tavily.com/search",
+      ok: response.ok,
+      status: response.status,
+      kind: "tool:search_web",
+      toolName: "search_web",
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody({ query, maxResults }),
+      responseBody: jsonBody(raw),
+      error: response.ok ? undefined : jsonBody(raw),
+    });
+    if (!response.ok) throw new Error(JSON.stringify(raw).slice(0, 500));
+    return {
+      query,
+      service: "Tavily",
+      items: (raw.results ?? []).slice(0, maxResults).map((item: any, index: number) =>
+        searchResult(index, { title: item.title, url: item.url, text: item.content ?? item.raw_content }),
+      ),
+    };
+  }
+
+  if (type === "rikkahub") {
+    const apiKey = String(service.apiKey ?? "");
+    const endpoint = "https://api.rikka-ai.com/v1/search";
+    const requestBody = { q: query, depth: service.depth ?? "standard", outputType: "sourcedAnswer", includeImages: false };
+    const requestHeaders = { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) };
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify(requestBody),
+    });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"),
+      providerName: nameOfSearchService(service),
+      url: endpoint,
+      ok: response.ok,
+      status: response.status,
+      kind: "tool:search_web",
+      toolName: "search_web",
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody(requestBody),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`RikkaHub search failed with code ${response.status}: ${text.slice(0, 500)}`);
+    return {
+      query,
+      service: "RikkaHub",
+      answer: raw.answer,
+      items: (raw.sources ?? []).slice(0, maxResults).map((item: any, index: number) =>
+        searchResult(index, { title: item.name, url: item.url, text: item.snippet }),
+      ),
+    };
+  }
+
+  if (type === "exa") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("Exa API Key is empty");
+    const requestHeaders = { "Content-Type": "application/json", "x-api-key": apiKey };
+    const response = await fetch("https://api.exa.ai/search", {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify({ query, numResults: maxResults }),
+    });
+    const raw = await response.json();
+    addLog({
+      providerId: String(service.id ?? "search"),
+      providerName: nameOfSearchService(service),
+      url: "https://api.exa.ai/search",
+      ok: response.ok,
+      status: response.status,
+      kind: "tool:search_web",
+      toolName: "search_web",
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody({ query, maxResults }),
+      responseBody: jsonBody(raw),
+      error: response.ok ? undefined : jsonBody(raw),
+    });
+    if (!response.ok) throw new Error(JSON.stringify(raw).slice(0, 500));
+    return {
+      query,
+      service: "Exa",
+      items: (raw.results ?? []).slice(0, maxResults).map((item: any, index: number) =>
+        searchResult(index, { title: item.title, url: item.url, text: item.text ?? item.summary }),
+      ),
+    };
+  }
+
+  if (type === "zhipu") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("Zhipu API Key is empty");
+    const endpoint = "https://open.bigmodel.cn/api/paas/v4/web_search";
+    const requestBody = { search_query: query, search_engine: "search_std", count: maxResults };
+    const requestHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify(requestBody),
+    });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"),
+      providerName: nameOfSearchService(service),
+      url: endpoint,
+      ok: response.ok,
+      status: response.status,
+      kind: "tool:search_web",
+      toolName: "search_web",
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody(requestBody),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`Zhipu search failed with code ${response.status}: ${text.slice(0, 500)}`);
+    return {
+      query,
+      service: "Zhipu",
+      items: (raw.search_result ?? raw.searchResult ?? []).slice(0, maxResults).map((item: any, index: number) =>
+        searchResult(index, { title: item.title, url: item.link, text: item.content }),
+      ),
+    };
+  }
+
+  if (type === "brave") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("Brave API Key is empty");
+    const endpoint = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${maxResults}`;
+    const requestHeaders = { Accept: "application/json", "X-Subscription-Token": apiKey };
+    const response = await fetch(endpoint, { headers: requestHeaders });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"),
+      providerName: nameOfSearchService(service),
+      url: endpoint,
+      ok: response.ok,
+      status: response.status,
+      kind: "tool:search_web",
+      toolName: "search_web",
+      durationMs: Date.now() - started,
+      method: "GET",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody({ query, maxResults }),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`Brave search failed with code ${response.status}: ${text.slice(0, 500)}`);
+    return {
+      query,
+      service: "Brave",
+      items: (raw.web?.results ?? []).slice(0, maxResults).map((item: any, index: number) =>
+        searchResult(index, { title: item.title, url: item.url, text: item.description }),
+      ),
+    };
+  }
+
+  if (type === "searxng") {
+    const baseUrl = String(service.url ?? "").trim().replace(/\/+$/, "");
+    if (!baseUrl) throw new Error("SearXNG URL cannot be empty");
+    const endpoint = new URL(`${baseUrl}/search`);
+    endpoint.searchParams.set("q", query);
+    endpoint.searchParams.set("format", "json");
+    const engines = String(service.engines ?? "").trim();
+    const language = String(service.language ?? "").trim();
+    if (engines) endpoint.searchParams.set("engines", engines);
+    if (language) endpoint.searchParams.set("language", language);
+    const headers: Record<string, string> = {};
+    const username = String(service.username ?? "");
+    const password = String(service.password ?? "");
+    if (username && password) headers.Authorization = `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
+    const response = await fetch(endpoint, { headers });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"),
+      providerName: nameOfSearchService(service),
+      url: endpoint.toString(),
+      ok: response.ok,
+      status: response.status,
+      kind: "tool:search_web",
+      toolName: "search_web",
+      durationMs: Date.now() - started,
+      method: "GET",
+      requestHeaders: headers,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody({ query, maxResults, engines, language }),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`SearXNG request failed with status ${response.status}: ${text.slice(0, 500)}`);
+    return {
+      query,
+      service: "SearXNG",
+      items: (raw.results ?? []).slice(0, maxResults).map((item: any, index: number) =>
+        searchResult(index, { title: item.title, url: item.url, text: item.content }),
+      ),
+    };
+  }
+
+  if (type === "tinyfish") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("Tinyfish API Key is empty");
+    const endpoint = `https://api.search.tinyfish.ai?query=${encodeURIComponent(query)}`;
+    const requestHeaders = { "X-API-Key": apiKey };
+    const response = await fetch(endpoint, {
+      headers: requestHeaders,
+    });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"),
+      providerName: nameOfSearchService(service),
+      url: endpoint,
+      ok: response.ok,
+      status: response.status,
+      kind: "tool:search_web",
+      toolName: "search_web",
+      durationMs: Date.now() - started,
+      method: "GET",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody({ query, maxResults }),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`Tinyfish search failed with code ${response.status}: ${text.slice(0, 500)}`);
+    return {
+      query,
+      service: "Tinyfish",
+      items: (raw.results ?? []).slice(0, maxResults).map((item: any, index: number) =>
+        searchResult(index, { title: item.title, url: item.url, text: item.snippet }),
+      ),
+    };
+  }
+
+  if (type === "perplexity") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("Perplexity API Key is empty");
+    const endpoint = "https://api.perplexity.ai/search";
+    const body: Record<string, JsonValue> = { query, max_results: maxResults };
+    const requestHeaders = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify(body),
+    });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"), providerName: nameOfSearchService(service),
+      url: endpoint, ok: response.ok, status: response.status, kind: "search:perplexity",
+      method: "POST",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`Perplexity search failed: ${response.status} ${text.slice(0, 300)}`);
+    const results = Array.isArray(raw.results) ? raw.results : [];
+    return {
+      answer: typeof raw.answer === "string" ? raw.answer : "",
+      items: results.filter((r: any) => r?.title && r?.url).slice(0, maxResults).map((r: any, index: number) =>
+        searchResult(index, { title: String(r.title ?? ""), url: String(r.url ?? ""), text: String(r.snippet ?? r.text ?? "") }),
+      ),
+    };
+  }
+
+  if (type === "bocha") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("Bocha API Key is empty");
+    const endpoint = "https://api.bochaai.com/v1/web-search";
+    const summary = service.summary !== false;
+    const body: Record<string, JsonValue> = { query, summary, count: maxResults };
+    const requestHeaders = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify(body),
+    });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"), providerName: nameOfSearchService(service),
+      url: endpoint, ok: response.ok, status: response.status, kind: "search:bocha",
+      method: "POST",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`Bocha search failed: ${response.status} ${text.slice(0, 300)}`);
+    const pages = raw?.data?.webPages?.value ?? [];
+    return {
+      answer: "",
+      items: (Array.isArray(pages) ? pages : []).slice(0, maxResults).map((page: any, index: number) =>
+        searchResult(index, { title: String(page.name ?? ""), url: String(page.url ?? ""), text: String(page.summary ?? page.snippet ?? "") }),
+      ),
+    };
+  }
+
+  if (type === "linkup") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("LinkUp API Key is empty");
+    const endpoint = "https://api.linkup.so/v1/search";
+    const depth = String(service.depth ?? "standard");
+    const body: Record<string, JsonValue> = { q: query, depth, outputType: "sourcedAnswer", includeImages: "false" };
+    const requestHeaders = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify(body),
+    });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"), providerName: nameOfSearchService(service),
+      url: endpoint, ok: response.ok, status: response.status, kind: "search:linkup",
+      method: "POST",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`LinkUp search failed: ${response.status} ${text.slice(0, 300)}`);
+    const sources = Array.isArray(raw.sources) ? raw.sources : [];
+    return {
+      answer: typeof raw.answer === "string" ? raw.answer : "",
+      items: sources.slice(0, maxResults).map((s: any, index: number) =>
+        searchResult(index, { title: String(s.name ?? ""), url: String(s.url ?? ""), text: String(s.snippet ?? "") }),
+      ),
+    };
+  }
+
+  if (type === "metaso") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("Metaso API Key is empty");
+    const endpoint = "https://metaso.cn/api/v1/search";
+    const body: Record<string, JsonValue> = { q: query, scope: "webpage", size: maxResults, includeSummary: false };
+    const requestHeaders = { Authorization: `Bearer ${apiKey}`, Accept: "application/json", "Content-Type": "application/json" };
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify(body),
+    });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"), providerName: nameOfSearchService(service),
+      url: endpoint, ok: response.ok, status: response.status, kind: "search:metaso",
+      method: "POST",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`Metaso search failed: ${response.status} ${text.slice(0, 300)}`);
+    const webpages = Array.isArray(raw.webpages) ? raw.webpages : [];
+    return {
+      answer: "",
+      items: webpages.slice(0, maxResults).map((w: any, index: number) =>
+        searchResult(index, { title: String(w.title ?? ""), url: String(w.link ?? ""), text: String(w.snippet ?? "") }),
+      ),
+    };
+  }
+
+  if (type === "ollama") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("Ollama API Key is empty");
+    const endpoint = "https://ollama.com/api/web_search";
+    const clamped = Math.max(5, Math.min(10, maxResults));
+    const body: Record<string, JsonValue> = { query, max_results: clamped };
+    const requestHeaders = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify(body),
+    });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"), providerName: nameOfSearchService(service),
+      url: endpoint, ok: response.ok, status: response.status, kind: "search:ollama",
+      method: "POST",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`Ollama search failed: ${response.status} ${text.slice(0, 300)}`);
+    const results = Array.isArray(raw.results) ? raw.results : [];
+    return {
+      answer: "",
+      items: results.slice(0, maxResults).map((r: any, index: number) =>
+        searchResult(index, { title: String(r.title ?? ""), url: String(r.url ?? ""), text: String(r.content ?? "") }),
+      ),
+    };
+  }
+
+  if (type === "jina") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("Jina API Key is empty");
+    const searchUrl = String(service.searchUrl ?? "").trim() || "https://s.jina.ai/";
+    const body: Record<string, JsonValue> = { q: query };
+    const requestHeaders = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", Accept: "application/json" };
+    const response = await fetch(searchUrl, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify(body),
+    });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"), providerName: nameOfSearchService(service),
+      url: searchUrl, ok: response.ok, status: response.status, kind: "search:jina",
+      method: "POST",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`Jina search failed: ${response.status} ${text.slice(0, 300)}`);
+    const data = Array.isArray(raw.data) ? raw.data : [];
+    return {
+      answer: "",
+      items: data.slice(0, maxResults).map((r: any, index: number) =>
+        searchResult(index, { title: String(r.title ?? ""), url: String(r.url ?? ""), text: String(r.description ?? "") }),
+      ),
+    };
+  }
+
+  if (type === "firecrawl") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("Firecrawl API Key is empty");
+    const endpoint = "https://api.firecrawl.dev/v2/search";
+    const body: Record<string, JsonValue> = { query, limit: maxResults };
+    const requestHeaders = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify(body),
+    });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"), providerName: nameOfSearchService(service),
+      url: endpoint, ok: response.ok, status: response.status, kind: "search:firecrawl",
+      method: "POST",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`Firecrawl search failed: ${response.status} ${text.slice(0, 300)}`);
+    const data = isRecord(raw.data) ? (raw.data as Record<string, JsonValue>) : {};
+    const web = Array.isArray(data.web) ? data.web : [];
+    const news = Array.isArray(data.news) ? data.news : [];
+    const items: ReturnType<typeof searchResult>[] = [];
+    for (const item of web) {
+      items.push(searchResult(items.length, {
+        title: String((item as Record<string, JsonValue>).title ?? ""),
+        url: String((item as Record<string, JsonValue>).url ?? ""),
+        text: String((item as Record<string, JsonValue>).description ?? ""),
+      }));
+    }
+    for (const item of news) {
+      const record = item as Record<string, JsonValue>;
+      items.push(searchResult(items.length, {
+        title: String(record.title ?? ""),
+        url: String(record.url ?? ""),
+        text: `${String(record.snippet ?? "")}\n${String(record.date ?? "")}`.trim(),
+      }));
+    }
+    return { answer: "", items: items.slice(0, maxResults) };
+  }
+
+  if (type === "grok") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("Grok API Key is empty");
+    const endpoint = String(service.customUrl ?? "").trim() || "https://api.x.ai/v1/responses";
+    const model = String(service.model ?? "").trim() || "grok-4-fast";
+    const systemPrompt = String(service.systemPrompt ?? "").trim()
+      || "You are a helpful assistant that searches the web for the user. Respond with a concise answer and cite sources via web_search/x_search tools.";
+    const body: Record<string, JsonValue> = {
+      model,
+      input: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: query },
+      ],
+      tools: [{ type: "web_search" }, { type: "x_search" }],
+      store: false,
+    };
+    const requestHeaders = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify(body),
+    });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"), providerName: nameOfSearchService(service),
+      url: endpoint, ok: response.ok, status: response.status, kind: "search:grok",
+      method: "POST",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      durationMs: Date.now() - started, requestBody: jsonBody(body), responseBody: textBody(text),
+      toolName: "search_web", error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`Grok search failed: ${response.status} ${text.slice(0, 300)}`);
+    const output = Array.isArray(raw.output) ? raw.output : [];
+    const messageOutput = output.find((entry: any) => entry?.type === "message" && entry?.role === "assistant");
+    const contentArr = Array.isArray(messageOutput?.content) ? messageOutput.content : [];
+    const textContent = contentArr.find((entry: any) => entry?.type === "output_text");
+    const answer = textContent?.text ? String(textContent.text) : "";
+    const annotations = Array.isArray(textContent?.annotations) ? textContent.annotations : [];
+    const seen = new Set<string>();
+    const items: ReturnType<typeof searchResult>[] = [];
+    for (const annotation of annotations) {
+      if (!annotation || annotation.type !== "url_citation") continue;
+      const url = String(annotation.url ?? "");
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      items.push(searchResult(items.length, {
+        title: String(annotation.title ?? url),
+        url,
+        text: "",
+      }));
+      if (items.length >= maxResults) break;
+    }
+    return { answer, items };
+  }
+
+  if (type === "custom_js") {
+    const result = await runCustomJsSearch(service, query, maxResults);
+    addLog({
+      providerId: String(service.id ?? "search"),
+      providerName: nameOfSearchService(service),
+      url: "custom_js:search",
+      ok: true,
+      status: 0,
+      kind: "tool:search_web",
+      toolName: "search_web",
+      durationMs: Date.now() - started,
+      requestBody: jsonBody({ query, maxResults }),
+      responseBody: jsonBody(result),
+    });
+    return result;
+  }
+
+  const requestHeaders = { "User-Agent": "Mozilla/5.0 RikkaHubPC/1.0" };
+  const response = await fetch(`https://www.bing.com/search?q=${encodeURIComponent(query)}&count=${maxResults}`, {
+    headers: requestHeaders,
+  });
+  const html = await response.text();
+  addLog({
+    providerId: String(service.id ?? "search"),
+    providerName: nameOfSearchService(service),
+    url: response.url,
+    ok: response.ok,
+    status: response.status,
+    kind: "tool:search_web",
+    toolName: "search_web",
+    durationMs: Date.now() - started,
+    method: "GET",
+    requestHeaders,
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    requestBody: jsonBody({ query, maxResults }),
+    responseBody: textBody(stripHtml(html)),
+    error: response.ok ? undefined : textBody(html),
+  });
+  if (!response.ok) throw new Error(`Bing ${response.status}: ${html.slice(0, 300)}`);
+  const items: Array<{ id: string; title: string; url: string; domain: string; icon: string; text: string }> = [];
+  const blocks = html.match(/<li class="b_algo"[\s\S]*?<\/li>/gi) ?? [];
+  for (const block of blocks.slice(0, maxResults)) {
+    const link = block.match(/<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
+    const snippet = block.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
+    if (!link) continue;
+    items.push(searchResult(items.length, {
+      title: stripHtml(link[2]),
+      url: link[1].replace(/&amp;/g, "&"),
+      text: snippet ? stripHtml(snippet[1]) : "",
+    }));
+  }
+  return { query, service: "Bing", items };
+}
+
+async function runScrapeWeb(params: Record<string, JsonValue>) {
+  const started = Date.now();
+  const target = String(params.url ?? "").trim();
+  if (!target || !/^https?:\/\//i.test(target)) throw new Error("scrape_web requires an http(s) url");
+  const service = selectedSearchService();
+  const type = String(service.type ?? "bing_local").toLowerCase();
+  if (type === "custom_js" && String(service.scrapeScript ?? "").trim()) {
+    const result = await runCustomJsScrape(service, target);
+    addLog({
+      providerId: String(service.id ?? "search"),
+      providerName: nameOfSearchService(service),
+      url: "custom_js:scrape",
+      ok: true,
+      status: 0,
+      kind: "tool:scrape_web",
+      toolName: "scrape_web",
+      durationMs: Date.now() - started,
+      requestBody: jsonBody({ url: target }),
+      responseBody: jsonBody(result),
+    });
+    return result;
+  }
+  if (type === "tinyfish") {
+    const apiKey = String(service.apiKey ?? "");
+    if (!apiKey) throw new Error("Tinyfish API Key is empty");
+    const endpoint = "https://api.fetch.tinyfish.ai";
+    const requestBody = { urls: [target], format: "markdown" };
+    const requestHeaders = { "Content-Type": "application/json", "X-API-Key": apiKey };
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify(requestBody),
+    });
+    const { text, raw } = await parseJsonResponse(response);
+    addLog({
+      providerId: String(service.id ?? "search"),
+      providerName: nameOfSearchService(service),
+      url: endpoint,
+      ok: response.ok,
+      status: response.status,
+      kind: "tool:scrape_web",
+      toolName: "scrape_web",
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody(requestBody),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`Tinyfish fetch failed with code ${response.status}: ${text.slice(0, 500)}`);
+    const item = Array.isArray(raw.results) ? raw.results[0] : null;
+    const fetchError = Array.isArray(raw.errors) ? raw.errors[0]?.error : "";
+    if (!item && fetchError) throw new Error(String(fetchError));
+    return {
+      url: String(item?.final_url ?? item?.url ?? target),
+      title: item?.title,
+      description: item?.description,
+      language: item?.language,
+      text: String(item?.text ?? "").slice(0, 12000),
+    };
+  }
+  const requestHeaders = { "User-Agent": "Mozilla/5.0 RikkaHubPC/1.0" };
+  const response = await fetch(target, { headers: requestHeaders });
+  const text = await response.text();
+  addLog({
+    providerId: "scrape_web",
+    providerName: "Scrape Web",
+    url: target,
+    ok: response.ok,
+    status: response.status,
+    kind: "tool:scrape_web",
+    toolName: "scrape_web",
+    durationMs: Date.now() - started,
+    method: "GET",
+    requestHeaders,
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    requestBody: jsonBody({ url: target }),
+    responseBody: textBody(stripHtml(text)),
+    error: response.ok ? undefined : textBody(text),
+  });
+  if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 300)}`);
+  return {
+    url: target,
+    text: stripHtml(text).slice(0, 12000),
+  };
+}
+
+function openAiSearchTools() {
+  return state.settings.enableWebSearch
+    ? [
+    {
+      type: "function",
+      function: {
+        name: "search_web",
+        description: `
+Search the web for up-to-date or specific information.
+Use this when the user asks for the latest news, current facts, or needs verification.
+Generate focused keywords and run multiple searches if needed.
+Today is ${formatKeyLocal(new Date())}.
+
+Response format:
+- items[].id (short id), title, url, text
+
+Citations:
+- After using results, add \`[citation,domain](id)\` after the sentence.
+- Multiple citations are allowed.
+- If no results are cited, omit citations.
+
+Example:
+The capital of France is Paris. [citation,example.com](abc123)
+The population is about 2.1 million. [citation,example.com](abc123) [citation,example2.com](def456)
+`.trim(),
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Focused search query" },
+            // `max_results` deliberately omitted from the tool schema — see callSearchTool
+            // (server.ts:3369). The user-configured `resultSize` is the authoritative count;
+            // letting the LLM specify max_results caused most models to silently downgrade
+            // to 5 results even when the user had configured 10.
+          },
+          required: ["query"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "scrape_web",
+        description: `
+Scrape a URL for detailed page content.
+Use this when the user requests content from a specific page or when search snippets are insufficient.
+Avoid using it for common questions unless the user asks.
+`.trim(),
+        parameters: {
+          type: "object",
+          properties: { url: { type: "string" } },
+          required: ["url"],
+        },
+      },
+    },
+  ]
+    : [];
+}
+
+function openAiSkillTools(assistant: Assistant) {
+  const enabled = new Set(getStringArray(assistant.enabledSkills));
+  const available = listSkills().filter((skill) => enabled.has(skill.name));
+  if (available.length === 0) return [];
+  return [
+    {
+      type: "function",
+      function: {
+        name: "use_skill",
+        description: "Load and apply a skill to get specialized instructions or capabilities.",
+        parameters: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "The name of the skill to use" },
+            path: {
+              type: "string",
+              description: "Optional relative path to a file inside the skill directory. Omit to read the default SKILL.md instructions. Only use paths extracted from Markdown links in the SKILL.md content. Do NOT guess or infer paths.",
+            },
+          },
+          required: ["name"],
+        },
+      },
+    },
+  ];
+}
+
+function openAiLocalTools(assistant: Assistant) {
+  const enabled = new Set((assistant.localTools ?? []).map((tool) => isRecord(tool) ? String(tool.type ?? "") : String(tool)));
+  const tools = [];
+  if (assistant.enableMemory) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "memory_tool",
+        description: `The memory tool stores long-term information across conversations.
+Use \`action\` to control the operation: \`create\` (add), \`edit\` (update), \`delete\` (remove).
+- No relevant record: \`create\` + \`content\`
+- Existing relevant record: \`edit\` + \`id\` + \`content\`
+- Outdated/irrelevant record: \`delete\` + \`id\`
+Memories will automatically appear in the <memories> tag in later conversations.
+Do not store sensitive information (e.g., ethnicity, religion, sexual orientation, political views, sex life, criminal records).
+You may store: preferred name, preferences, plans, work-related notes, chat style preferences, first chat time, etc.
+Do not show memory content directly in the conversation unless the user explicitly asks.
+Today is ${formatKeyLocal(new Date())}.
+Similar memories should be merged; prefer updating existing records.
+
+Examples:
+{"action":"create","content":"User prefers brief replies and is more active on weekends."}
+{"action":"edit","id":12,"content":"User's preferred name updated to A-Xing, prefers Chinese replies."}
+{"action":"delete","id":7}`,
+        parameters: {
+          type: "object",
+          properties: {
+            action: {
+              type: "string",
+              enum: ["create", "edit", "delete"],
+              description: "Operation to perform: create, edit, or delete",
+            },
+            id: {
+              type: "integer",
+              description: "The id of the memory record (required for edit/delete)",
+            },
+            content: {
+              type: "string",
+              description: "The content of the memory record (required for create/edit)",
+            },
+          },
+          required: ["action"],
+        },
+      },
+    });
+  }
+  if (enabled.has("time_info")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "get_time_info",
+        description: "Get the current local date and time info from the device. Returns year/month/day, weekday, ISO date/time strings, timezone, and timestamp.",
+        parameters: { type: "object", properties: {} },
+      },
+    });
+  }
+  if (enabled.has("javascript_engine")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "eval_javascript",
+        description: "Execute JavaScript code using QuickJS engine (ES2020). The result is the value of the last expression in the code. For calculations with decimals, use toFixed() to control precision. Console output (log/info/warn/error) is captured and returned in 'logs' field. No DOM or Node.js APIs available. Example: '1 + 2' returns 3; 'const x = 5; x * 2' returns 10.",
+        parameters: {
+          type: "object",
+          properties: { code: { type: "string", description: "JavaScript code to evaluate" } },
+          required: ["code"],
+        },
+      },
+    });
+  }
+  if (enabled.has("clipboard")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "clipboard_tool",
+        description: "Read or write plain text from the device clipboard. Use action: read or write. For write, provide text. Do NOT write to the clipboard unless the user has explicitly requested it.",
+        parameters: {
+          type: "object",
+          properties: {
+            action: { type: "string", enum: ["read", "write"], description: "Operation to perform: read or write" },
+            text: { type: "string", description: "Text to write to the clipboard (required for write)" },
+          },
+          required: ["action"],
+        },
+      },
+    });
+  }
+  if (enabled.has("tts")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "text_to_speech",
+        description: "Speak text aloud to the user using the device's text-to-speech engine. Use this when the user asks you to read something aloud, or when audio output is appropriate. The tool returns immediately; audio plays in the background on the device. Provide natural, readable text without markdown formatting.",
+        parameters: {
+          type: "object",
+          properties: { text: { type: "string", description: "The text to speak aloud" } },
+          required: ["text"],
+        },
+      },
+    });
+  }
+  if (enabled.has("ask_user")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "ask_user",
+        description: "Ask the user one or more questions when you need clarification, additional information, or confirmation. Each question can optionally provide a list of suggested options for the user to choose from. The user may select an option or provide their own free-text answer for each question. The answers will be returned as a JSON object mapping question IDs to the user's responses.",
+        parameters: {
+          type: "object",
+          properties: {
+            questions: {
+              type: "array",
+              description: "List of questions to ask the user",
+              items: {
+                type: "object",
+                properties: {
+                  id: { type: "string", description: "Unique identifier for this question" },
+                  question: { type: "string", description: "The question text to display to the user" },
+                  options: { type: "array", description: "Optional suggested options", items: { type: "string" } },
+                  selection_type: { type: "string", enum: ["text", "single", "multi"], description: "Answer type" },
+                },
+                required: ["id", "question"],
+              },
+            },
+          },
+          required: ["questions"],
+        },
+      },
+    });
+  }
+  return tools;
+}
+
+function openAiMcpTools(assistant: Assistant) {
+  const selected = new Set(getStringArray(assistant.mcpServers));
+  return (state.settings.mcpServers as Array<Record<string, JsonValue>>)
+    .filter((server) => selected.has(String(server.id ?? "")) && isRecord(server.commonOptions) && server.commonOptions.enable !== false)
+    .flatMap((server) => {
+      const serverId = String(server.id ?? "");
+      const serverName = String((server.commonOptions as Record<string, JsonValue>).name ?? server.id ?? "mcp");
+      const tools = Array.isArray((server.commonOptions as Record<string, JsonValue>).tools)
+        ? ((server.commonOptions as Record<string, JsonValue>).tools as JsonValue[])
+        : [];
+      // Apply both the global tool.enable filter AND the per-assistant override. A tool that
+      // the user disabled at the chat-input MCP picker for this assistant is invisible to
+      // the model on this turn — matching how the chat-input MCP server switch already hides
+      // an entire server from the model.
+      return tools.filter(isRecord)
+        .filter((tool) => isMcpToolEnabledForAssistant(assistant, serverId, tool))
+        .map((tool) => ({
+          type: "function",
+          function: {
+            name: `mcp__${String(tool.name ?? "").replace(/[^a-zA-Z0-9_-]/g, "_")}`,
+            description: String(tool.description ?? `MCP tool from ${serverName}`),
+            parameters: tool.inputSchema && typeof tool.inputSchema === "object" ? tool.inputSchema : { type: "object", properties: {} },
+          },
+        })).filter((tool) => tool.function.name !== "mcp__");
+    });
+}
+
+function headersFromMcpServer(server: Record<string, JsonValue>) {
+  const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json, text/event-stream" };
+  const common = isRecord(server.commonOptions) ? server.commonOptions : {};
+  const rawHeaders = Array.isArray(common.headers) ? common.headers : [];
+  for (const header of rawHeaders) {
+    if (Array.isArray(header)) {
+      const [key, value] = header;
+      if (key) headers[String(key)] = String(value ?? "");
+    } else if (isRecord(header)) {
+      const key = String(header.key ?? header.name ?? header.first ?? "").trim();
+      const value = String(header.value ?? header.second ?? "");
+      if (key) headers[key] = value;
+    }
+  }
+  return headers;
+}
+
+function parseMcpResponseText(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) return {};
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const dataLines = trimmed
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.replace(/^data:\s?/, "").trim())
+      .filter((line) => line && line !== "[DONE]");
+    for (const line of dataLines.reverse()) {
+      try {
+        return JSON.parse(line);
+      } catch {
+        // Continue scanning older SSE data frames.
+      }
+    }
+    return { text };
+  }
+}
+
+function resolveMcpSseEndpoint(baseUrl: string, endpoint: string) {
+  const trimmed = endpoint.trim();
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return new URL(trimmed, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString();
+}
+
+const mcpSessionCache = new Map<string, { sessionId: string; protocolVersion?: string }>();
+const MCP_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+function mcpSessionCacheKey(server: Record<string, JsonValue>) {
+  const common = isRecord(server.commonOptions) ? server.commonOptions : {};
+  const headers = Array.isArray(common.headers) ? common.headers : [];
+  return JSON.stringify({
+    id: String(server.id ?? ""),
+    type: String(server.type ?? "streamable_http"),
+    url: String(server.url ?? ""),
+    headers,
+  });
+}
+
+async function readMcpSseUntilEndpoint(response: Response, timeoutMs = 15000) {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("SSE MCP response has no body");
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const started = Date.now();
+  try {
+    for (;;) {
+      if (Date.now() - started > timeoutMs) throw new Error("SSE MCP endpoint event timeout");
+      const read = await Promise.race([
+        reader.read(),
+        new Promise<ReadableStreamReadResult<Uint8Array>>((_, reject) =>
+          setTimeout(() => reject(new Error("SSE MCP endpoint event timeout")), 1000),
+        ),
+      ]);
+      if (read.done) break;
+      buffer += decoder.decode(read.value, { stream: true });
+      const events = buffer.split(/\n\n+/);
+      buffer = events.pop() ?? "";
+      for (const eventBlock of events) {
+        const eventName = eventBlock.split(/\r?\n/).find((line) => line.startsWith("event:"))?.replace(/^event:\s*/, "").trim() ?? "";
+        const data = eventBlock
+          .split(/\r?\n/)
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.replace(/^data:\s?/, ""))
+          .join("\n")
+          .trim();
+        if (eventName === "endpoint" && data) return data;
+      }
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // Ignore cancellation errors from the long-lived SSE stream.
+    }
+  }
+  throw new Error("SSE MCP endpoint event was not received");
+}
+
+async function mcpSsePostEndpoint(server: Record<string, JsonValue>) {
+  const cached = String(server.ssePostEndpoint ?? "").trim();
+  if (cached) return cached;
+  const target = String(server.url ?? "").trim();
+  if (!/^https?:\/\//i.test(target)) throw new Error("MCP SSE server URL must be http(s)");
+  const started = Date.now();
+  // 给握手阶段的 fetch 加 30s 超时——SSE 流读取本身已有内部 15s 超时
+  // (readMcpSseUntilEndpoint)，但外层 fetch 在服务器吊死/不回响应头时
+  // 永远不会返回，导致前端"连接异常"被卡在 connecting 状态。
+  const ac = new AbortController();
+  const timeoutId = setTimeout(() => ac.abort(), 30_000);
+  let response: Response;
+  try {
+    response = await fetch(target, { headers: headersFromMcpServer(server), signal: ac.signal });
+  } catch (err) {
+    clearTimeout(timeoutId);
+    const aborted = err instanceof Error && (err.name === "AbortError" || /abort/i.test(err.message));
+    throw new Error(aborted ? "MCP SSE handshake timed out after 30s" : err instanceof Error ? err.message : String(err));
+  }
+  clearTimeout(timeoutId);
+  const endpoint = resolveMcpSseEndpoint(target, await readMcpSseUntilEndpoint(response));
+  addLog({
+    providerId: String(server.id ?? "mcp"),
+    providerName: String(isRecord(server.commonOptions) ? server.commonOptions.name ?? "MCP Server" : "MCP Server"),
+    url: target,
+    ok: true,
+    status: response.status,
+    kind: "mcp:sse:endpoint",
+    durationMs: Date.now() - started,
+    responseBody: endpoint,
+    toolName: "endpoint",
+  });
+  server.ssePostEndpoint = endpoint;
+  return endpoint;
+}
+
+async function postMcpJsonRpc(
+  server: Record<string, JsonValue>,
+  method: string,
+  params: Record<string, JsonValue> | undefined,
+  extraHeaders: Record<string, string> = {},
+  options: { notification?: boolean } = {},
+) {
+  const target = String(server.type ?? "streamable_http") === "sse"
+    ? await mcpSsePostEndpoint(server)
+    : String(server.url ?? "").trim();
+  if (!/^https?:\/\//i.test(target)) throw new Error("MCP server URL must be http(s)");
+  const body = options.notification
+    ? { jsonrpc: "2.0", method, params: params ?? {} }
+    : { jsonrpc: "2.0", id: id(), method, params: params ?? {} };
+  const started = Date.now();
+  // 给 fetch 加 30s 超时，避免 MCP 服务卡死时把"启用/同步工具"流程一直
+  // 卡在 connecting 状态——对齐安卓 commit 4d257320 的修复目标：sync
+  // 必须有失败终点，前端才能切换到错误态。
+  const ac = new AbortController();
+  const timeoutId = setTimeout(() => ac.abort(), 30_000);
+  let response: Response;
+  let text: string;
+  const requestHeaders = { ...headersFromMcpServer(server), ...extraHeaders };
+  try {
+    response = await fetch(target, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify(body),
+      signal: ac.signal,
+    });
+    text = await response.text();
+  } catch (err) {
+    clearTimeout(timeoutId);
+    const aborted = err instanceof Error && (err.name === "AbortError" || /abort/i.test(err.message));
+    const reason = aborted ? "MCP request timed out after 30s" : err instanceof Error ? err.message : String(err);
+    addLog({
+      providerId: String(server.id ?? "mcp"),
+      providerName: String(isRecord(server.commonOptions) ? server.commonOptions.name ?? "MCP Server" : "MCP Server"),
+      url: target,
+      ok: false,
+      status: 0,
+      kind: `mcp:${method}`,
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders,
+      requestBody: jsonBody(body),
+      responseBody: "",
+      toolName: method,
+      error: reason,
+    });
+    throw new Error(reason);
+  }
+  clearTimeout(timeoutId);
+  const raw: any = parseMcpResponseText(text);
+  addLog({
+    providerId: String(server.id ?? "mcp"),
+    providerName: String(isRecord(server.commonOptions) ? server.commonOptions.name ?? "MCP Server" : "MCP Server"),
+    url: target,
+    ok: response.ok && !raw.error,
+    status: response.status,
+    kind: `mcp:${method}`,
+    durationMs: Date.now() - started,
+    method: "POST",
+    requestHeaders,
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    requestBody: jsonBody(body),
+    responseBody: textBody(text),
+    toolName: method,
+    error: response.ok && !raw.error ? undefined : jsonBody(raw.error ?? text),
+  });
+  if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+  if (raw.error) throw new Error(jsonBody(raw.error, 500));
+  return {
+    result: raw.result ?? raw,
+    sessionId: response.headers.get("mcp-session-id") ?? response.headers.get("Mcp-Session-Id") ?? undefined,
+    protocolVersion: typeof raw.result?.protocolVersion === "string" ? raw.result.protocolVersion : undefined,
+  };
+}
+
+async function mcpSessionHeaders(server: Record<string, JsonValue>) {
+  const cacheKey = mcpSessionCacheKey(server);
+  const cached = mcpSessionCache.get(cacheKey);
+  if (cached?.sessionId) {
+    return {
+      "mcp-session-id": cached.sessionId,
+      ...(cached.protocolVersion ? { "mcp-protocol-version": cached.protocolVersion } : {}),
+    };
+  }
+  let init: Awaited<ReturnType<typeof postMcpJsonRpc>> | null = null;
+  let lastError: unknown = null;
+  for (const protocolVersion of MCP_PROTOCOL_VERSIONS) {
+    try {
+      init = await postMcpJsonRpc(server, "initialize", {
+        protocolVersion,
+        capabilities: {},
+        clientInfo: { name: "RikkaHub PC", version: "pc-dev" },
+      });
+      break;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  if (!init) {
+    throw lastError instanceof Error ? lastError : new Error(String(lastError ?? "MCP initialize failed"));
+  }
+  if (init.sessionId) mcpSessionCache.set(cacheKey, { sessionId: init.sessionId, protocolVersion: init.protocolVersion });
+  const headers = init.sessionId
+    ? {
+      "mcp-session-id": init.sessionId,
+      ...(init.protocolVersion ? { "mcp-protocol-version": init.protocolVersion } : {}),
+    }
+    : {};
+  await postMcpJsonRpc(server, "notifications/initialized", {}, headers, { notification: true });
+  return headers;
+}
+
+async function mcpJsonRpc(server: Record<string, JsonValue>, method: string, params?: Record<string, JsonValue>) {
+  const cacheKey = mcpSessionCacheKey(server);
+  const headers = await mcpSessionHeaders(server);
+  try {
+    const response = await postMcpJsonRpc(server, method, params, headers);
+    return response.result;
+  } catch (err) {
+    if (!mcpSessionCache.has(cacheKey)) throw err;
+    mcpSessionCache.delete(cacheKey);
+    const retryHeaders = await mcpSessionHeaders(server);
+    const response = await postMcpJsonRpc(server, method, params, retryHeaders);
+    return response.result;
+  }
+}
+
+async function fetchMcpTools(server: Record<string, JsonValue>) {
+  const result = await mcpJsonRpc(server, "tools/list");
+  const tools = Array.isArray(result.tools) ? result.tools : [];
+  return tools.map((tool: any) => ({
+    enable: true,
+    name: String(tool.name ?? ""),
+    description: tool.description ? String(tool.description) : null,
+    inputSchema: tool.inputSchema ?? tool.input_schema ?? { type: "object", properties: {} },
+    needsApproval: tool.needsApproval === true,
+  })).filter((tool) => tool.name);
+}
+
+async function syncMcpServerTools(server: Record<string, JsonValue>) {
+  const common = isRecord(server.commonOptions) ? server.commonOptions : {};
+  // Preserve user-set per-tool toggles (enable / needsApproval) across re-syncs. Without
+  // this, every detail-save would re-fetch tools/list and reset the user's switches —
+  // because settings/mcp-server/detail unconditionally calls this function whenever the
+  // server is enabled, including when the user toggled a single per-tool field in the UI.
+  const existingTools = Array.isArray(common.tools) ? common.tools.filter(isRecord) : [];
+  const prefs = new Map<string, { enable: boolean; needsApproval: boolean }>();
+  for (const t of existingTools) {
+    const n = String(t.name ?? "");
+    if (!n) continue;
+    prefs.set(n, {
+      enable: t.enable !== false,
+      needsApproval: t.needsApproval === true,
+    });
+  }
+  try {
+    const fetched = await fetchMcpTools(server);
+    const tools = fetched.map((tool) => {
+      const pref = prefs.get(tool.name);
+      return pref ? { ...tool, enable: pref.enable, needsApproval: pref.needsApproval } : tool;
+    });
+    return {
+      ...server,
+      commonOptions: {
+        ...common,
+        tools,
+        lastSyncAt: Date.now(),
+        lastSyncError: "",
+        connected: true,
+      },
+    };
+  } catch (err) {
+    return {
+      ...server,
+      commonOptions: {
+        ...common,
+        lastSyncAt: Date.now(),
+        lastSyncError: err instanceof Error ? err.message : String(err),
+        connected: false,
+      },
+    };
+  }
+}
+
+// Read this assistant's per-tool override (PC-only). Returns the override entry or undefined
+// if the assistant hasn't customized this tool. Outer key is the server id from the global
+// MCP server list; inner key is the tool name (NOT the `mcp__<sanitized>` LLM-facing alias).
+function getMcpToolOverride(assistant: Assistant, serverId: string, toolName: string): { enable?: boolean; needsApproval?: boolean } | undefined {
+  const overrides = isRecord(assistant.mcpToolOverrides) ? assistant.mcpToolOverrides as Record<string, Record<string, { enable?: boolean; needsApproval?: boolean }>> : undefined;
+  if (!overrides) return undefined;
+  const perServer = overrides[serverId];
+  if (!perServer) return undefined;
+  return perServer[toolName];
+}
+
+// Per-assistant resolved enable state for a tool. Global tool.enable=false ⇒ false (override
+// can never reactivate a globally-disabled tool — matches the user's stated rule "设置中关闭
+// 的工具会话里看不见"). Otherwise, the override.enable wins; absence falls back to true.
+function isMcpToolEnabledForAssistant(assistant: Assistant, serverId: string, tool: Record<string, JsonValue>): boolean {
+  if (tool.enable === false) return false;
+  const override = getMcpToolOverride(assistant, serverId, String(tool.name ?? ""));
+  if (override?.enable === false) return false;
+  return true;
+}
+
+// Per-assistant resolved needsApproval state. Override wins when set (true/false), otherwise
+// falls back to the global per-tool needsApproval flag.
+function isMcpToolApprovalRequiredForAssistant(assistant: Assistant, serverId: string, tool: Record<string, JsonValue>): boolean {
+  const override = getMcpToolOverride(assistant, serverId, String(tool.name ?? ""));
+  if (typeof override?.needsApproval === "boolean") return override.needsApproval;
+  return tool.needsApproval === true;
+}
+
+async function callMcpTool(assistant: Assistant, toolName: string, args: Record<string, JsonValue>) {
+  const selected = new Set(getStringArray(assistant.mcpServers));
+  const servers = (state.settings.mcpServers as Array<Record<string, JsonValue>>)
+    .filter((server) => selected.has(String(server.id ?? "")) && isRecord(server.commonOptions) && server.commonOptions.enable !== false);
+  for (const server of servers) {
+    const common = server.commonOptions as Record<string, JsonValue>;
+    const tools = Array.isArray(common.tools) ? common.tools.filter(isRecord) : [];
+    const matched = tools.find((tool) =>
+      isMcpToolEnabledForAssistant(assistant, String(server.id ?? ""), tool)
+      && `mcp__${String(tool.name ?? "").replace(/[^a-zA-Z0-9_-]/g, "_")}` === toolName,
+    );
+    if (!matched) continue;
+    const result = await mcpJsonRpc(server, "tools/call", { name: String(matched.name), arguments: args });
+    return result;
+  }
+  throw new Error(`MCP tool '${toolName}' is not available for this assistant`);
+}
+
+// Returns true if this tool requires user approval before executing — mirrors Android's
+// GenerationHandler.kt:184-189 logic (`toolDef?.needsApproval == true && state is Auto -> Pending`).
+// PC scope: `ask_user` is always pending (it's literally a "ask the user" prompt), and any
+// MCP tool whose effective needsApproval (override-resolved) is true gets pending too. Local
+// built-ins (search/scrape/memory/etc.) currently never need approval — Android matches.
+function toolNeedsApproval(toolName: string, assistant: Assistant): boolean {
+  if (!toolName) return false;
+  if (toolName === "ask_user") return true;
+  if (!toolName.startsWith("mcp__")) return false;
+  const selected = new Set(getStringArray(assistant.mcpServers));
+  const servers = (state.settings.mcpServers as Array<Record<string, JsonValue>>)
+    .filter((server) => selected.has(String(server.id ?? "")) && isRecord(server.commonOptions) && server.commonOptions.enable !== false);
+  for (const server of servers) {
+    const common = server.commonOptions as Record<string, JsonValue>;
+    const tools = Array.isArray(common.tools) ? common.tools.filter(isRecord) : [];
+    const matched = tools.find((tool) =>
+      isMcpToolEnabledForAssistant(assistant, String(server.id ?? ""), tool)
+      && `mcp__${String(tool.name ?? "").replace(/[^a-zA-Z0-9_-]/g, "_")}` === toolName,
+    );
+    if (matched) return isMcpToolApprovalRequiredForAssistant(assistant, String(server.id ?? ""), matched);
+  }
+  return false;
+}
+
+function initialApprovalState(toolName: string, assistant: Assistant): JsonValue {
+  return toolNeedsApproval(toolName, assistant) ? { type: "pending" } : { type: "auto" };
+}
+
+async function runPowerShell(command: string, input = "") {
+  const proc = Bun.spawn(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (input) {
+    proc.stdin.write(input);
+  }
+  proc.stdin.end();
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  if (exitCode !== 0) throw new Error(stderr.trim() || `PowerShell exited with code ${exitCode}`);
+  return stdout;
+}
+
+function clipboardCommand(): string | null {
+  if (process.env.WAYLAND_DISPLAY || process.env.XDG_SESSION_TYPE === "wayland") {
+    return "wl";
+  }
+  if (process.env.DISPLAY || process.env.XDG_SESSION_TYPE === "x11") {
+    return "x11";
+  }
+  return null;
+}
+
+async function readSystemClipboardText() {
+  if (process.platform === "win32") {
+    return runPowerShell("[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Get-Clipboard -Raw");
+  }
+  const backend = clipboardCommand();
+  try {
+    if (backend === "wl") {
+      const proc = Bun.spawnSync(["wl-paste"]);
+      if (proc.exitCode === 0) return new TextDecoder().decode(proc.stdout).trim();
+    } else if (backend === "x11") {
+      const proc = Bun.spawnSync(["xclip", "-selection", "clipboard", "-o"]);
+      if (proc.exitCode === 0) return new TextDecoder().decode(proc.stdout).trim();
+    }
+  } catch (e) { console.warn("[clipboard] read failed:", e); }
+  return "";
+}
+
+async function writeSystemClipboardText(text: string) {
+  if (process.platform === "win32") {
+    await runPowerShell("[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); Set-Clipboard -Value ([Console]::In.ReadToEnd())", text);
+    return;
+  }
+  const backend = clipboardCommand();
+  try {
+    if (backend === "wl") {
+      const proc = Bun.spawn(["wl-copy"], { stdin: "pipe" });
+      proc.stdin.write(text);
+      proc.stdin.end();
+      await proc.exited;
+    } else if (backend === "x11") {
+      const proc = Bun.spawn(["xclip", "-selection", "clipboard"], { stdin: "pipe" });
+      proc.stdin.write(text);
+      proc.stdin.end();
+      await proc.exited;
+    }
+  } catch (e) { console.warn("[clipboard] write failed:", e); }
+}
+
+// Global serialization lock for system TTS. Without this, parallel client
+// fetches (chunked-playback prefetch) would each spawn their own TTS process,
+// producing the "multiple voices speaking at once" bug.
+let systemTtsChain: Promise<void> = Promise.resolve();
+
+// All currently-spawned system-TTS processes — keyed by Subprocess so we can
+// `kill()` them when the client calls /api/tts/cancel.
+const activeSystemTtsProcs = new Set<ReturnType<typeof Bun.spawn>>();
+
+async function speakSystemText(text: string, speechRate = 1) {
+  const prev = systemTtsChain;
+  let release: () => void = () => {};
+  systemTtsChain = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    await prev.catch(() => undefined);
+    if (process.platform === "win32") {
+      const rate = Math.max(-10, Math.min(10, Math.round((speechRate - 1) * 5)));
+      const script = [
+        "Add-Type -AssemblyName System.Speech",
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer",
+        `$s.Rate = ${rate}`,
+        "$s.Speak([Console]::In.ReadToEnd())",
+        "$s.Dispose()",
+      ].join("; ");
+      const proc = Bun.spawn(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      activeSystemTtsProcs.add(proc);
+      try {
+        proc.stdin.write(text);
+        proc.stdin.end();
+        const exitCode = await proc.exited;
+        if (exitCode !== 0 && exitCode !== null) {
+          const stderrText = await new Response(proc.stderr).text().catch(() => "");
+          if (stderrText.trim()) console.warn(`[tts] System TTS exited ${exitCode}: ${stderrText.slice(0, 200)}`);
+        }
+      } finally {
+        activeSystemTtsProcs.delete(proc);
+      }
+    } else {
+      const speed = Math.max(80, Math.min(450, Math.round(175 * speechRate)));
+      const proc = Bun.spawn(["espeak-ng", "--stdin", "-s", String(speed)], {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      activeSystemTtsProcs.add(proc);
+      try {
+        proc.stdin.write(text);
+        proc.stdin.end();
+        const exitCode = await proc.exited;
+        if (exitCode !== 0 && exitCode !== null) {
+          const stderrText = await new Response(proc.stderr).text().catch(() => "");
+          if (stderrText.trim()) console.warn(`[tts] espeak-ng exited ${exitCode}: ${stderrText.slice(0, 200)}`);
+        }
+      } finally {
+        activeSystemTtsProcs.delete(proc);
+      }
+    }
+  } finally {
+    release();
+  }
+}
+
+async function synthesizeSystemTtsToWav(text: string, speechRate = 1): Promise<Buffer> {
+  const prev = systemTtsChain;
+  let release: () => void = () => {};
+  systemTtsChain = new Promise<void>((resolve) => { release = resolve; });
+  const tmpWav = join(tempDir(), `tts-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.wav`);
+  try {
+    await prev.catch(() => undefined);
+    if (process.platform === "win32") {
+      const rate = Math.max(-10, Math.min(10, Math.round((speechRate - 1) * 5)));
+      const script = [
+        "Add-Type -AssemblyName System.Speech",
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer",
+        `$s.Rate = ${rate}`,
+        `$s.SetOutputToWaveFile('${tmpWav.replace(/'/g, "''")}')`,
+        "$s.Speak([Console]::In.ReadToEnd())",
+        "$s.Dispose()",
+      ].join("; ");
+      const proc = Bun.spawn(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      activeSystemTtsProcs.add(proc);
+      try {
+        proc.stdin.write(text);
+        proc.stdin.end();
+        const exitCode = await proc.exited;
+        if (exitCode !== 0 && exitCode !== null) {
+          const stderrText = await new Response(proc.stderr).text().catch(() => "");
+          if (stderrText.trim()) console.warn(`[tts] System TTS exited ${exitCode}: ${stderrText.slice(0, 200)}`);
+        }
+      } finally {
+        activeSystemTtsProcs.delete(proc);
+      }
+    } else {
+      const speed = Math.max(80, Math.min(450, Math.round(175 * speechRate)));
+      const proc = Bun.spawn(["espeak-ng", "-w", tmpWav, "-s", String(speed), "--stdin"], {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      activeSystemTtsProcs.add(proc);
+      try {
+        proc.stdin.write(text);
+        proc.stdin.end();
+        const exitCode = await proc.exited;
+        if (exitCode !== 0 && exitCode !== null) {
+          const stderrText = await new Response(proc.stderr).text().catch(() => "");
+          if (stderrText.trim()) console.warn(`[tts] espeak-ng exited ${exitCode}: ${stderrText.slice(0, 200)}`);
+        }
+      } finally {
+        activeSystemTtsProcs.delete(proc);
+      }
+    }
+    if (!existsSync(tmpWav)) throw new Error("System TTS failed to produce audio file");
+    return readFileSync(tmpWav);
+  } finally {
+    release();
+    try { if (existsSync(tmpWav)) rmSync(tmpWav); } catch { /* best-effort */ }
+  }
+}
+
+function cancelAllSystemTts() {
+  for (const proc of activeSystemTtsProcs) {
+    try { proc.kill(); } catch { /* best-effort */ }
+  }
+  activeSystemTtsProcs.clear();
+}
+
+function runMemoryTool(assistant: Assistant, args: Record<string, JsonValue>) {
+  if (!assistant.enableMemory) throw new Error("memory_tool is not enabled for this assistant");
+  const action = String(args.action ?? "").trim();
+  const assistantId = assistant.useGlobalMemory ? GLOBAL_MEMORY_ID : assistant.id;
+  const now = Date.now();
+  if (action === "create") {
+    const content = String(args.content ?? "").trim();
+    if (!content) throw new Error("content is required");
+    const memory: AssistantMemory = {
+      id: state.nextMemoryId++,
+      assistantId,
+      content,
+      createdAt: now,
+      updatedAt: now,
+    };
+    state.memories.push(memory);
+    saveState();
+    return { id: memory.id, content: memory.content };
+  }
+  if (action === "edit") {
+    const memoryId = Number(args.id);
+    const content = String(args.content ?? "").trim();
+    if (!Number.isInteger(memoryId)) throw new Error("id is required");
+    if (!content) throw new Error("content is required");
+    const memory = state.memories.find((item) => item.id === memoryId && item.assistantId === assistantId);
+    if (!memory) throw new Error(`Memory record #${memoryId} not found`);
+    memory.content = content;
+    memory.updatedAt = now;
+    saveState();
+    return { id: memory.id, content: memory.content };
+  }
+  if (action === "delete") {
+    const memoryId = Number(args.id);
+    if (!Number.isInteger(memoryId)) throw new Error("id is required");
+    const before = state.memories.length;
+    state.memories = state.memories.filter((item) => !(item.id === memoryId && item.assistantId === assistantId));
+    if (state.memories.length === before) throw new Error(`Memory record #${memoryId} not found`);
+    saveState();
+    return { success: true, id: memoryId };
+  }
+  throw new Error("unknown action: " + action + ", must be one of [create, edit, delete]");
+}
+
+async function executeToolCall(toolCall: any, assistant: Assistant) {
+  const name = String(toolCall.function?.name ?? "");
+  let args: Record<string, JsonValue> = {};
+  try {
+    const parsedArgs = JSON.parse(String(toolCall.function?.arguments ?? "{}").trim() || "{}");
+    if (!isRecord(parsedArgs) || Array.isArray(parsedArgs)) {
+      throw new Error("tool arguments must be a JSON object");
+    }
+    args = parsedArgs as Record<string, JsonValue>;
+  } catch (err) {
+    throw new Error(`Invalid tool arguments JSON for ${name}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (name === "memory_tool") return runMemoryTool(assistant, args);
+  // 联网搜索是可关闭的工具(全局 enableWebSearch 开关)。关闭后,tools 数组里不再声明
+  // search_web,但历史消息里残留的 search tool_call 仍会诱导模型再次调用——而本函数原本
+  // 无条件执行真搜索,造成"关了搜索 AI 照样搜"的 bug。加守卫与 use_skill(6266) /
+  // callMcpTool(5912) 的"本轮未启用则拒绝执行"语义对齐(安卓等价:未注册到本轮 tools 表
+  // 的工具根本查不到 execute)。throw 经调用方 catch 转成 tool_result 回灌,模型看到
+  // "已禁用"即停止。
+  if (name === "search_web") {
+    if (!state.settings.enableWebSearch) {
+      throw new Error(
+        "Web search is currently disabled. Stop calling search_web and answer from your own knowledge, or ask the user to re-enable web search.",
+      );
+    }
+    return runSearchWeb(args);
+  }
+  if (name === "scrape_web") {
+    if (!state.settings.enableWebSearch) {
+      throw new Error("Web search is currently disabled. Stop calling scrape_web.");
+    }
+    return runScrapeWeb(args);
+  }
+  if (name === "get_time_info") {
+    const now = new Date();
+    return {
+      year: now.getFullYear(),
+      month: now.getMonth() + 1,
+      day: now.getDate(),
+      weekday: new Intl.DateTimeFormat(undefined, { weekday: "long" }).format(now),
+      weekday_en: new Intl.DateTimeFormat("en-US", { weekday: "long" }).format(now),
+      date: formatKeyLocal(now),
+      time: now.toLocaleTimeString(),
+      datetime: `${formatKeyLocal(now)} ${now.toLocaleTimeString()}`,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      timestamp_ms: now.getTime(),
+    };
+  }
+  if (name === "eval_javascript") {
+    const code = String(args.code ?? "");
+    if (code.length > 20_000) throw new Error("JavaScript code is too long");
+    const logs: string[] = [];
+    const toolConsole = {
+      log: (...values: unknown[]) => logs.push(`[LOG] ${values.map((value) => String(value)).join(" ")}`),
+      info: (...values: unknown[]) => logs.push(`[INFO] ${values.map((value) => String(value)).join(" ")}`),
+      warn: (...values: unknown[]) => logs.push(`[WARN] ${values.map((value) => String(value)).join(" ")}`),
+      error: (...values: unknown[]) => logs.push(`[ERROR] ${values.map((value) => String(value)).join(" ")}`),
+    };
+    const fn = new Function("code", "console", "process", "Bun", "require", "globalThis", "\"use strict\"; return eval(code);");
+    const result = fn(code, toolConsole, undefined, undefined, undefined, undefined);
+    return { ...(logs.length ? { logs: logs.join("\n") } : {}), result: result == null ? null : String(result) };
+  }
+  if (name === "clipboard_tool") {
+    const action = String(args.action ?? "").trim();
+    if (action === "write") {
+      const text = String(args.text ?? "");
+      await writeSystemClipboardText(text);
+      return {
+        success: true,
+        text,
+      };
+    }
+    if (action === "read") {
+      return {
+        text: await readSystemClipboardText(),
+      };
+    }
+    throw new Error("unknown action: " + action + ", must be one of [read, write]");
+  }
+  if (name === "text_to_speech") {
+    const text = String(args.text ?? "").trim();
+    if (!text) throw new Error("text is required");
+    await speakSystemText(text);
+    return {
+      success: true,
+    };
+  }
+  if (name === "ask_user") {
+    return {
+      pending: true,
+      questions: Array.isArray(args.questions) ? args.questions : [],
+      note: "The question has been shown in the conversation. Wait for the user answer before continuing.",
+    };
+  }
+  if (name === "use_skill") {
+    const skillName = String(args.name ?? "").trim();
+    if (!getStringArray(assistant.enabledSkills).includes(skillName)) {
+      throw new Error(`Skill '${skillName}' is not available. Available skills: ${getStringArray(assistant.enabledSkills).join(", ")}`);
+    }
+    const path = String(args.path ?? "").trim();
+    const content = path ? (() => {
+      const target = safeSkillFile(skillName, path);
+      if (!target || !existsSync(target)) throw new Error(`File '${path}' not found in skill '${skillName}'`);
+      return readFileSync(target, "utf8");
+    })() : readSkillBody(skillName);
+    if (!content) throw new Error(`Skill '${skillName}' not found`);
+    return { name: skillName, content };
+  }
+  if (name.startsWith("mcp__")) {
+    return callMcpTool(assistant, name, args);
+  }
+  throw new Error(`Unknown tool: ${name}`);
+}
+
+function toolExecutionErrorPayload(err: unknown) {
+  if (err instanceof Error) {
+    return {
+      error: `[${err.name || "Error"}] ${err.message}${err.stack ? `\n${err.stack}` : ""}`,
+    };
+  }
+  return { error: String(err) };
+}
+
+type ApiMessage = Record<string, any>;
+
+function openAiToolOutput(parts: JsonValue[]) {
+  const text = textFromParts(parts);
+  if (text) return text;
+  return parts.length ? JSON.stringify(parts) : "";
+}
+
+function toolOutputForApproval(part: Record<string, JsonValue>) {
+  const approvalState = isRecord(part.approvalState) ? part.approvalState : { type: "auto" };
+  const type = String(approvalState.type ?? "auto");
+  if (type === "answered") return String(approvalState.answer ?? "");
+  if (type === "denied") {
+    const reason = String(approvalState.reason ?? "").trim() || "No reason provided";
+    return JSON.stringify({ error: `Tool execution denied by user. Reason: ${reason}` });
+  }
+  return "";
+}
+
+function resolvedToolOutput(part: Record<string, JsonValue>) {
+  const output = Array.isArray(part.output) ? part.output : [];
+  const fromOutput = openAiToolOutput(output);
+  if (fromOutput) return fromOutput;
+  return toolOutputForApproval(part);
+}
+
+function fileEntryFromApiUrl(url: string) {
+  const match = url.match(/^\/api\/files\/(\d+)\/content(?:\?.*)?$/) ?? url.match(/^\/files\/(\d+)\/content(?:\?.*)?$/);
+  if (!match) return null;
+  return state.files.find((file) => file.id === Number(match[1])) ?? null;
+}
+
+function safeDataFilePath(relativePath: string) {
+  let decoded = "";
+  try {
+    decoded = decodeURIComponent(relativePath).replace(/\\/g, "/").replace(/^\/+/, "");
+  } catch {
+    return null;
+  }
+  if (!decoded || decoded.split("/").some((part) => part === "..")) return null;
+  const roots = [resolve(dataDir), resolve(filesDir)];
+  const separator = process.platform === "win32" ? "\\" : "/";
+  const candidates = [resolve(dataDir, decoded), resolve(filesDir, decoded)];
+  return candidates.find((candidate) =>
+    roots.some((root) => (candidate === root || candidate.startsWith(`${root}${separator}`))) &&
+    existsSync(candidate) &&
+    statSync(candidate).isFile()
+  ) ?? null;
+}
+
+function extensionFromMime(mime: string) {
+  const normalized = mime.toLowerCase();
+  if (normalized.includes("jpeg") || normalized.includes("jpg")) return ".jpg";
+  if (normalized.includes("webp")) return ".webp";
+  if (normalized.includes("gif")) return ".gif";
+  if (normalized.includes("svg")) return ".svg";
+  if (normalized.includes("pdf")) return ".pdf";
+  if (normalized.includes("json")) return ".json";
+  if (normalized.includes("text")) return ".txt";
+  return ".png";
+}
+
+async function saveToolBinaryContent(data: string, mime: string, prefix: string) {
+  const fileId = state.nextFileId++;
+  const fileName = `${prefix}-${Date.now()}-${fileId}${extensionFromMime(mime)}`;
+  const target = join(filesDir, fileName);
+  await Bun.write(target, Buffer.from(data, "base64"));
+  const fileEntry: StoredFile = { id: fileId, path: target, fileName, mime, size: statSync(target).size };
+  state.files.push(fileEntry);
+  saveState();
+  return `/api/files/${fileId}/content`;
+}
+
+async function toolResultToParts(toolResult: unknown): Promise<JsonValue[]> {
+  if (typeof toolResult === "string") return [{ type: "text", text: toolResult }];
+  if (isRecord(toolResult) && Array.isArray(toolResult.content)) {
+    const parts: JsonValue[] = [];
+    for (const item of toolResult.content) {
+      if (!isRecord(item)) continue;
+      const type = String(item.type ?? "").toLowerCase();
+      if (type === "text") {
+        parts.push({ type: "text", text: String(item.text ?? "") });
+        continue;
+      }
+      if (type === "image") {
+        const data = String(item.data ?? item.base64 ?? "");
+        const mime = String(item.mimeType ?? item.mime_type ?? "image/png");
+        if (data) {
+          parts.push({
+            type: "image",
+            url: await saveToolBinaryContent(data, mime, "mcp-image"),
+            metadata: { source: "mcp", mime },
+          });
+        }
+        continue;
+      }
+      if (type === "resource" && isRecord(item.resource)) {
+        const resource = item.resource;
+        const text = String(resource.text ?? "");
+        if (text) parts.push({ type: "text", text });
+        else parts.push({ type: "text", text: JSON.stringify(item) });
+        continue;
+      }
+      parts.push({ type: "text", text: JSON.stringify(item) });
+    }
+    if (parts.length) return parts;
+  }
+  return [{ type: "text", text: JSON.stringify(toolResult) }];
+}
+
+function dataUrlForMessageUrl(url: string) {
+  if (!url || url.startsWith("data:") || /^https?:\/\//i.test(url)) return url;
+  const entry = fileEntryFromApiUrl(url);
+  if (!entry || !existsSync(entry.path)) return url;
+  const data = readFileSync(entry.path).toString("base64");
+  return `data:${entry.mime || "application/octet-stream"};base64,${data}`;
+}
+
+function parseDataUrl(url: string) {
+  const match = url.match(/^data:([^;,]+);base64,(.+)$/);
+  return match ? { mime: match[1], data: match[2] } : null;
+}
+
+function stripXmlText(input: string) {
+  return input
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function readZipEntries(buffer: Buffer) {
+  const entries: Array<{ name: string; data: Buffer }> = [];
+  const eocd = buffer.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  if (eocd < 0) return entries;
+  const count = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+  for (let i = 0; i < count && offset + 46 <= buffer.length; i += 1) {
+    if (buffer.readUInt32LE(offset) !== 0x02014b50) break;
+    const compression = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const fileNameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.subarray(offset + 46, offset + 46 + fileNameLength).toString("utf8");
+    offset += 46 + fileNameLength + extraLength + commentLength;
+    if (!name || name.endsWith("/") || localOffset + 30 > buffer.length) continue;
+    if (buffer.readUInt32LE(localOffset) !== 0x04034b50) continue;
+    const localNameLength = buffer.readUInt16LE(localOffset + 26);
+    const localExtraLength = buffer.readUInt16LE(localOffset + 28);
+    const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+    const raw = buffer.subarray(dataStart, dataStart + compressedSize);
+    try {
+      if (compression === 0) entries.push({ name, data: raw });
+      if (compression === 8) entries.push({ name, data: inflateRawSync(raw) });
+    } catch {
+      // Ignore unreadable zip members; EPUB text extraction is best-effort.
+    }
+  }
+  return entries;
+}
+
+// Extract a single named member from a (potentially huge) zip via an external `unzip` /
+// `tar.exe` invocation, so we don't decompress every entry into JS heap just to read one
+// XML file. Returns the member's raw bytes or null on failure.
+//
+// Platform support:
+//   - Windows 10+ : System32\tar.exe (BSD libarchive build) speaks zip natively. We
+//     spell out the full path to avoid PATH resolving to GNU tar shipped with Git Bash etc.,
+//     which only handles tar archives and rejects zip with "This does not look like a tar archive".
+//   - Linux: standard `unzip -p <zip> <member>` writes the decompressed bytes to stdout.
+//
+// Falls back to in-memory readZipEntries if the spawn fails (e.g. missing tool, sandboxed
+// environment), so the caller doesn't have to handle that case.
+function extractSingleZipMemberStreaming(zipPath: string, memberName: string): Buffer | null {
+  try {
+    const isWindows = process.platform === "win32";
+    const cmd = isWindows
+      ? [join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe"), "-xOf", zipPath, memberName]
+      : ["unzip", "-p", zipPath, memberName];
+    const proc = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe" });
+    if (proc.exitCode !== 0) {
+      const stderr = new TextDecoder().decode(proc.stderr ?? new Uint8Array()).slice(0, 200);
+      console.warn(`[document] ${cmd[0]} exit ${proc.exitCode}: ${stderr}`);
+      return null;
+    }
+    const out = proc.stdout;
+    if (!out || out.length === 0) return null;
+    return Buffer.from(out);
+  } catch (err) {
+    console.warn(`[document] streaming zip extract spawn failed: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+// --- Document extraction OOM protection ---------------------------------------------------
+//
+// Android's document module is fully streaming (InputStream.copyTo / ZipFile.getInputStream
+// / MuPDF page-by-page), so it doesn't need explicit size caps — single-file memory peak
+// stays low even for multi-hundred-MB files. PC end's readFileSync-and-parse approach can't
+// match that everywhere without rewriting the zip parser, so we layer in size guards: above
+// these thresholds, extraction is skipped and prompt falls back to a brief notice (see
+// extractDocumentPromptText). 240 KB extracted-text cap is the existing prompt limit.
+const MAX_PDF_EXTRACT_BYTES = 100 * 1024 * 1024;   // 100 MB — MuPDF streams pages, headroom for big books
+const MAX_DOCX_EXTRACT_BYTES = 50 * 1024 * 1024;   // 50 MB compressed (~5-10× decompressed XML)
+const MAX_PPTX_EXTRACT_BYTES = 100 * 1024 * 1024;  // 100 MB — PPTX often padded with embedded images
+const MAX_EPUB_EXTRACT_BYTES = 100 * 1024 * 1024;
+const MAX_TEXT_EXTRACT_BYTES = 10 * 1024 * 1024;   // plain text/code; above this we read only head
+const MAX_EXTRACTED_CHARS = 240_000;
+// DOCX above this size routes to the external-unzip path (`tar.exe` on Windows, `unzip` on
+// Linux) to extract only `word/document.xml`, instead of decompressing every zip entry into
+// JS heap. Threshold picked at the point where in-memory cost starts to matter.
+const DOCX_STREAMING_THRESHOLD_BYTES = 20 * 1024 * 1024;
+
+// --- Lightweight XML pull parser (mirrors Android XmlPullParser) ----------------
+//
+// Tokenizes well-formed XML into START_TAG / END_TAG / TEXT events with depth
+// tracking. Namespace prefixes are stripped from tag names (e.g. <w:p> → "p")
+// to match Android's isNamespaceAware=true behaviour. Not a general-purpose XML
+// parser — no entity resolution, no CDATA, no DTD validation — but sufficient
+// for the predictable XML inside DOCX / PPTX / EPUB zips.
+const XML_START_TAG = 0;
+const XML_END_TAG = 1;
+const XML_TEXT = 2;
+const XML_EOF = -1;
+
+interface XmlToken {
+  type: number;
+  name?: string;
+  attrs?: Record<string, string>;
+  text?: string;
+  depth: number;
+}
+
+function tokenizeXml(xml: string): XmlToken[] {
+  const tokens: XmlToken[] = [];
+  let depth = 0;
+  let i = 0;
+  const len = xml.length;
+  while (i < len) {
+    if (xml[i] === "<") {
+      if (xml.startsWith("!--", i + 1)) {
+        const end = xml.indexOf("-->", i + 4);
+        i = end >= 0 ? end + 3 : len;
+        continue;
+      }
+      if (xml[i + 1] === "?") {
+        const end = xml.indexOf("?>", i + 2);
+        i = end >= 0 ? end + 2 : len;
+        continue;
+      }
+      if (xml[i + 1] === "/") {
+        const end = xml.indexOf(">", i + 2);
+        if (end < 0) break;
+        let raw = xml.slice(i + 2, end).trim();
+        const colon = raw.indexOf(":");
+        if (colon >= 0) raw = raw.slice(colon + 1);
+        depth--;
+        tokens.push({ type: XML_END_TAG, name: raw, depth });
+        i = end + 1;
+        continue;
+      }
+      const end = xml.indexOf(">", i + 1);
+      if (end < 0) break;
+      let tagContent = xml.slice(i + 1, end);
+      const selfClose = tagContent.endsWith("/");
+      if (selfClose) tagContent = tagContent.slice(0, -1);
+      const spaceIdx = tagContent.search(/[\s/]/);
+      let rawName = spaceIdx >= 0 ? tagContent.slice(0, spaceIdx).trim() : tagContent.trim();
+      const colon = rawName.indexOf(":");
+      const localName = colon >= 0 ? rawName.slice(colon + 1) : rawName;
+      const attrs: Record<string, string> = {};
+      if (spaceIdx >= 0) {
+        const attrStr = tagContent.slice(spaceIdx);
+        const attrRe = /([a-zA-Z_:][\w:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+        let am: RegExpExecArray | null;
+        while ((am = attrRe.exec(attrStr)) !== null) {
+          attrs[am[1]] = am[2] ?? am[3] ?? "";
+        }
+      }
+      tokens.push({ type: XML_START_TAG, name: localName, attrs, depth });
+      if (selfClose) {
+        tokens.push({ type: XML_END_TAG, name: localName, depth });
+      } else {
+        depth++;
+      }
+      i = end + 1;
+    } else {
+      let end = xml.indexOf("<", i);
+      if (end < 0) end = len;
+      const text = xml.slice(i, end);
+      if (text.length > 0) {
+        tokens.push({ type: XML_TEXT, text, depth });
+      }
+      i = end;
+    }
+  }
+  return tokens;
+}
+
+class XmlPull {
+  private tokens: XmlToken[];
+  private pos = 0;
+  constructor(xml: string) { this.tokens = tokenizeXml(xml); }
+  get eventType() { return this.pos < this.tokens.length ? this.tokens[this.pos].type : XML_EOF; }
+  get name() { return this.pos < this.tokens.length ? this.tokens[this.pos].name : undefined; }
+  get attrs() { return this.pos < this.tokens.length ? this.tokens[this.pos].attrs : undefined; }
+  get text() { return this.pos < this.tokens.length ? this.tokens[this.pos].text : undefined; }
+  get depth() { return this.pos < this.tokens.length ? this.tokens[this.pos].depth : -1; }
+  next(): number { this.pos++; return this.eventType; }
+  getAttributeValue(_ns: string | null, attrName: string): string | null {
+    return this.attrs?.[attrName] ?? null;
+  }
+}
+
+function getStoredFileSize(entry: StoredFile): number {
+  if (typeof entry.size === "number" && entry.size > 0) return entry.size;
+  try {
+    return statSync(entry.path).size;
+  } catch {
+    return 0;
+  }
+}
+
+// EPUB parser — mirrors Android's EpubParser.kt:
+// 1. Read META-INF/container.xml → find OPF path
+// 2. Parse OPF → extract manifest + spine (chapter reading order)
+// 3. Follow spine order, parse each XHTML file with structured text extraction
+// Falls back to filename-sorted stripXmlText if container/OPF is missing.
+function extractEpubText(pathValue: string) {
+  try {
+    const entries = readZipEntries(readFileSync(pathValue));
+    const entryMap = new Map(entries.map((e) => [e.name, e]));
+
+    const containerEntry = entryMap.get("META-INF/container.xml");
+    if (!containerEntry) return extractEpubFallback(entries);
+
+    const opfPath = findEpubOpfPath(containerEntry.data.toString("utf8"));
+    if (!opfPath) return extractEpubFallback(entries);
+
+    const opfEntry = entryMap.get(opfPath);
+    if (!opfEntry) return extractEpubFallback(entries);
+
+    const opfDir = opfPath.includes("/") ? opfPath.substring(0, opfPath.lastIndexOf("/")) : "";
+    return extractEpubFromOpf(entries, entryMap, opfEntry.data.toString("utf8"), opfDir);
+  } catch (err) {
+    console.warn("[document] EPUB extract failed:", err);
+    return "";
+  }
+}
+
+function findEpubOpfPath(containerXml: string): string | null {
+  const p = new XmlPull(containerXml);
+  while (p.eventType !== XML_EOF) {
+    if (p.eventType === XML_START_TAG && p.name === "rootfile") {
+      return p.getAttributeValue(null, "full-path");
+    }
+    p.next();
+  }
+  return null;
+}
+
+function extractEpubFromOpf(
+  entries: Array<{ name: string; data: Buffer }>,
+  entryMap: Map<string, { name: string; data: Buffer }>,
+  opfXml: string,
+  opfDir: string,
+): string {
+  const p = new XmlPull(opfXml);
+  const manifest = new Map<string, { href: string; mediaType: string }>();
+  const spine: string[] = [];
+  while (p.eventType !== XML_EOF) {
+    if (p.eventType === XML_START_TAG) {
+      if (p.name === "item") {
+        const id = p.getAttributeValue(null, "id") ?? "";
+        const href = p.getAttributeValue(null, "href") ?? "";
+        const mediaType = p.getAttributeValue(null, "media-type") ?? "";
+        if (id) manifest.set(id, { href, mediaType });
+      } else if (p.name === "itemref") {
+        const idref = p.getAttributeValue(null, "idref") ?? "";
+        if (idref) spine.push(idref);
+      }
+    }
+    p.next();
+  }
+  const parts: string[] = [];
+  for (const itemId of spine) {
+    const item = manifest.get(itemId);
+    if (!item || !item.mediaType.includes("html")) continue;
+    const itemPath = opfDir ? `${opfDir}/${item.href}` : item.href;
+    const entry = entryMap.get(itemPath);
+    if (!entry) continue;
+    const content = parseEpubXhtml(entry.data.toString("utf8"));
+    if (content) parts.push(content);
+  }
+  const text = parts.join("\n\n").trim();
+  return text ? text.slice(0, MAX_EXTRACTED_CHARS) : "";
+}
+
+// Structured XHTML text extraction — mirrors Android's parseXhtml.
+// Handles headings, lists (ol/ul/li), bold/italic, blockquotes, images, hr.
+function parseEpubXhtml(xhtml: string): string {
+  try {
+    const p = new XmlPull(xhtml);
+    const result: string[] = [];
+    const tagStack: string[] = [];
+    let inBody = false;
+    let listCounter = 0;
+    while (p.eventType !== XML_EOF) {
+      if (p.eventType === XML_START_TAG) {
+        const tag = p.name ?? "";
+        tagStack.push(tag);
+        if (tag === "body") inBody = true;
+        else if (inBody) {
+          if (tag === "ol") { listCounter = 0; }
+          else if (tag === "li") {
+            const parent = tagStack.length >= 2 ? tagStack[tagStack.length - 2] : "";
+            if (parent === "ol") { listCounter++; result.push(`${listCounter}. `); }
+            else { result.push("- "); }
+          }
+          else if (tag === "br") { result.push("\n"); }
+          else if (tag === "img") {
+            const alt = p.getAttributeValue(null, "alt");
+            if (alt) result.push(`[image: ${alt}]`);
+          }
+          else if (/^h[1-6]$/.test(tag)) { result.push(`${"#".repeat(parseInt(tag[1]))} `); }
+          else if (tag === "strong" || tag === "b") { result.push("**"); }
+          else if (tag === "em" || tag === "i") { result.push("*"); }
+          else if (tag === "hr") { result.push("\n---\n"); }
+          else if (tag === "blockquote") { result.push("> "); }
+        }
+      } else if (p.eventType === XML_TEXT) {
+        if (inBody && p.text) {
+          const text = p.text.replace(/[\n\r]/g, " ").replace(/\s+/g, " ");
+          if (text.trim()) result.push(text);
+        }
+      } else if (p.eventType === XML_END_TAG) {
+        const tag = p.name ?? "";
+        if (tagStack.length > 0) tagStack.pop();
+        if (tag === "body") inBody = false;
+        else if (inBody) {
+          if (tag === "p" || tag === "div") { result.push("\n\n"); }
+          else if (/^h[1-6]$/.test(tag)) { result.push("\n\n"); }
+          else if (tag === "li") { result.push("\n"); }
+          else if (tag === "ul" || tag === "ol") { result.push("\n"); }
+          else if (tag === "strong" || tag === "b") { result.push("**"); }
+          else if (tag === "em" || tag === "i") { result.push("*"); }
+          else if (tag === "blockquote") { result.push("\n"); }
+        }
+      }
+      p.next();
+    }
+    return result.join("").replace(/\n{3,}/g, "\n\n").trim();
+  } catch { return ""; }
+}
+
+function extractEpubFallback(entries: Array<{ name: string; data: Buffer }>): string {
+  const textEntries = entries
+    .filter((e) => /\.(xhtml|html|htm|xml|opf|ncx)$/i.test(e.name))
+    .filter((e) => !/^(META-INF\/|mimetype$)/i.test(e.name))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return textEntries
+    .map((e) => stripXmlText(e.data.toString("utf8")))
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, MAX_EXTRACTED_CHARS);
+}
+
+// Synchronous text extraction for the non-PDF formats. The three on-demand call sites
+// (contentPartsForApi / Claude blocks / responses) stay sync and use this to back-fill
+// extractedText for legacy entries; PDFs there fall back to a "[Document]" prompt.
+function extractStoredFileTextSync(entry: StoredFile): string {
+  const name = entry.fileName.toLowerCase();
+  const mimeValue = entry.mime.toLowerCase();
+  const size = getStoredFileSize(entry);
+  try {
+    if (mimeValue === "application/epub+zip" || name.endsWith(".epub")) {
+      if (size > MAX_EPUB_EXTRACT_BYTES) {
+        console.warn(`[document] skipping EPUB extraction: ${entry.fileName} ${size} > ${MAX_EPUB_EXTRACT_BYTES}`);
+        return "";
+      }
+      return extractEpubText(entry.path);
+    }
+    if (mimeValue === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || name.endsWith(".docx")) {
+      if (size > MAX_DOCX_EXTRACT_BYTES) {
+        console.warn(`[document] skipping DOCX extraction: ${entry.fileName} ${size} > ${MAX_DOCX_EXTRACT_BYTES}`);
+        return "";
+      }
+      return extractDocxText(entry.path, size);
+    }
+    if (mimeValue === "application/vnd.openxmlformats-officedocument.presentationml.presentation" || name.endsWith(".pptx")) {
+      if (size > MAX_PPTX_EXTRACT_BYTES) {
+        console.warn(`[document] skipping PPTX extraction: ${entry.fileName} ${size} > ${MAX_PPTX_EXTRACT_BYTES}`);
+        return "";
+      }
+      return extractPptxText(entry.path);
+    }
+    if (
+      mimeValue.startsWith("text/") ||
+      /\.(txt|md|markdown|csv|tsv|json|jsonl|yaml|yml|xml|html|htm|css|js|ts|tsx|jsx|py|java|kt|rs|go|c|cpp|h|hpp|cs|php|rb|sh|ps1|sql)$/i.test(name)
+    ) {
+      if (size > MAX_TEXT_EXTRACT_BYTES) {
+        // Don't readFileSync a 200 MB log file just to slice the first 240 KB —
+        // open + read the head with a bounded buffer instead.
+        return readTextFileHead(entry.path, MAX_EXTRACTED_CHARS);
+      }
+      return readFileSync(entry.path, "utf8").slice(0, MAX_EXTRACTED_CHARS);
+    }
+  } catch (err) {
+    console.warn(`[document] sync extract failed for ${entry.fileName}:`, err);
+  }
+  return "";
+}
+
+// Read at most `maxBytes` from the start of a text file without buffering the rest.
+// Used for very large text/log uploads where readFileSync would balloon JS heap.
+function readTextFileHead(pathValue: string, maxBytes: number): string {
+  const fd = openSync(pathValue, "r");
+  try {
+    const buf = Buffer.alloc(maxBytes);
+    const bytesRead = readSync(fd, buf, 0, maxBytes, 0);
+    return buf.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// Full async version, used only by the upload endpoint. Adds PDF handling on top of the
+// sync formats. Run once at upload time and cache into entry.extractedText.
+async function extractStoredFileText(entry: StoredFile): Promise<string> {
+  const name = entry.fileName.toLowerCase();
+  const mimeValue = entry.mime.toLowerCase();
+  if (mimeValue === "application/pdf" || name.endsWith(".pdf")) {
+    const size = getStoredFileSize(entry);
+    if (size > MAX_PDF_EXTRACT_BYTES) {
+      console.warn(`[document] skipping PDF extraction: ${entry.fileName} ${size} > ${MAX_PDF_EXTRACT_BYTES}`);
+      return "";
+    }
+    try {
+      return await extractPdfText(entry.path);
+    } catch (err) {
+      console.warn(`[document] PDF extract failed for ${entry.fileName}:`, err);
+      return "";
+    }
+  }
+  return extractStoredFileTextSync(entry);
+}
+
+// Format a fallback prompt fragment for a document whose text content isn't available —
+// either the size cap kicked in, the format isn't extractable here (image-only PDF that
+// MuPDF couldn't OCR, exotic mime), or the entry record is gone. The model needs *some*
+// signal that the user attached a file, plus a hint about why it can't see the content,
+// so it doesn't hallucinate that it read the contents.
+function fallbackDocumentText(part: { fileName: string; url: string; entry: StoredFile | null }): string {
+  const { fileName, url, entry } = part;
+  if (!entry) {
+    return `[Document: ${fileName}] ${url} (file entry missing — user may need to re-upload)`;
+  }
+  const size = getStoredFileSize(entry);
+  const name = entry.fileName.toLowerCase();
+  const mimeValue = entry.mime.toLowerCase();
+  const sizeMb = (size / (1024 * 1024)).toFixed(1);
+
+  // Size-cap path: tell the model the file is too big to inline so it can ask the user
+  // to split / summarize rather than pretend to have read it.
+  const overCap =
+    ((mimeValue === "application/pdf" || name.endsWith(".pdf")) && size > MAX_PDF_EXTRACT_BYTES) ||
+    ((mimeValue === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || name.endsWith(".docx")) && size > MAX_DOCX_EXTRACT_BYTES) ||
+    ((mimeValue === "application/vnd.openxmlformats-officedocument.presentationml.presentation" || name.endsWith(".pptx")) && size > MAX_PPTX_EXTRACT_BYTES) ||
+    ((mimeValue === "application/epub+zip" || name.endsWith(".epub")) && size > MAX_EPUB_EXTRACT_BYTES);
+  if (overCap) {
+    return `[Document: ${fileName} — too large to inline (${sizeMb} MB). Ask the user to split it or describe the part they need.]`;
+  }
+  // Extraction was attempted but came back empty — could be a scanned PDF without OCR-able
+  // text, an unsupported binary format, or a parse failure logged at upload time.
+  return `[Document: ${fileName} — content could not be extracted; the file may be image-only or use an unsupported format.] ${url}`;
+}
+
+// --- Document parsers: aligned with Android's document module ---
+
+// PDF parser — mirrors Android's PdfParser.kt:
+//   document = PDFDocument.openDocument(file.absolutePath).asPDF()
+//   for i in 0 until pages: page.toStructuredText().asText()
+//
+// Uses MuPDF WASM (the same engine Android uses as native via JNI). Same API surface,
+// same extraction quality —— scanned pages, CID fonts, complex layouts all handled by
+// MuPDF's structured-text extractor rather than our previous regex-based approach.
+//
+// Memory: MuPDF maintains its own wasm heap; we MUST destroy() doc/page/stext explicitly
+// because JS GC can't reach into wasm memory. try/finally pairing is non-negotiable.
+async function extractPdfText(pathValue: string): Promise<string> {
+  const mupdf = await loadMupdf();
+  const buf = readFileSync(pathValue);
+  const doc = mupdf.Document.openDocument(buf, "application/pdf");
+  try {
+    const pageCount = doc.countPages();
+    const parts: string[] = [];
+    let totalLen = 0;
+    for (let i = 0; i < pageCount; i++) {
+      const page = doc.loadPage(i);
+      try {
+        const stext = page.toStructuredText();
+        try {
+          // Aligned with Android: "---Page ${i+1}:\n${stext.asText()}"
+          const pageText = stext.asText();
+          parts.push(`---Page ${i + 1}:\n${pageText}`);
+          totalLen += pageText.length;
+          // Early-stop once we've crossed the prompt cap. Saves time and memory for
+          // 1000-page PDFs where the model only sees the first chunk anyway.
+          if (totalLen > MAX_EXTRACTED_CHARS) break;
+        } finally {
+          stext.destroy?.();
+        }
+      } finally {
+        page.destroy?.();
+      }
+    }
+    return parts.join("\n").slice(0, MAX_EXTRACTED_CHARS);
+  } finally {
+    doc.destroy?.();
+  }
+}
+
+// DOCX parser — mirrors Android's DocxParser.kt:
+// Parse word/document.xml from the ZIP, extract paragraphs with heading/list/table structure.
+// For files above DOCX_STREAMING_THRESHOLD_BYTES, route to extractSingleZipMemberStreaming
+// (external unzip) so we only spend RAM on the one entry we care about instead of every
+// member in the archive.
+function extractDocxText(pathValue: string, sizeBytes?: number) {
+  const size = sizeBytes ?? statSync(pathValue).size;
+  let docXmlData: Buffer | null = null;
+  if (size >= DOCX_STREAMING_THRESHOLD_BYTES) {
+    docXmlData = extractSingleZipMemberStreaming(pathValue, "word/document.xml");
+    if (!docXmlData) {
+      console.warn(`[document] streaming extract failed for ${pathValue}; falling back to in-memory`);
+    }
+  }
+  if (!docXmlData) {
+    const entries = readZipEntries(readFileSync(pathValue));
+    const docEntry = entries.find((e) => e.name === "word/document.xml");
+    if (!docEntry) return "";
+    docXmlData = docEntry.data;
+  }
+  const xml = docXmlData.toString("utf8");
+  // Extract body content
+  const bodyMatch = xml.match(/<w:body[\s>]?([\s\S]*?)<\/w:body>/i);
+  if (!bodyMatch) return stripXmlText(xml).slice(0, MAX_EXTRACTED_CHARS);
+  const body = bodyMatch[1];
+  const result: string[] = [];
+  // Walk top-level blocks in document order. We can't naively split on </w:p> because
+  // tables contain <w:p> elements inside their cells — match whole <w:tbl>...</w:tbl> and
+  // top-level <w:p>...</w:p> blocks instead, scanning left to right.
+  const blockRe = /<w:tbl[\s>][\s\S]*?<\/w:tbl>|<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>|<w:p\s*\/>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = blockRe.exec(body)) !== null) {
+    const block = m[0];
+    if (/^<w:tbl[\s>]/i.test(block)) {
+      const table = extractDocxTable(block);
+      if (table) result.push(table);
+    } else {
+      const text = extractDocxParagraph(block);
+      if (text) result.push(text);
+    }
+  }
+  return result.join("\n\n").slice(0, MAX_EXTRACTED_CHARS);
+}
+
+function extractDocxParagraph(xml: string): string {
+  // Check for heading style
+  const pStyleMatch = xml.match(/<w:pStyle[^>]*w:val="([Hh]eading)(\d)"/);
+  const headingLevel = pStyleMatch ? parseInt(pStyleMatch[2]) : 0;
+  // Check for list/numbering
+  const hasNumPr = /<w:numPr[\s>]/i.test(xml);
+  const listLevelMatch = xml.match(/<w:ilvl[^>]*w:val="(\d+)"/);
+  const listLevel = listLevelMatch ? parseInt(listLevelMatch[1]) : 0;
+  const isNumbered = /<w:numId[^>]*w:val="[^0]/i.test(xml);
+  // Extract text runs
+  const runs: string[] = [];
+  const runRe = /<w:r[\s>][\s\S]*?<\/w:r>/gi;
+  let runMatch: RegExpExecArray | null;
+  while ((runMatch = runRe.exec(xml)) !== null) {
+    const runXml = runMatch[0];
+    const isBold = /<w:b[\s>/]/i.test(runXml);
+    const isItalic = /<w:i[\s>/]/i.test(runXml);
+    const tMatch = runXml.match(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/i);
+    if (tMatch) {
+      let text = tMatch[1];
+      if (isBold && isItalic) text = `***${text}***`;
+      else if (isBold) text = `**${text}**`;
+      else if (isItalic) text = `*${text}*`;
+      runs.push(text);
+    }
+  }
+  const text = runs.join("").trim();
+  if (!text) return "";
+  if (headingLevel > 0) return `${"#".repeat(headingLevel)} ${text}`;
+  if (hasNumPr) {
+    const indent = "  ".repeat(listLevel);
+    const marker = isNumbered ? "1. " : "- ";
+    return `${indent}${marker}${text}`;
+  }
+  return text;
+}
+
+function extractDocxTable(xml: string): string {
+  const rows: string[][] = [];
+  const rowRe = /<w:tr[\s>][\s\S]*?<\/w:tr>/gi;
+  let rowMatch: RegExpExecArray | null;
+  while ((rowMatch = rowRe.exec(xml)) !== null) {
+    const cells: string[] = [];
+    const cellRe = /<w:tc[\s>][\s\S]*?<\/w:tc>/gi;
+    let cellMatch: RegExpExecArray | null;
+    while ((cellMatch = cellRe.exec(rowMatch[0])) !== null) {
+      const cellTexts: string[] = [];
+      const tRe = /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/gi;
+      let tMatch: RegExpExecArray | null;
+      while ((tMatch = tRe.exec(cellMatch[0])) !== null) {
+        cellTexts.push(tMatch[1]);
+      }
+      cells.push(cellTexts.join(" ").trim());
+    }
+    if (cells.length) rows.push(cells);
+  }
+  if (!rows.length) return "";
+  const maxCols = Math.max(...rows.map((r) => r.length));
+  const lines: string[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const line = "| " + Array.from({ length: maxCols }, (_, ci) => rows[i][ci] ?? "").join(" | ") + " |";
+    lines.push(line);
+    if (i === 0) lines.push("| " + Array(maxCols).fill("---").join(" | ") + " |");
+  }
+  return lines.join("\n");
+}
+
+// PPTX parser — mirrors Android's PptxParser.kt:
+// Process <sp> shapes (with bullet/numbering detection) and <graphicFrame> tables.
+// Speaker notes extracted via <ph type="body"> detection (same as Android).
+function extractPptxText(pathValue: string) {
+  const entries = readZipEntries(readFileSync(pathValue));
+  const entryMap = new Map(entries.map((e) => [e.name, e]));
+  const slideEntries = entries
+    .filter((e) => /^ppt\/slides\/slide\d+\.xml$/i.test(e.name))
+    .sort((a, b) => {
+      const na = parseInt(a.name.match(/slide(\d+)/i)?.[1] ?? "0");
+      const nb = parseInt(b.name.match(/slide(\d+)/i)?.[1] ?? "0");
+      return na - nb;
+    });
+  if (!slideEntries.length) return "";
+  const slides: string[] = [];
+  for (let i = 0; i < slideEntries.length; i++) {
+    const slideNumber = i + 1;
+    const content = parsePptxSlideXml(slideEntries[i].data.toString("utf8"));
+    const notesEntry = entryMap.get(`ppt/notesSlides/notesSlide${slideNumber}.xml`);
+    const notes = notesEntry ? parsePptxNotesXml(notesEntry.data.toString("utf8")) : "";
+    if (!content && !notes) continue;
+    let slide = `## Slide ${slideNumber}\n\n${content}`;
+    if (notes) slide += `\n\n### Speaker Notes\n\n${notes}`;
+    slides.push(slide);
+  }
+  return slides.join("\n\n").slice(0, MAX_EXTRACTED_CHARS);
+}
+
+function parsePptxSlideXml(xml: string): string {
+  try {
+    const p = new XmlPull(xml);
+    const result: string[] = [];
+    while (p.eventType !== XML_EOF) {
+      if (p.eventType === XML_START_TAG) {
+        if (p.name === "sp") processPptxShape(p, result);
+        else if (p.name === "graphicFrame") processPptxGraphicFrame(p, result);
+      }
+      p.next();
+    }
+    return result.join("");
+  } catch { return ""; }
+}
+
+function processPptxShape(p: XmlPull, result: string[]) {
+  const startDepth = p.depth;
+  const textParts: string[] = [];
+  while (p.next() !== XML_EOF) {
+    if (p.eventType === XML_START_TAG && p.name === "p") processPptxParagraph(p, textParts);
+    if (p.eventType === XML_END_TAG && p.name === "sp" && p.depth === startDepth) break;
+  }
+  const text = textParts.join("").trim();
+  if (text) { result.push(text); result.push("\n\n"); }
+}
+
+function processPptxParagraph(p: XmlPull, result: string[]) {
+  const startDepth = p.depth;
+  const runTexts: string[] = [];
+  let hasBullet = false, bulletLevel = 0, isNumbered = false;
+  while (p.next() !== XML_EOF) {
+    if (p.eventType === XML_START_TAG) {
+      if (p.name === "pPr") {
+        const info = extractPptxBulletInfo(p);
+        hasBullet = info.hasBullet; bulletLevel = info.level; isNumbered = info.isNumbered;
+      }
+      if (p.name === "r") extractPptxTextRun(p, runTexts);
+    }
+    if (p.eventType === XML_END_TAG && p.name === "p" && p.depth === startDepth) break;
+  }
+  const text = runTexts.join("").trim();
+  if (!text) return;
+  if (hasBullet) {
+    const indent = "  ".repeat(bulletLevel);
+    result.push(`${indent}${isNumbered ? "1. " : "- "}${text}\n`);
+  } else {
+    result.push(`${text}\n`);
+  }
+}
+
+function extractPptxBulletInfo(p: XmlPull): { hasBullet: boolean; level: number; isNumbered: boolean } {
+  const startDepth = p.depth;
+  let hasBullet = false, level = 0, isNumbered = false;
+  while (p.next() !== XML_EOF) {
+    if (p.eventType === XML_START_TAG) {
+      if (p.name === "buChar") { hasBullet = true; isNumbered = false; }
+      if (p.name === "buAutoNum") { hasBullet = true; isNumbered = true; }
+      if (p.name === "lvl") { const v = p.getAttributeValue(null, "val"); if (v) level = parseInt(v) || 0; }
+    }
+    if (p.eventType === XML_END_TAG && p.name === "pPr" && p.depth === startDepth) break;
+  }
+  return { hasBullet, level, isNumbered };
+}
+
+function extractPptxTextRun(p: XmlPull, result: string[]) {
+  const startDepth = p.depth;
+  while (p.next() !== XML_EOF) {
+    if (p.eventType === XML_START_TAG && p.name === "t") {
+      p.next();
+      if (p.eventType === XML_TEXT && p.text) result.push(p.text);
+    }
+    if (p.eventType === XML_END_TAG && p.name === "r" && p.depth === startDepth) break;
+  }
+}
+
+function processPptxGraphicFrame(p: XmlPull, result: string[]) {
+  const startDepth = p.depth;
+  while (p.next() !== XML_EOF) {
+    if (p.eventType === XML_START_TAG && p.name === "tbl") processPptxTable(p, result);
+    if (p.eventType === XML_END_TAG && p.name === "graphicFrame" && p.depth === startDepth) break;
+  }
+}
+
+function processPptxTable(p: XmlPull, result: string[]) {
+  const startDepth = p.depth;
+  const rows: string[][] = [];
+  while (p.next() !== XML_EOF) {
+    if (p.eventType === XML_START_TAG && p.name === "tr") {
+      const cells = extractPptxTableRow(p);
+      if (cells.length) rows.push(cells);
+    }
+    if (p.eventType === XML_END_TAG && p.name === "tbl" && p.depth === startDepth) break;
+  }
+  if (!rows.length) return;
+  const maxCols = Math.max(...rows.map((r) => r.length));
+  for (let i = 0; i < rows.length; i++) {
+    result.push("| " + Array.from({ length: maxCols }, (_, ci) => rows[i][ci] ?? "").join(" | ") + " |\n");
+    if (i === 0) result.push("| " + Array(maxCols).fill("---").join(" | ") + " |\n");
+  }
+  result.push("\n");
+}
+
+function extractPptxTableRow(p: XmlPull): string[] {
+  const startDepth = p.depth;
+  const cells: string[] = [];
+  while (p.next() !== XML_EOF) {
+    if (p.eventType === XML_START_TAG && p.name === "tc") cells.push(extractPptxTableCell(p));
+    if (p.eventType === XML_END_TAG && p.name === "tr" && p.depth === startDepth) break;
+  }
+  return cells;
+}
+
+function extractPptxTableCell(p: XmlPull): string {
+  const startDepth = p.depth;
+  const parts: string[] = [];
+  while (p.next() !== XML_EOF) {
+    if (p.eventType === XML_START_TAG && p.name === "t") {
+      p.next();
+      if (p.eventType === XML_TEXT && p.text) {
+        if (parts.length > 0) parts.push(" ");
+        parts.push(p.text);
+      }
+    }
+    if (p.eventType === XML_END_TAG && p.name === "tc" && p.depth === startDepth) break;
+  }
+  return parts.join("").trim();
+}
+
+function parsePptxNotesXml(xml: string): string {
+  try {
+    const p = new XmlPull(xml);
+    const result: string[] = [];
+    while (p.eventType !== XML_EOF) {
+      if (p.eventType === XML_START_TAG && p.name === "sp") {
+        if (isPptxNotesTextShape(p)) extractPptxShapeText(p, result);
+      }
+      p.next();
+    }
+    return result.join("").trim();
+  } catch { return ""; }
+}
+
+// Look ahead inside <sp> for <ph type="body"> — marks the notes text area (not the slide preview).
+function isPptxNotesTextShape(p: XmlPull): boolean {
+  const d = p.depth;
+  while (p.next() !== XML_EOF) {
+    if (p.eventType === XML_START_TAG && p.name === "ph") return p.getAttributeValue(null, "type") === "body";
+    if (p.eventType === XML_END_TAG && p.depth <= d) return false;
+  }
+  return false;
+}
+
+function extractPptxShapeText(p: XmlPull, result: string[]) {
+  while (p.next() !== XML_EOF) {
+    if (p.eventType === XML_START_TAG && p.name === "t") {
+      p.next();
+      if (p.eventType === XML_TEXT && p.text) result.push(p.text);
+    }
+    if (p.eventType === XML_END_TAG && p.name === "p") result.push("\n");
+  }
+}
+
+function documentPromptText(fileName: string, content: string) {
+  return `## user sent a file: ${fileName}
+<content>
+\`\`\`
+${content}
+\`\`\`
+</content>`;
+}
+
+function contentPartsForApi(parts: JsonValue[], targetModel?: Model) {
+  const stripImageForOcr = targetModel ? !supportsInputModality(targetModel, "IMAGE") : false;
+  const result: any[] = [];
+  for (const part of parts) {
+    if (!isRecord(part)) continue;
+    if (part.type === "text") {
+      const text = String(part.text ?? "");
+      if (text) result.push({ type: "text", text });
+    } else if (part.type === "image") {
+      const metadata = isRecord(part.metadata) ? part.metadata : {};
+      const ocrText = String(metadata.ocrText ?? "").trim();
+      // Android OcrTransformer: when chat model has no IMAGE input, replace image with OCR text.
+      // Otherwise (model supports image), keep the image and append OCR text alongside as extra hint.
+      if (stripImageForOcr && ocrText) {
+        result.push({
+          type: "text",
+          text: `<image_file_ocr>\n${ocrText}\n</image_file_ocr>`,
+        });
+        continue;
+      }
+      const url = dataUrlForMessageUrl(String(part.url ?? ""));
+      if (url) result.push({ type: "image_url", image_url: { url } });
+      if (ocrText) {
+        result.push({
+          type: "text",
+          text: `<image_file_ocr>\n${ocrText}\n</image_file_ocr>`,
+        });
+      }
+    } else if (part.type === "document") {
+      const fileName = String(part.fileName ?? "document");
+      const url = String(part.url ?? "");
+      const entry = fileEntryFromApiUrl(url);
+      // Match Android's DocumentAsPromptTransformer: extract text on demand if not cached.
+      let extractedText = String(entry?.extractedText ?? "").trim();
+      if (!extractedText && entry) {
+        const fresh = extractStoredFileTextSync(entry);
+        if (fresh) {
+          extractedText = fresh;
+          // Cache for future requests (matches Android reading file on each send,
+          // but avoids re-parsing the same file repeatedly).
+          entry.extractedText = fresh;
+          entry.extractedAt = Date.now();
+          scheduleThrottledSaveState();
+        }
+      }
+      result.push({
+        type: "text",
+        text: extractedText
+          ? documentPromptText(fileName, extractedText)
+          : fallbackDocumentText({ fileName, url, entry: entry ?? null }),
+      });
+    } else if (part.type === "audio" || part.type === "video") {
+      const url = String(part.url ?? "");
+      if (url) result.push({ type: "text", text: `[${part.type}: ${url}]` });
+    }
+  }
+  return result;
+}
+
+function apiContentFromParts(parts: JsonValue[], fallbackText = "", targetModel?: Model) {
+  const contentParts = contentPartsForApi(parts, targetModel);
+  if (contentParts.length === 0) return fallbackText;
+  if (contentParts.length === 1 && contentParts[0].type === "text") return contentParts[0].text;
+  return contentParts;
+}
+
+function claudeContentFromApiContent(content: any) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return String(content ?? "");
+  return content.map((part) => {
+    if (part?.type === "image_url") {
+      const dataUrl = String(part.image_url?.url ?? "");
+      const parsed = parseDataUrl(dataUrl);
+      if (parsed) {
+        return {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: parsed.mime,
+            data: parsed.data,
+          },
+        };
+      }
+      return { type: "text", text: `[Image: ${dataUrl}]` };
+    }
+    if (part?.type === "text") return { type: "text", text: String(part.text ?? "") };
+    return { type: "text", text: JSON.stringify(part) };
+  });
+}
+
+function claudeCacheControlEphemeral(providerItem: Provider) {
+  return {
+    type: "ephemeral",
+    ...(providerItem.promptCacheTtl === "1h" ? { ttl: "1h" } : {}),
+  };
+}
+
+function claudeTextBlock(text: string) {
+  return { type: "text", text };
+}
+
+function claudeContentBlocks(content: any) {
+  const converted = claudeContentFromApiContent(content);
+  return Array.isArray(converted) ? converted : [claudeTextBlock(String(converted ?? ""))];
+}
+
+function claudeBlocksFromUiParts(parts: JsonValue[]) {
+  const blocks: any[] = [];
+  for (const part of parts) {
+    if (!isRecord(part)) continue;
+    if (part.type === "text") {
+      const text = String(part.text ?? "");
+      if (text) blocks.push({ type: "text", text });
+    } else if (part.type === "image") {
+      const parsed = parseDataUrl(dataUrlForMessageUrl(String(part.url ?? "")));
+      if (parsed) {
+        blocks.push({
+          type: "image",
+          source: { type: "base64", media_type: parsed.mime, data: parsed.data },
+        });
+      } else {
+        const url = String(part.url ?? "");
+        if (url) blocks.push({ type: "text", text: `[Image: ${url}]` });
+      }
+    } else if (part.type === "document") {
+      const fileName = String(part.fileName ?? "document");
+      const url = String(part.url ?? "");
+      const entry = fileEntryFromApiUrl(url);
+      let extractedText = String(entry?.extractedText ?? "").trim();
+      if (!extractedText && entry) {
+        const fresh = extractStoredFileTextSync(entry);
+        if (fresh) {
+          extractedText = fresh;
+          entry.extractedText = fresh;
+          entry.extractedAt = Date.now();
+          scheduleThrottledSaveState();
+        }
+      }
+      blocks.push({
+        type: "text",
+        text: extractedText
+          ? documentPromptText(fileName, extractedText)
+          : fallbackDocumentText({ fileName, url, entry: entry ?? null }),
+      });
+    }
+  }
+  return blocks.length ? blocks : [claudeTextBlock("")];
+}
+
+function parseToolInput(value: unknown) {
+  if (isRecord(value)) return value;
+  if (typeof value !== "string") return {};
+  const trimmed = value.trim();
+  if (!trimmed) return {};
+  try {
+    const parsed = JSON.parse(trimmed);
+    return isRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function claudeToolUseBlock(toolCall: any) {
+  const fn = toolCall?.function ?? {};
+  return {
+    type: "tool_use",
+    id: String(toolCall?.id ?? id()),
+    name: String(fn.name ?? ""),
+    input: parseToolInput(fn.arguments),
+  };
+}
+
+function claudeToolResultBlock(toolMessage: ApiMessage) {
+  const outputParts = Array.isArray(toolMessage._rikkahub_tool_output_parts)
+    ? claudeBlocksFromUiParts(toolMessage._rikkahub_tool_output_parts)
+    : claudeContentBlocks(toolMessage.content);
+  return {
+    type: "tool_result",
+    tool_use_id: String(toolMessage.tool_call_id ?? ""),
+    content: outputParts,
+  };
+}
+
+function withClaudeCacheOnLastBlock(content: any, providerItem: Provider) {
+  const blocks = claudeContentBlocks(content);
+  if (blocks.length === 0) return blocks;
+  return blocks.map((block, index) =>
+    index === blocks.length - 1 && isRecord(block)
+      ? { ...block, cache_control: claudeCacheControlEphemeral(providerItem) }
+      : block,
+  );
+}
+
+function claudeSystemContent(system: unknown, providerItem: Provider) {
+  const text = String(system ?? "").trim();
+  if (!text) return undefined;
+  // 对齐安卓 ClaudeProvider.buildMessageRequest：system 始终以 text block 数组发送
+  // （无缓存时也用数组，避免部分第三方代理只认数组格式）；开启 promptCaching 时
+  // 在最后一个 block 上加 cache_control。
+  if (providerItem.promptCaching === true) return withClaudeCacheOnLastBlock(text, providerItem);
+  return [claudeTextBlock(text)];
+}
+
+function claudeMessagesFromApiMessages(messages: ApiMessage[], providerItem: Provider) {
+  const items = messages
+    .filter((item) => item.role !== "system")
+    .flatMap((item) => {
+      if (item.role === "assistant") {
+        const content = claudeContentBlocks(item.content).filter((block) =>
+          !isRecord(block) || block.type !== "text" || String(block.text ?? "").trim()
+        );
+        const toolCalls = Array.isArray(item.tool_calls) ? item.tool_calls : [];
+        const toolUseBlocks = toolCalls.map(claudeToolUseBlock).filter((block) => block.name);
+        const blocks = [...content, ...toolUseBlocks];
+        return blocks.length ? [{ role: "assistant", content: blocks }] : [];
+      }
+      if (item.role === "tool") {
+        return [{ role: "user", content: [claudeToolResultBlock(item)] }];
+      }
+      return [{ role: "user", content: claudeContentBlocks(item.content) }];
+    });
+
+  // 合并连续的 tool_result user message（对齐安卓 ClaudeProvider.addAssistantMessage +
+  // groupPartsByToolBoundary，见 ClaudeProviderMessageTest "parallel tool calls should be in
+  // same assistant message"）。OpenAI 格式把一轮 assistant 并行的多个 tool_use 结果拆成多条
+  // 独立的 role:"tool" 消息，逐条映射会产生连续的 role:"user" message，违反 Anthropic 的
+  // user/assistant 严格交替规则 → 400 "text content blocks must be non-empty"。这里把同一轮的
+  // 所有 tool_result 合并进一个 user message 的 content 数组；只合并前后都是纯 tool_result 的
+  // 相邻项，不触碰普通文本 user message 与 assistant message。
+  const isToolResultUser = (entry: (typeof items)[number]) =>
+    entry.role === "user" &&
+    Array.isArray(entry.content) &&
+    entry.content.length > 0 &&
+    entry.content.every((block) => isRecord(block) && block.type === "tool_result");
+  const mergedItems: typeof items = [];
+  for (const item of items) {
+    const prevIdx = mergedItems.length - 1;
+    const prev = prevIdx >= 0 ? mergedItems[prevIdx] : undefined;
+    if (isToolResultUser(item) && prev !== undefined && isToolResultUser(prev)) {
+      prev.content = [...prev.content, ...item.content];
+    } else {
+      mergedItems.push(item);
+    }
+  }
+
+  if (providerItem.promptCaching !== true) return mergedItems;
+
+  const realUserIndices = mergedItems
+    .map((item, index) => {
+      const content = Array.isArray(item.content) ? item.content : [];
+      const hasOnlyToolResults = content.length > 0 && content.every((block) => isRecord(block) && block.type === "tool_result");
+      return item.role === "user" && !hasOnlyToolResults ? index : -1;
+    })
+    .filter((index) => index >= 0);
+  const targetIndex = realUserIndices.length >= 2 ? realUserIndices[realUserIndices.length - 2] : -1;
+  if (targetIndex < 0) return mergedItems;
+  return mergedItems.map((item, index) =>
+    index === targetIndex
+      ? { ...item, content: withClaudeCacheOnLastBlock(item.content, providerItem) }
+      : item,
+  );
+}
+
+function claudeToolsFromOpenAiTools(tools: any[], providerItem: Provider) {
+  return tools
+    .map((tool, index) => {
+      const fn = tool?.function ?? {};
+      const name = String(fn.name ?? "");
+      if (!name) return null;
+      return {
+        name,
+        description: String(fn.description ?? ""),
+        input_schema: isRecord(fn.parameters) ? fn.parameters : { type: "object", properties: {} },
+        ...(providerItem.promptCaching === true && index === tools.length - 1
+          ? { cache_control: claudeCacheControlEphemeral(providerItem) }
+          : {}),
+      };
+    })
+    .filter(Boolean);
+}
+
+// 递归剔除 Google Gemini 不支持的 JSON Schema 关键字。镜像安卓
+// me/rerere/ai/util/Request.kt 的 removeElements + GoogleProvider 中对
+// functionDeclarations.parameters 的清理（const/format/additionalProperties/enum 等）。
+const GOOGLE_SCHEMA_STRIP_KEYS = new Set([
+  "const",
+  "exclusiveMaximum",
+  "exclusiveMinimum",
+  "format",
+  "additionalProperties",
+  "enum",
+]);
+
+function googleStripSchemaKeys(value: JsonValue): JsonValue {
+  if (Array.isArray(value)) return value.map((item) => googleStripSchemaKeys(item));
+  if (isRecord(value)) {
+    const out: Record<string, JsonValue> = {};
+    for (const [key, val] of Object.entries(value)) {
+      if (GOOGLE_SCHEMA_STRIP_KEYS.has(key)) continue;
+      out[key] = googleStripSchemaKeys(val as JsonValue);
+    }
+    return out;
+  }
+  return value;
+}
+
+// 把 OpenAI 格式的 function tools 转成 Gemini functionDeclarations，镜像安卓
+// GoogleProvider.buildCompletionRequestBody:418-445。
+function googleFunctionDeclarations(tools: any[]) {
+  return tools
+    .map((tool) => {
+      const fn = tool?.function ?? {};
+      const name = String(fn.name ?? "");
+      if (!name) return null;
+      return {
+        name,
+        description: String(fn.description ?? ""),
+        parameters: googleStripSchemaKeys(isRecord(fn.parameters) ? fn.parameters : { type: "object", properties: {} }),
+      };
+    })
+    .filter(Boolean);
+}
+
+// 把单条 OpenAI 格式 content 转成 Gemini parts（text / inlineData）。
+function googlePartsFromApiContent(content: any): Record<string, JsonValue>[] {
+  if (typeof content === "string") {
+    return content ? [{ text: content }] : [];
+  }
+  if (!Array.isArray(content)) {
+    const text = String(content ?? "");
+    return text ? [{ text }] : [];
+  }
+  const parts: Record<string, JsonValue>[] = [];
+  for (const item of content) {
+    if (!isRecord(item)) continue;
+    if (item.type === "text") {
+      const text = String(item.text ?? "");
+      if (text) parts.push({ text });
+    } else if (item.type === "image_url") {
+      const dataUrl = String((item.image_url as any)?.url ?? "");
+      const parsed = parseDataUrl(dataUrl);
+      if (parsed) {
+        parts.push({ inlineData: { mimeType: parsed.mime, data: parsed.data } });
+      } else if (dataUrl) {
+        parts.push({ text: `[Image: ${dataUrl}]` });
+      }
+    }
+  }
+  return parts;
+}
+
+// 把 OpenAI 格式的 messagesForApi 转成 Gemini contents。镜像安卓
+// GoogleProvider.buildContents/addModelMessage/addUserMessage：
+// - system 消息单独抽出，不进 contents
+// - assistant 的 tool_calls → functionCall part
+// - role:"tool" 结果 → functionResponse part（Gemini 中以 user role 发送）
+function googleContentsFromApiMessages(messages: ApiMessage[]): Record<string, JsonValue>[] {
+  const contents: Record<string, JsonValue>[] = [];
+  for (const item of messages) {
+    if (item.role === "system") continue;
+    if (item.role === "tool") {
+      contents.push({
+        role: "user",
+        parts: [{
+          functionResponse: {
+            name: String((item as any).name ?? ""),
+            response: { result: apiContentText(item.content) },
+          },
+        }],
+      });
+      continue;
+    }
+    if (item.role === "assistant") {
+      const parts = googlePartsFromApiContent(item.content);
+      const toolCalls = Array.isArray(item.tool_calls) ? item.tool_calls : [];
+      for (const call of toolCalls) {
+        const fn = (call as any)?.function ?? {};
+        const name = String(fn.name ?? "");
+        if (!name) continue;
+        parts.push({ functionCall: { name, args: parseToolInput(fn.arguments) } });
+      }
+      if (parts.length) contents.push({ role: "model", parts });
+      continue;
+    }
+    const parts = googlePartsFromApiContent(item.content);
+    if (parts.length) contents.push({ role: "user", parts });
+  }
+  return contents;
+}
+
+// 构建 Gemini 的 generationConfig（含 thinkingConfig）。镜像安卓
+// GoogleProvider.buildCompletionRequestBody:366-409。
+function googleGenerationConfig(modelItem: Model, assistant: Assistant) {
+  const config: Record<string, JsonValue> = {};
+  if (assistant.temperature != null) config.temperature = assistant.temperature;
+  if (assistant.topP != null) config.topP = assistant.topP;
+  if (assistant.maxTokens != null) config.maxOutputTokens = assistant.maxTokens;
+  if (supportsOutputModality(modelItem, "IMAGE")) {
+    config.responseModalities = ["TEXT", "IMAGE"];
+  }
+  if (supportsAbility(modelItem, "REASONING")) {
+    const normalized = reasoningLevelNormalized(assistant.reasoningLevel);
+    const isGemini3 = /\bgemini[-._]?3\b/i.test(modelItem.modelId);
+    const isGeminiPro = /2[.-]5.*pro/i.test(modelItem.modelId);
+    const thinkingConfig: Record<string, JsonValue> = { includeThoughts: true };
+    if (normalized === "off") {
+      if (isGemini3) {
+        thinkingConfig.thinkingLevel = "minimal";
+      } else if (!isGeminiPro) {
+        thinkingConfig.thinkingBudget = 0;
+        thinkingConfig.includeThoughts = false;
+      }
+    } else if (normalized !== "auto") {
+      if (isGemini3) {
+        thinkingConfig.thinkingLevel = normalized === "low" ? "low" : normalized === "medium" ? "medium" : "high";
+      } else {
+        thinkingConfig.thinkingBudget = budgetTokensFor(normalized);
+      }
+    }
+    config.thinkingConfig = thinkingConfig;
+  }
+  return config;
+}
+
+const GOOGLE_SAFETY_SETTINGS = [
+  { category: "HARM_CATEGORY_HARASSMENT", threshold: "OFF" },
+  { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "OFF" },
+  { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "OFF" },
+  { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "OFF" },
+  { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "OFF" },
+];
+
+// 构建 Gemini 的完整请求体。镜像安卓 GoogleProvider.buildCompletionRequestBody。
+function buildGoogleRequestBody(messagesForApi: ApiMessage[], modelItem: Model, assistant: Assistant) {
+  const systemContent = messagesForApi.find((item) => item.role === "system")?.content;
+  const hasImageOutput = supportsOutputModality(modelItem, "IMAGE");
+  const functionTools = supportsAbility(modelItem, "TOOL")
+    ? [...openAiSearchTools(), ...openAiLocalTools(assistant), ...openAiSkillTools(assistant), ...openAiMcpTools(assistant)]
+    : [];
+  const functionDeclarations = googleFunctionDeclarations(functionTools);
+  // 内置工具（googleSearch/urlContext）目前与函数工具互斥，优先内置工具，镜像安卓
+  // buildCompletionRequestBody:446-468（model.tools 覆盖 functionDeclarations）。
+  const builtInTools: Record<string, JsonValue>[] = [];
+  if (hasBuiltInTool(modelItem, "search")) builtInTools.push({ googleSearch: {} });
+  if (hasBuiltInTool(modelItem, "url_context") || hasBuiltInTool(modelItem, "urlContext")) {
+    builtInTools.push({ urlContext: {} });
+  }
+  const tools = builtInTools.length
+    ? builtInTools
+    : functionDeclarations.length
+      ? [{ functionDeclarations }]
+      : undefined;
+  const body: Record<string, JsonValue> = {
+    // system 在图片输出模型上不发送，对齐安卓 buildCompletionRequestBody:352。
+    ...(systemContent && !hasImageOutput
+      ? { systemInstruction: { parts: [{ text: apiContentText(systemContent) }] } }
+      : {}),
+    generationConfig: googleGenerationConfig(modelItem, assistant),
+    contents: googleContentsFromApiMessages(messagesForApi),
+    ...(tools ? { tools } : {}),
+    safetySettings: GOOGLE_SAFETY_SETTINGS,
+  };
+  return body;
+}
+
+
+// 按工具边界把 ASSISTANT 消息的 parts 分组。镜像安卓
+// ai/src/main/java/me/rerere/ai/provider/providers/ProviderMessageUtils.kt 的
+// groupPartsByToolBoundary：连续的"已执行 tool" parts 合为一组，与它们之前的
+// content（含 reasoning）共同组成一条 assistant 消息，避免把同一个 reasoning
+// 在多次 tool flush 中提前清空——这是 DeepSeek V4 thinking 模式要求每条带
+// tool_calls 的 assistant 消息都必须携带 reasoning_content 的核心修复点。
+function groupAssistantPartsByToolBoundary(parts: JsonValue[]): Array<
+  { kind: "content"; parts: JsonValue[] } | { kind: "tools"; tools: JsonValue[] }
+> {
+  const groups: Array<{ kind: "content"; parts: JsonValue[] } | { kind: "tools"; tools: JsonValue[] }> = [];
+  let pendingContent: JsonValue[] = [];
+  let pendingTools: JsonValue[] = [];
+  const flushContent = () => {
+    if (pendingContent.length) {
+      groups.push({ kind: "content", parts: pendingContent });
+      pendingContent = [];
+    }
+  };
+  const flushTools = () => {
+    if (pendingTools.length) {
+      groups.push({ kind: "tools", tools: pendingTools });
+      pendingTools = [];
+    }
+  };
+  for (const part of parts) {
+    if (isRecord(part) && part.type === "tool") {
+      flushContent();
+      pendingTools.push(part);
+    } else {
+      flushTools();
+      pendingContent.push(part);
+    }
+  }
+  flushContent();
+  flushTools();
+  return groups;
+}
+
+function appendAssistantApiMessages(items: ApiMessage[], message: Message, includeReasoning: boolean) {
+  const groups = groupAssistantPartsByToolBoundary(message.parts);
+  const contentBuffer: string[] = [];
+  let reasoningBuffer = "";
+
+  const flushAssistant = (tools: JsonValue[] = []) => {
+    const content = contentBuffer.join("\n").trim();
+    const reasoning = reasoningBuffer.trim();
+    if (!content && !reasoning && tools.length === 0) return;
+    const payload: ApiMessage = {
+      role: "assistant",
+      content,
+    };
+    if (includeReasoning && reasoning) payload.reasoning_content = reasoning;
+    if (tools.length) {
+      payload.tool_calls = tools.map((tool) => {
+        const record = isRecord(tool) ? tool : {};
+        return {
+          id: String(record.toolCallId ?? id()),
+          type: "function",
+          function: {
+            name: String(record.toolName ?? ""),
+            arguments: String(record.input ?? "{}"),
+          },
+        };
+      });
+    }
+    items.push(payload);
+    contentBuffer.length = 0;
+    // 同一条 ASSISTANT 消息里 reasoning 只贴在它后面"第一组"
+    // tool_calls 上（与安卓 addAssistantMessages 行为一致：reasoning
+    // 在 Tools group 输出后不会被复用）。
+    reasoningBuffer = "";
+  };
+
+  for (const group of groups) {
+    if (group.kind === "content") {
+      for (const part of group.parts) {
+        if (!isRecord(part)) continue;
+        if (part.type === "reasoning") {
+          const reasoning = String(part.reasoning ?? "").trim();
+          if (reasoning) reasoningBuffer += `${reasoningBuffer ? "\n" : ""}${reasoning}`;
+          continue;
+        }
+        if (part.type === "text") {
+          const text = String(part.text ?? "").trim();
+          if (text) contentBuffer.push(text);
+          continue;
+        }
+        if (part.type === "image" || part.type === "document" || part.type === "audio" || part.type === "video") {
+          const url = String(part.url ?? "");
+          const name = String(part.fileName ?? part.type);
+          if (url) contentBuffer.push(`[${name}] ${url}`);
+          continue;
+        }
+      }
+      continue;
+    }
+    // Tools group：所有连续的 tool 调用合并到同一条 assistant 消息里，
+    // 紧跟它们的 role:"tool" 结果消息。
+    flushAssistant(group.tools);
+    for (const part of group.tools) {
+      if (!isRecord(part)) continue;
+      items.push({
+        role: "tool",
+        name: String(part.toolName ?? ""),
+        tool_call_id: String(part.toolCallId ?? ""),
+        content: resolvedToolOutput(part),
+        _rikkahub_tool_output_parts: Array.isArray(part.output) ? part.output : [],
+      });
+    }
+  }
+  flushAssistant();
+}
+
+function conversationTransformedMessages(conversation: Conversation, assistant: Assistant) {
+  const picked = findModel(assistant.chatModelId ?? state.settings.chatModelId);
+  const rawMessages = conversation.messages.slice(assistant.contextMessageSize > 0 ? -assistant.contextMessageSize : undefined);
+  const selectedMessages = rawMessages
+    .map((node) => node.messages[node.selectIndex] ?? node.messages[0])
+    .filter(Boolean);
+  const conversationSystemPrompt = assistant.allowConversationSystemPrompt
+    ? String(conversation.systemPrompt ?? "").trim()
+    : "";
+  const effectiveSystemPrompt = conversationSystemPrompt || assistant.systemPrompt.trim();
+  const systemParts = [
+    effectiveSystemPrompt
+      ? renderTemplate(effectiveSystemPrompt, templateVariables("", "system", assistant, picked.model))
+      : "",
+    buildMemoryPrompt(assistant),
+    buildRecentChatsPrompt(assistant, conversation.id),
+    buildSkillsContext(assistant),
+    buildSearchContext(),
+  ].filter(Boolean);
+
+  const internalMessages: Message[] = [];
+  if (systemParts.length) {
+    internalMessages.push(message("SYSTEM", [{ type: "text", text: systemParts.join("\n\n") }]));
+  }
+  internalMessages.push(...selectedMessages.map((msg) => cloneJson(msg)));
+
+  const messagesAfterTimeReminder: Message[] = [];
+  let firstUserReminderInjected = false;
+  for (let index = 0; index < internalMessages.length; index += 1) {
+    const selected = internalMessages[index];
+    if (assistant.enableTimeReminder && selected.role === "USER") {
+      const previous = firstUserReminderInjected && index > 0 ? internalMessages[index - 1] : undefined;
+      const reminder = timeReminderContent(
+        selected,
+        previous,
+      );
+      if (reminder) messagesAfterTimeReminder.push(message("USER", [{ type: "text", text: reminder }]));
+      firstUserReminderInjected = true;
+    }
+    messagesAfterTimeReminder.push(selected);
+  }
+
+  const injections = activePromptInjections(assistant, messagesAfterTimeReminder);
+  return { messages: applyPromptInjectionsToMessages(messagesAfterTimeReminder, injections), picked };
+}
+
+function conversationMessagesForApi(
+  conversation: Conversation,
+  assistant: Assistant,
+  // 对齐安卓 commit e63d017：OpenAI providerSetting.includeHistoryReasoning
+  // 控制是否把历史 assistant 消息的 reasoning_content 回传给上游。默认 true，
+  // 与安卓 ChatCompletionsAPI.buildMessages 的默认值一致。
+  includeHistoryReasoning: boolean = true,
+) {
+  const template = assistant.messageTemplate?.trim() || "{{ message }}";
+  const { messages: transformedMessages, picked } = conversationTransformedMessages(conversation, assistant);
+
+  const items: ApiMessage[] = [];
+  for (const selected of transformedMessages) {
+    if (selected.role === "ASSISTANT") {
+      appendAssistantApiMessages(
+        items,
+        {
+          ...selected,
+          parts: applyMessageTemplateToParts(selected.parts, "assistant", template),
+        },
+        includeHistoryReasoning,
+      );
+      continue;
+    }
+    const rawContent = textFromParts(selected.parts);
+    const role = selected.role === "SYSTEM" ? "system" : selected.role === "TOOL" ? "tool" : "user";
+    const placeholderParts = selected.parts.map((part) =>
+      isRecord(part) && part.type === "text"
+        ? { ...part, text: applyPlaceholders(String(part.text ?? ""), templateVariables(rawContent, role, assistant, picked.model)) }
+        : part,
+    );
+    const templatedParts = applyMessageTemplateToParts(placeholderParts, role, template);
+    const content = apiContentFromParts(templatedParts, rawContent, picked.model);
+    if (!content) continue;
+    items.push({ role, content });
+  }
+  return items;
+}
+
+function conversationResponseApiInput(conversation: Conversation, assistant: Assistant) {
+  const template = assistant.messageTemplate?.trim() || "{{ message }}";
+  const { messages: transformedMessages, picked } = conversationTransformedMessages(conversation, assistant);
+  const converted = transformedMessages
+    .map((selected) => {
+      if (selected.role === "ASSISTANT") {
+        return {
+          ...selected,
+          parts: applyMessageTemplateToParts(selected.parts, "assistant", template),
+        };
+      }
+      const rawContent = textFromParts(selected.parts);
+      const role = selected.role === "SYSTEM" ? "system" : selected.role === "TOOL" ? "tool" : "user";
+      const placeholderParts = selected.parts.map((part) =>
+        isRecord(part) && part.type === "text"
+          ? { ...part, text: applyPlaceholders(String(part.text ?? ""), templateVariables(rawContent, role, assistant, picked.model)) }
+          : part,
+      );
+      return {
+        ...selected,
+        parts: applyMessageTemplateToParts(placeholderParts, role, template),
+      };
+    });
+  return responseApiMessagesFromUiMessages(converted, picked.model);
+}
+
+function conversationResponseApiInstructions(conversation: Conversation, assistant: Assistant) {
+  const { messages: transformedMessages, picked } = conversationTransformedMessages(conversation, assistant);
+  return transformedMessages
+    .filter((item) => item.role === "SYSTEM")
+    .map((item) =>
+      applyPlaceholders(
+        textFromParts(item.parts),
+        templateVariables(textFromParts(item.parts), "system", assistant, picked.model),
+      )
+    )
+    .filter(Boolean)
+    .join("\n");
+}
+
+function endpointFor(providerItem: Provider) {
+  const base = providerItem.baseUrl.replace(/\/+$/, "");
+  if (providerItem.type === "openai") {
+    return providerItem.useResponseApi ? `${base}/responses` : `${base}${providerItem.chatCompletionsPath || "/chat/completions"}`;
+  }
+  if (providerItem.type === "claude") return `${base}/messages`;
+  return `${base}/models/{model}:generateContent`;
+}
+
+function reasoningEffortForApi(level: string | null | undefined) {
+  const normalized = String(level ?? "").toLowerCase();
+  if (!["low", "medium", "high"].includes(normalized)) return undefined;
+  return normalized;
+}
+
+function reasoningForApi(level: string | null | undefined) {
+  const normalized = String(level ?? "").toLowerCase();
+  if (!["low", "medium", "high"].includes(normalized)) return undefined;
+  return { effort: normalized };
+}
+
+function reasoningLevelNormalized(level: string | null | undefined) {
+  const normalized = String(level ?? "").toLowerCase();
+  return normalized === "off" || normalized === "none" ? "off" : normalized;
+}
+
+// Token budgets per level — mirrors Android's ReasoningLevel enum values.
+function budgetTokensFor(level: string): number {
+  const map: Record<string, number> = { off: 0, low: 1_000, medium: 2_000, high: 8_000, xhigh: 16_000 };
+  return map[level] ?? 8_000;
+}
+
+// DeepSeek 系列模型的特色是展示原始思维链。当 DeepSeek 走 Anthropic(Claude) 格式时，
+// 用 display:"raw" 而非 "summarized"，让用户看到完整的思维链而非摘要。其它模型保持
+// "summarized"。匹配 deepseek-r1 / deepseek-reasoner / deepseek-v4 等当前与未来命名。
+function isDeepSeekModel(modelItem: Model) {
+  return /deepseek/i.test(String(modelItem.modelId ?? ""));
+}
+
+// 构建 Claude(Anthropic) 的 thinking + output_config 负载，主路径与辅助路径共用，
+// 对齐安卓 ClaudeProvider.buildMessageRequest:308-331。
+function claudeThinkingPayload(modelItem: Model, level: string | null | undefined): Record<string, JsonValue> {
+  if (!supportsAbility(modelItem, "REASONING")) return {};
+  const normalized = reasoningLevelNormalized(level);
+  if (normalized === "off") return { thinking: { type: "disabled" } };
+  const display = isDeepSeekModel(modelItem) ? "raw" : "summarized";
+  if (normalized === "auto") return { thinking: { type: "adaptive", display } };
+  return { thinking: { type: "adaptive", display }, output_config: { effort: normalized } };
+}
+
+function supportsAbility(modelItem: Model, ability: string) {
+  return (modelItem.abilities ?? []).map((item) => String(item).toUpperCase()).includes(ability.toUpperCase());
+}
+
+function supportsInputModality(modelItem: Model, modality: string) {
+  return (modelItem.inputModalities ?? []).map((item) => String(item).toUpperCase()).includes(modality.toUpperCase());
+}
+
+function supportsOutputModality(modelItem: Model, modality: string) {
+  return (modelItem.outputModalities ?? []).map((item) => String(item).toUpperCase()).includes(modality.toUpperCase());
+}
+
+function hasBuiltInTool(modelItem: Model, toolType: string) {
+  return (Array.isArray(modelItem.tools) ? modelItem.tools : []).some((tool) => {
+    if (typeof tool === "string") return tool.toLowerCase() === toolType.toLowerCase();
+    if (tool && typeof tool === "object" && !Array.isArray(tool)) return String(tool.type ?? "").toLowerCase() === toolType.toLowerCase();
+    return false;
+  });
+}
+
+function responseApiBuiltInTools(modelItem: Model) {
+  const tools: Record<string, JsonValue>[] = [];
+  if (hasBuiltInTool(modelItem, "search")) tools.push({ type: "web_search" });
+  if (hasBuiltInTool(modelItem, "image_generation")) tools.push({ type: "image_generation", model: "gpt-image-2" });
+  return tools;
+}
+
+function openAiChatCompletionsModalities(modelItem: Model, providerItem: Provider) {
+  if (hostOfProvider(providerItem) === "openrouter.ai" && supportsOutputModality(modelItem, "IMAGE")) {
+    return ["image", "text"];
+  }
+  return undefined;
+}
+
+function responseProviderCapabilities(providerItem: Provider) {
+  const host = hostOfProvider(providerItem);
+  if (host === "ark.cn-beijing.volces.com") {
+    return { supportsReasoningSummary: false, supportsEncryptedContent: false };
+  }
+  return { supportsReasoningSummary: true, supportsEncryptedContent: true };
+}
+
+function responseApiReasoningForProvider(providerItem: Provider, modelItem: Model, level: string | null | undefined) {
+  if (!supportsAbility(modelItem, "REASONING")) return undefined;
+  const normalized = reasoningLevelNormalized(level);
+  const capabilities = responseProviderCapabilities(providerItem);
+  const payload: Record<string, JsonValue> = {};
+  if (capabilities.supportsReasoningSummary) payload.summary = "auto";
+  if (normalized !== "auto") {
+    payload.effort = normalized === "off" ? "none" : normalized;
+  }
+  return payload;
+}
+
+function responseApiIncludeForProvider(providerItem: Provider, modelItem: Model) {
+  if (!supportsAbility(modelItem, "REASONING")) return undefined;
+  return responseProviderCapabilities(providerItem).supportsEncryptedContent
+    ? ["reasoning.encrypted_content"]
+    : undefined;
+}
+
+function apiContentText(content: unknown) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (isRecord(part)) return String(part.text ?? part.content ?? "");
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+function responseApiContent(content: unknown, role: string) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return apiContentText(content);
+  return content
+    .map((part) => {
+      if (!isRecord(part)) return null;
+      const text = String(part.text ?? part.content ?? "");
+      if (text) {
+        return {
+          type: role === "assistant" ? "output_text" : "input_text",
+          text,
+        };
+      }
+      if (part.type === "image_url") return part;
+      return null;
+    })
+    .filter(Boolean);
+}
+
+function responseApiContentFromUiParts(parts: JsonValue[], role: string) {
+  const content = parts
+    .map((part) => {
+      if (!isRecord(part)) return null;
+      if (part.type === "text" || part.type === "input_text" || part.type === "output_text") {
+        return {
+          type: role === "assistant" ? "output_text" : "input_text",
+          text: String(part.text ?? ""),
+        };
+      }
+      if (part.type === "image") {
+        return responseApiImagePart(part, role);
+      }
+      if (part.type === "image_url" || part.type === "input_image" || part.type === "output_image") {
+        const rawImageUrl = isRecord(part.image_url) ? part.image_url.url : part.image_url;
+        const url = String(rawImageUrl ?? part.url ?? "");
+        return {
+          type: role === "assistant" ? "output_image" : "input_image",
+          image_url: url,
+        };
+      }
+      if (part.type === "document") return responseApiDocumentPart(part);
+      if (part.type === "audio" || part.type === "video") return responseApiTextPart(`[${part.type}: ${String(part.url ?? "")}]`, role);
+      return null;
+    })
+    .filter(Boolean);
+  if (content.length === 1 && isRecord(content[0]) && content[0].type === "input_text") return String(content[0].text ?? "");
+  if (content.length === 1 && isRecord(content[0]) && content[0].type === "output_text") return String(content[0].text ?? "");
+  return content;
+}
+
+function responseApiReasoningItem(part: Record<string, JsonValue>) {
+  const reasoning = String(part.reasoning ?? "").trim();
+  if (!reasoning) return null;
+  const metadata = isRecord(part.metadata) ? part.metadata : {};
+  const payload: Record<string, JsonValue> = {
+    type: "reasoning",
+    summary: [{ type: "summary_text", text: reasoning }],
+  };
+  const reasoningId = String(metadata.reasoning_id ?? "").trim();
+  if (reasoningId) payload.id = reasoningId;
+  const encryptedContent = String(metadata.encrypted_content ?? "").trim();
+  if (encryptedContent) payload.encrypted_content = encryptedContent;
+  return payload;
+}
+
+function responseApiTextPart(text: string, role: string) {
+  return { type: role === "assistant" ? "output_text" : "input_text", text };
+}
+
+function responseApiImagePart(part: Record<string, JsonValue>, role: string, stripForOcr = false) {
+  const metadata = isRecord(part.metadata) ? part.metadata : {};
+  const ocrText = String(metadata.ocrText ?? "").trim();
+  if (stripForOcr && ocrText) {
+    return responseApiTextPart(`<image_file_ocr>\n${ocrText}\n</image_file_ocr>`, role);
+  }
+  const url = dataUrlForMessageUrl(String(part.url ?? ""));
+  if (!url) return null;
+  return {
+    type: role === "assistant" ? "output_image" : "input_image",
+    image_url: url,
+  };
+}
+
+function responseApiDocumentPart(part: Record<string, JsonValue>) {
+  const fileName = String(part.fileName ?? "document");
+  const url = String(part.url ?? "");
+  const entry = fileEntryFromApiUrl(url);
+  let extractedText = String(entry?.extractedText ?? "").trim();
+  if (!extractedText && entry) {
+    const fresh = extractStoredFileTextSync(entry);
+    if (fresh) {
+      extractedText = fresh;
+      entry.extractedText = fresh;
+      entry.extractedAt = Date.now();
+      scheduleThrottledSaveState();
+    }
+  }
+  return responseApiTextPart(
+    extractedText ? documentPromptText(fileName, extractedText) : fallbackDocumentText({ fileName, url, entry: entry ?? null }),
+    "user",
+  );
+}
+
+function responseApiImageGenerationItem(part: Record<string, JsonValue>) {
+  const metadata = isRecord(part.metadata) ? part.metadata : {};
+  const callId = String(metadata.openai_image_call_id ?? "").trim();
+  if (!callId) return null;
+  return { type: "image_generation_call", id: callId };
+}
+
+function responseApiMessagesFromUiMessages(messages: Message[], targetModel?: Model) {
+  const stripImageForOcr = targetModel ? !supportsInputModality(targetModel, "IMAGE") : false;
+  const items: ApiMessage[] = [];
+  for (const messageValue of messages) {
+    if (messageValue.role === "SYSTEM") continue;
+    if (messageValue.role === "ASSISTANT") {
+      const contentBuffer: JsonValue[] = [];
+      const flushContent = () => {
+        const content = responseApiContentFromUiParts(contentBuffer, "assistant");
+        const hasContent = typeof content === "string"
+          ? content.trim().length > 0
+          : Array.isArray(content) && content.length > 0;
+        if (hasContent) items.push({ role: "assistant", content });
+        contentBuffer.length = 0;
+      };
+      for (const part of messageValue.parts) {
+        if (!isRecord(part)) continue;
+        if (part.type === "reasoning") {
+          flushContent();
+          const reasoningItem = responseApiReasoningItem(part);
+          if (reasoningItem) items.push(reasoningItem);
+          continue;
+        }
+        if (part.type === "image") {
+          const imageCall = responseApiImageGenerationItem(part);
+          if (imageCall) {
+            flushContent();
+            items.push(imageCall);
+            continue;
+          }
+          contentBuffer.push(part);
+          continue;
+        }
+        if (part.type === "text" || part.type === "document" || part.type === "audio" || part.type === "video") {
+          if (part.type === "document") contentBuffer.push(responseApiDocumentPart(part));
+          else if (part.type === "audio" || part.type === "video") contentBuffer.push(responseApiTextPart(`[${part.type}: ${String(part.url ?? "")}]`, "assistant"));
+          else contentBuffer.push(part);
+          continue;
+        }
+        if (part.type === "tool") {
+          flushContent();
+          items.push({
+            type: "function_call",
+            call_id: String(part.toolCallId ?? ""),
+            name: String(part.toolName ?? ""),
+            arguments: String(part.input ?? "{}"),
+          });
+          items.push({
+            type: "function_call_output",
+            call_id: String(part.toolCallId ?? ""),
+            output: resolvedToolOutput(part),
+          });
+        }
+      }
+      flushContent();
+      continue;
+    }
+    const role = messageValue.role === "TOOL" ? "tool" : "user";
+    const contentParts = messageValue.parts
+      .map((part) => {
+        if (!isRecord(part)) return null;
+        if (part.type === "text") return part;
+        if (part.type === "image") return responseApiImagePart(part, role, stripImageForOcr);
+        if (part.type === "document") return responseApiDocumentPart(part);
+        if (part.type === "audio" || part.type === "video") return responseApiTextPart(`[${part.type}: ${String(part.url ?? "")}]`, role);
+        return null;
+      })
+      .filter(Boolean) as JsonValue[];
+    const content = responseApiContentFromUiParts(contentParts, role);
+    const hasContent = typeof content === "string"
+      ? content.trim().length > 0
+      : Array.isArray(content) && content.length > 0;
+    if (hasContent) items.push({ role, content });
+  }
+  return items;
+}
+
+function responseApiMessages(messagesForApi: ApiMessage[]) {
+  const items: ApiMessage[] = [];
+  for (const item of messagesForApi) {
+    if (item.role === "system") continue;
+    if (item.role === "assistant") {
+      const content = responseApiContent(item.content, "assistant");
+      if ((typeof content === "string" && content.trim()) || (Array.isArray(content) && content.length)) {
+        items.push({ role: "assistant", content });
+      }
+      const toolCalls = Array.isArray(item.tool_calls) ? item.tool_calls : [];
+      for (const toolCall of toolCalls) {
+        const fn = toolCall?.function ?? {};
+        items.push({
+          type: "function_call",
+          call_id: String(toolCall.id ?? ""),
+          name: String(fn.name ?? ""),
+          arguments: String(fn.arguments ?? ""),
+        });
+      }
+      continue;
+    }
+    if (item.role === "tool") {
+      items.push({
+        type: "function_call_output",
+        call_id: String(item.tool_call_id ?? ""),
+        output: apiContentText(item.content),
+      });
+      continue;
+    }
+    items.push({ role: item.role, content: responseApiContent(item.content, String(item.role ?? "user")) });
+  }
+  return items;
+}
+
+function responseApiInstructions(messagesForApi: ApiMessage[]) {
+  return messagesForApi
+    .filter((item) => item.role === "system")
+    .map((item) => apiContentText(item.content))
+    .filter(Boolean)
+    .join("\n");
+}
+
+function isModelAllowTemperature(modelItem: Model) {
+  // Mirror Android's ModelRegistry-based check: OPENAI_O_MODELS (o1, o3, o4 etc.)
+  // and GPT_5 (exact "gpt-5" only — NOT gpt-5.1, gpt-5.2 etc., which Android allows).
+  const id = modelItem.modelId;
+  return !/(^o\d|[/:_-]o\d)/i.test(id) && !/^gpt[-._]?5$/i.test(id);
+}
+
+function hostOfProvider(providerItem: Provider) {
+  try {
+    return new URL(providerItem.baseUrl).hostname;
+  } catch {
+    return "";
+  }
+}
+
+function reasoningPayloadForProvider(providerItem: Provider, modelItem: Model, level: string | null | undefined) {
+  if (!supportsAbility(modelItem, "REASONING")) return {};
+  const normalized = reasoningLevelNormalized(level);
+  const enabled = normalized !== "off";
+  const host = hostOfProvider(providerItem);
+  if (host === "api.mistral.ai") return {}; // Mistral 不支持 reasoning params
+  if (host === "openrouter.ai") {
+    if (normalized === "off") return { reasoning: { effort: "none" } };
+    if (normalized === "auto") return { reasoning: { enabled: true } };
+    return { reasoning: { effort: normalized } };
+  }
+  if (host === "dashscope.aliyuncs.com") {
+    const result: Record<string, any> = { enable_thinking: enabled };
+    if (normalized !== "auto") result.thinking_budget = budgetTokensFor(normalized);
+    return result;
+  }
+  if (host === "api.siliconflow.cn") {
+    const siliconflowThinkingModels = new Set([
+      "Pro/moonshotai/Kimi-K2.5",
+      "Pro/zai-org/GLM-5",
+      "Pro/zai-org/GLM-5.1",
+      "Pro/zai-org/GLM-4.7",
+      "deepseek-ai/DeepSeek-V3.2",
+      "Pro/deepseek-ai/DeepSeek-V3.2",
+      "Qwen/Qwen3.5-397B-A17B",
+      "Qwen/Qwen3.5-122B-A10B",
+      "Qwen/Qwen3.5-35B-A3B",
+      "Qwen/Qwen3.5-27B",
+      "Qwen/Qwen3.5-9B",
+      "Qwen/Qwen3.5-4B",
+      "zai-org/GLM-4.6",
+      "Qwen/Qwen3-8B",
+      "Qwen/Qwen3-14B",
+      "Qwen/Qwen3-32B",
+      "Qwen/Qwen3-30B-A3B",
+      "tencent/Hunyuan-A13B-Instruct",
+      "zai-org/GLM-4.5V",
+      "deepseek-ai/DeepSeek-V3.1-Terminus",
+      "Pro/deepseek-ai/DeepSeek-V3.1-Terminus",
+      "deepseek-ai/DeepSeek-V4-Flash",
+      "Pro/deepseek-ai/DeepSeek-V4-Flash",
+      "deepseek-ai/DeepSeek-V4-Pro",
+      "Pro/deepseek-ai/DeepSeek-V4-Pro",
+    ]);
+    return siliconflowThinkingModels.has(modelItem.modelId) ? { enable_thinking: enabled } : {};
+  }
+  if (["ark.cn-beijing.volces.com", "open.bigmodel.cn", "api.moonshot.cn", "api.deepseek.com"].includes(host)) {
+    return { thinking: { type: enabled ? "enabled" : "disabled" }, ...(host === "api.deepseek.com" && enabled && normalized !== "auto" ? { reasoning_effort: normalized } : {}) };
+  }
+  if (host === "integrate.api.nvidia.com") {
+    if (normalized === "auto") return {};
+    if (modelItem.modelId.toLowerCase().includes("deepseek-v4")) {
+      if (normalized === "xhigh") return { reasoning_effort: "max" };
+      if (normalized === "off") return { reasoning_effort: "none" };
+      return { reasoning_effort: "high" };
+    }
+    // Non-deepseek NVIDIA: maps "none" → "low", passes everything else through (Android: level.effort)
+    if (normalized === "off") return { reasoning_effort: "low" };
+    return { reasoning_effort: normalized };
+  }
+  if (host === "chat.intern-ai.org.cn") return { thinking_mode: enabled };
+  // Android default else branch: passes effort through as-is (including "xhigh").
+  // OFF maps to "low" (lowest budget), AUTO sends no field.
+  if (normalized === "auto") return {};
+  if (normalized === "off") return { reasoning_effort: "low" };
+  return { reasoning_effort: normalized };
+}
+
+function auxiliaryReasoningPayloadForProvider(providerItem: Provider, modelItem: Model, level: string | null | undefined) {
+  if (!level || !supportsAbility(modelItem, "REASONING")) return {};
+  return reasoningPayloadForProvider(providerItem, modelItem, level);
+}
+
+function modelsEndpointFor(providerItem: Provider) {
+  const base = providerItem.baseUrl.replace(/\/+$/, "");
+  if (providerItem.type === "google") return `${base}/models?pageSize=100&key=${encodeURIComponent(providerItem.apiKey)}`;
+  return `${base}/models`;
+}
+
+function providerHeaders(providerItem: Provider) {
+  const headers: Record<string, string> = {};
+  if (providerItem.type === "openai") headers.Authorization = `Bearer ${providerItem.apiKey}`;
+  if (providerItem.type === "claude") {
+    headers["x-api-key"] = providerItem.apiKey;
+    headers["anthropic-version"] = "2023-06-01";
+  }
+  return headers;
+}
+
+function customHeaderRecords(assistant: Assistant, modelItem?: Model) {
+  return [
+    ...(Array.isArray(assistant.customHeaders) ? assistant.customHeaders : []),
+    ...(Array.isArray((modelItem as any)?.customHeaders) ? (modelItem as any).customHeaders : []),
+  ].filter(isRecord);
+}
+
+function modelCustomHeaderRecords(modelItem?: Model) {
+  return (Array.isArray((modelItem as any)?.customHeaders) ? (modelItem as any).customHeaders : []).filter(isRecord);
+}
+
+function applyModelRequestHeaders(headers: Record<string, string>, providerItem: Provider, modelItem?: Model) {
+  for (const header of modelCustomHeaderRecords(modelItem)) {
+    const name = String(header.name ?? header.key ?? "").trim();
+    if (name) headers[name] = String(header.value ?? "");
+  }
+  const host = hostOfProvider(providerItem);
+  if (host === "aihubmix.com") headers["APP-Code"] ??= "DKHA9468";
+  if (host === "openrouter.ai") {
+    headers["X-Title"] ??= "RikkaHub";
+    headers["HTTP-Referer"] ??= "https://rikka-ai.com";
+  }
+  return headers;
+}
+
+function applyRequestHeaders(
+  headers: Record<string, string>,
+  assistant: Assistant,
+  providerItem: Provider,
+  modelItem?: Model,
+) {
+  for (const header of customHeaderRecords(assistant, modelItem)) {
+    const name = String(header.name ?? header.key ?? "").trim();
+    if (name) headers[name] = String(header.value ?? "");
+  }
+  const host = hostOfProvider(providerItem);
+  if (host === "aihubmix.com") headers["APP-Code"] ??= "DKHA9468";
+  if (host === "openrouter.ai") {
+    headers["X-Title"] ??= "RikkaHub";
+    headers["HTTP-Referer"] ??= "https://rikka-ai.com";
+  }
+  return headers;
+}
+
+function mergeObjects(base: Record<string, any>, overlay: Record<string, any>): Record<string, any> {
+  const result = { ...base };
+  for (const [key, value] of Object.entries(overlay)) {
+    const existing = result[key];
+    result[key] = isRecord(existing) && isRecord(value)
+      ? mergeObjects(existing as Record<string, any>, value as Record<string, any>)
+      : value;
+  }
+  return result;
+}
+
+function decodeCustomBodyValue(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
+}
+
+function applyCustomBody<T extends Record<string, any>>(body: T, assistant: Assistant, modelItem?: Model): T {
+  const entries = [
+    ...(Array.isArray(assistant.customBodies) ? assistant.customBodies : []),
+    ...(Array.isArray((modelItem as any)?.customBodies) ? (modelItem as any).customBodies : []),
+  ].filter(isRecord);
+  if (entries.length === 0) return body;
+  let next: Record<string, any> = { ...body };
+  for (const entry of entries) {
+    const key = String(entry.key ?? entry.name ?? "").trim();
+    if (!key) continue;
+    const value = decodeCustomBodyValue(entry.value);
+    const existing = next[key];
+    next[key] = isRecord(existing) && isRecord(value)
+      ? mergeObjects(existing as Record<string, any>, value as Record<string, any>)
+      : value;
+  }
+  return next as T;
+}
+
+function applyModelCustomBody<T extends Record<string, any>>(body: T, modelItem?: Model): T {
+  const entries = (Array.isArray((modelItem as any)?.customBodies) ? (modelItem as any).customBodies : []).filter(isRecord);
+  if (entries.length === 0) return body;
+  let next: Record<string, any> = { ...body };
+  for (const entry of entries) {
+    const key = String(entry.key ?? entry.name ?? "").trim();
+    if (!key) continue;
+    const value = decodeCustomBodyValue(entry.value);
+    const existing = next[key];
+    next[key] = isRecord(existing) && isRecord(value)
+      ? mergeObjects(existing as Record<string, any>, value as Record<string, any>)
+      : value;
+  }
+  return next as T;
+}
+
+function customBodyEntriesForForm(modelItem?: Model) {
+  return (Array.isArray((modelItem as any)?.customBodies) ? (modelItem as any).customBodies : [])
+    .filter(isRecord)
+    .map((entry) => ({
+      key: String(entry.key ?? entry.name ?? "").trim(),
+      value: decodeCustomBodyValue(entry.value),
+    }))
+    .filter((entry) => entry.key.length > 0);
+}
+
+function customFormValue(value: unknown) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return JSON.stringify(value);
+}
+
+function normalizeFetchedModels(providerItem: Provider, raw: any): Model[] {
+  const items = providerItem.type === "google" ? raw.models ?? [] : raw.data ?? raw.models ?? [];
+  const models = (Array.isArray(items) ? items : [])
+    .map((item: any) => {
+      const rawId = String(item.id ?? item.name ?? item.model ?? "").trim();
+      const modelId = rawId.replace(/^models\//, "");
+      if (!modelId) return null;
+      const displayName = String(item.display_name ?? item.displayName ?? item.name ?? modelId).replace(/^models\//, "");
+      return enrichModel(model(modelId, displayName || modelId), item);
+    })
+    .filter(Boolean) as Model[];
+  const byId = new Map<string, Model>();
+  for (const item of models) byId.set(item.modelId, item);
+  return [...byId.values()].sort((a, b) => a.modelId.localeCompare(b.modelId));
+}
+
+async function fetchProviderModels(providerItem: Provider) {
+  const endpoint = modelsEndpointFor(providerItem);
+  const started = Date.now();
+  let response: Response;
+  try {
+    response = await fetch(endpoint, { headers: providerHeaders(providerItem) });
+  } catch (err) {
+    const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url: endpoint,
+      ok: false,
+      status: 0,
+      kind: "provider:models",
+      durationMs: Date.now() - started,
+      method: "GET",
+      requestHeaders: providerHeaders(providerItem),
+      error: detail,
+    });
+    throw new Error(`获取模型列表失败：请求未能发送到供应商。\n${detail}\n\n请检查 Base URL、API Key、代理、防火墙或供应商服务状态。`);
+  }
+  const text = await response.text();
+  let raw: any = {};
+  try {
+    raw = text ? JSON.parse(text) : {};
+  } catch {
+    raw = { text };
+  }
+  addLog({
+    providerId: providerItem.id,
+    providerName: providerItem.name,
+    url: endpoint,
+    ok: response.ok,
+    status: response.status,
+    kind: "provider:models",
+    durationMs: Date.now() - started,
+    method: "GET",
+    requestHeaders: providerHeaders(providerItem),
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    responseBody: textBody(text),
+    error: response.ok ? undefined : textBody(text),
+  });
+  if (!response.ok) {
+    if (response.status === 404 && providerItem.models.length > 0) {
+      return {
+        endpoint,
+        models: providerItem.models,
+        preview: `The provider did not expose a model-list endpoint at ${endpoint}; using the configured local model templates.`,
+      };
+    }
+    throw new Error(`${response.status}: ${text.slice(0, 500) || response.statusText}`);
+  }
+  return { endpoint, models: normalizeFetchedModels(providerItem, raw), preview: textBody(text) };
+}
+
+async function fetchProviderBalance(providerItem: Provider) {
+  const option = providerItem.balanceOption ?? { enabled: false, apiPath: "", resultPath: "" };
+  if (!option.enabled) throw new Error("余额查询未启用");
+  if (providerItem.type !== "openai") throw new Error("原版仅对 OpenAI-compatible 供应商执行余额查询");
+  const apiPath = String(option.apiPath ?? "").trim();
+  if (!apiPath) throw new Error("余额 API Path 为空");
+  const endpoint = /^https?:\/\//i.test(apiPath) ? apiPath : `${providerItem.baseUrl.replace(/\/+$/, "")}${apiPath.startsWith("/") ? apiPath : `/${apiPath}`}`;
+  const started = Date.now();
+  let response: Response;
+  try {
+    response = await fetch(endpoint, { headers: providerHeaders(providerItem) });
+  } catch (err) {
+    const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url: endpoint,
+      ok: false,
+      status: 0,
+      kind: "provider:balance",
+      durationMs: Date.now() - started,
+      method: "GET",
+      requestHeaders: providerHeaders(providerItem),
+      error: detail,
+    });
+    throw new Error(`余额查询请求失败：${detail}`);
+  }
+  const text = await response.text();
+  let raw: any = {};
+  try {
+    raw = text ? JSON.parse(text) : {};
+  } catch {
+    raw = { text };
+  }
+  addLog({
+    providerId: providerItem.id,
+    providerName: providerItem.name,
+    url: endpoint,
+    ok: response.ok,
+    status: response.status,
+    kind: "provider:balance",
+    durationMs: Date.now() - started,
+    method: "GET",
+    requestHeaders: providerHeaders(providerItem),
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    responseBody: textBody(text),
+    error: response.ok ? undefined : textBody(text),
+  });
+  if (!response.ok) throw new Error(`余额查询失败：${response.status} ${text.slice(0, 500) || response.statusText}`);
+  const value = getByPath(raw, String(option.resultPath ?? ""));
+  const formatted = formatBalanceValue(value);
+  if (!formatted) throw new Error(`余额结果路径没有取到值：${option.resultPath || "(root)"}`);
+  return { status: "ok", endpoint, value: formatted, preview: textBody(text) };
+}
+
+function firstProviderModel(providerItem: Provider, preferredModelId?: string, fetchedModels: Model[] = []) {
+  const preferred = preferredModelId?.trim();
+  if (preferred && preferred !== "auto") return preferred;
+  const configured = providerItem.models.find((item) => item.modelId && item.modelId !== "auto")?.modelId;
+  if (configured) return configured;
+  const fetched = fetchedModels.find((item) => item.modelId && item.modelId !== "auto")?.modelId;
+  if (fetched) return fetched;
+  const fallback = providerItem.models.find((item) => item.modelId)?.modelId;
+  if (fallback && fallback !== "auto") return fallback;
+  throw new Error("No test model is available. Fetch the provider model list or select a model first.");
+}
+
+function providerTestAssistant(modelItem?: Model): Assistant {
+  return {
+    ...findAssistant(state.settings.assistantId),
+    systemPrompt: "",
+    temperature: null,
+    topP: null,
+    maxTokens: null,
+    reasoningLevel: "off",
+    customHeaders: [],
+    customBodies: [],
+    chatModelId: modelItem?.id ?? null,
+  } as Assistant;
+}
+
+function providerTestPayload(providerItem: Provider, mode: "non_stream" | "stream" | "tools", selectedModel: string) {
+  if (providerItem.type === "google") {
+    const body: any = {
+      contents: [{ role: "user", parts: [{ text: mode === "tools" ? "Use the get_current_time tool." : "hello" }] }],
+      systemInstruction: { parts: [{ text: "You are a helpful assistant" }] },
+    };
+    if (mode === "tools") {
+      body.tools = [{ functionDeclarations: [{ name: "get_current_time", description: "Get the current date and time.", parameters: { type: "object", properties: {} } }] }];
+    }
+    const suffix = mode === "stream" ? "streamGenerateContent?alt=sse" : "generateContent";
+    const connector = suffix.includes("?") ? "&" : "?";
+    return { url: `${providerItem.baseUrl.replace(/\/+$/, "")}/models/${selectedModel}:${suffix}${connector}key=${encodeURIComponent(providerItem.apiKey)}`, body };
+  }
+  if (providerItem.type === "claude") {
+    const body: any = {
+      model: selectedModel,
+      max_tokens: 4096,
+      stream: mode === "stream",
+      system: "You are a helpful assistant",
+      messages: [{ role: "user", content: mode === "tools" ? "Use the get_current_time tool." : "hello" }],
+    };
+    if (mode === "tools") {
+      body.tools = [{ name: "get_current_time", description: "Get the current date and time.", input_schema: { type: "object", properties: {} } }];
+      body.tool_choice = { type: "tool", name: "get_current_time" };
+    }
+    return { url: endpointFor(providerItem), body };
+  }
+  if (providerItem.useResponseApi) {
+    const body: any = {
+      model: selectedModel,
+      input: [
+        { role: "system", content: "You are a helpful assistant" },
+        { role: "user", content: mode === "tools" ? "Use the get_current_time tool." : "hello" },
+      ],
+      stream: mode === "stream",
+      store: false,
+    };
+    if (mode === "tools") {
+      body.tools = [{ type: "function", name: "get_current_time", description: "Get the current date and time.", parameters: { type: "object", properties: {} } }];
+      body.tool_choice = { type: "function", name: "get_current_time" };
+    }
+    return { url: endpointFor(providerItem), body };
+  }
+  const body: any = {
+    model: selectedModel,
+    messages: [
+      { role: "system", content: "You are a helpful assistant" },
+      { role: "user", content: mode === "tools" ? "Use the get_current_time tool." : "hello" },
+    ],
+    stream: mode === "stream",
+  };
+  if (mode === "stream" && hostOfProvider(providerItem) !== "api.mistral.ai") body.stream_options = { include_usage: true };
+  if (mode === "tools") {
+    body.tools = [{ type: "function", function: { name: "get_current_time", description: "Get the current date and time.", parameters: { type: "object", properties: {} } } }];
+    // Use `"auto"` to match the live request path (server.ts:6476) and the Android client
+    // (which never sets tool_choice at all — same as auto by default). The previous shape
+    // `{ type: "function", function: { name: ... } }` is the OpenAI "force this specific
+    // function" format; Deepseek's API doesn't reliably emit standard tool_calls deltas
+    // for that form when streaming, so the test would falsely fail. The user prompt
+    // ("Use the get_current_time tool.") is explicit enough that any well-behaved model
+    // will call the tool under "auto" mode.
+    body.tool_choice = "auto";
+  }
+  return { url: endpointFor(providerItem), body };
+}
+
+function providerTestModel(providerItem: Provider, selectedModel: string, fetchedModels: Model[] = []) {
+  return (
+    providerItem.models.find((item) => item.modelId === selectedModel || item.id === selectedModel)
+    ?? fetchedModels.find((item) => item.modelId === selectedModel || item.id === selectedModel)
+    ?? model(selectedModel, selectedModel)
+  );
+}
+
+async function readProviderTestStream(response: Response, providerItem: Provider) {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let preview = "";
+  let sawEvent = false;
+  const appendPreview = (text: string) => {
+    if (!text) return;
+    preview += text;
+    if (preview.length > 6000) preview = `${preview.slice(0, 6000)}...`;
+  };
+  const readWithIdleTimeout = async () => {
+    // 120s between upstream chunks before declaring the connection dead. Was 10 minutes;
+    // dropped to 2 minutes so a half-open TCP / Cloudflare hiccup releases the connection
+    // (and its slot in the frontend's 6-per-host pool) much faster. Reasoning models can
+    // pause 30+s mid-thought but rarely 2 min — well within tolerance.
+    const timeoutMs = 120_000;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise<ReadableStreamReadResult<Uint8Array>>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("流式测试超时：10 分钟内没有收到供应商的 SSE 数据")), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  };
+  const consumePayload = (payload: string) => {
+    if (!payload || payload === "[DONE]") return;
+    sawEvent = true;
+    try {
+      const raw = JSON.parse(payload);
+      if (providerItem.type === "google") {
+        appendPreview(String(raw.candidates?.[0]?.content?.parts?.[0]?.text ?? ""));
+        appendUsageFromRaw(undefined, raw);
+        return;
+      }
+      if (providerItem.type === "claude") {
+        appendPreview(String(raw.delta?.text ?? raw.content_block?.text ?? raw.message?.content?.[0]?.text ?? ""));
+        return;
+      }
+      const delta = raw.choices?.[0]?.delta ?? raw.choices?.[0]?.message ?? responseEventToDelta(raw) ?? {};
+      const text = deltaTextContent(delta);
+      const reasoning = deltaReasoningContent(delta);
+      if (text) appendPreview(text);
+      else if (reasoning) appendPreview(`[reasoning] ${reasoning}`);
+      else if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+        const names = delta.tool_calls
+          .map((call: any) => String(call?.function?.name ?? "").trim())
+          .filter(Boolean)
+          .join(", ");
+        appendPreview(names ? `[tool_calls] ${names}` : "[tool_calls]");
+      } else if (raw.usage) {
+        appendPreview("[usage]");
+      }
+      appendUsageFromRaw(undefined, raw);
+    } catch {
+      appendPreview(payload);
+    }
+  };
+  try {
+    for (;;) {
+      const { done, value } = await readWithIdleTimeout();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split(/\n\n+/);
+      buffer = parts.pop() ?? "";
+      for (const part of parts) {
+        for (const payload of parseSseChunks(part)) consumePayload(payload);
+      }
+      if (sawEvent) break;
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // The stream may already be closed by the provider.
+    }
+  }
+  for (const payload of parseSseChunks(buffer)) consumePayload(payload);
+  return preview.trim() || (sawEvent ? "已收到流式事件" : "已建立流式连接，供应商未返回可解析内容");
+}
+
+async function runProviderCheck(providerItem: Provider, mode: "non_stream" | "stream" | "tools", selectedModel: string, fetchedModels: Model[] = []) {
+  const modelItem = providerTestModel(providerItem, selectedModel, fetchedModels);
+  const assistant = providerTestAssistant(modelItem);
+  const { url, body: rawBody } = providerTestPayload(providerItem, mode, selectedModel);
+  const body = applyCustomBody(rawBody, assistant, modelItem);
+  const started = Date.now();
+  let response: Response;
+  const headers = applyRequestHeaders(
+    {
+      "Content-Type": "application/json",
+      ...(mode === "stream" ? { Accept: "text/event-stream" } : {}),
+      ...providerHeaders(providerItem),
+    },
+    assistant,
+    providerItem,
+    modelItem,
+  );
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url,
+      ok: false,
+      status: 0,
+      kind: `provider:test:${mode}`,
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders: headers,
+      requestBody: jsonBody(body),
+      responseBody: "",
+      error: detail,
+    });
+    return {
+      mode,
+      ok: false,
+      status: 0,
+      endpoint: url,
+      preview: `请求未能发送到供应商。\n${detail}\n\n请检查 Base URL、API 路径、代理、防火墙、证书或供应商服务状态。`,
+    };
+  }
+  let text = "";
+  try {
+    text = mode === "stream" && response.ok ? await readProviderTestStream(response, providerItem) : await response.text();
+  } catch (err) {
+    const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url,
+      ok: false,
+      status: response.status,
+      kind: `provider:test:${mode}`,
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders: headers,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody(body),
+      responseBody: textBody(text),
+      error: detail,
+    });
+    return {
+      mode,
+      ok: false,
+      status: response.status,
+      endpoint: url,
+      preview: `供应商已建立连接，但流式读取失败。\n${detail}`,
+    };
+  }
+  addLog({
+    providerId: providerItem.id,
+    providerName: providerItem.name,
+    url,
+    ok: response.ok,
+    status: response.status,
+    kind: `provider:test:${mode}`,
+    durationMs: Date.now() - started,
+    method: "POST",
+    requestHeaders: headers,
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    requestBody: jsonBody(body),
+    responseBody: textBody(text),
+    error: response.ok ? undefined : textBody(text),
+  });
+  return {
+    mode,
+    ok: response.ok,
+    status: response.status,
+    endpoint: url,
+    preview: textBody(text || (mode === "stream" && response.ok ? "流式测试已收到事件" : "")),
+  };
+}
+
+function providerTestCorePassed(checks: Array<{ mode: string; ok: boolean }>) {
+  const nonStream = checks.find((item) => item.mode === "non_stream");
+  const stream = checks.find((item) => item.mode === "stream");
+  return nonStream?.ok === true || stream?.ok === true;
+}
+
+function markProviderTestResult(providerItem: Provider, models: Model[], checks: Array<{ mode: string; ok: boolean }>) {
+  if (!providerTestCorePassed(checks)) return;
+  updateSettings({
+    ...state.settings,
+    providers: state.settings.providers.map((item) =>
+      item.id === providerItem.id
+        ? { ...item, testPassed: true, testPassedAt: Date.now() }
+        : item,
+    ),
+  });
+}
+
+async function testSearchService(service: SearchService) {
+  const type = String(service.type ?? "");
+  const name = String(service.name ?? (type || "Search"));
+  const apiKey = String(service.apiKey ?? "");
+  if (type === "bing_local" || type === "rikkahub") {
+    if (type === "bing_local") {
+      return { status: "ok", name, endpoint: type, preview: "Built-in Bing local search is available without API key." };
+    }
+  }
+  if (type !== "searxng" && type !== "rikkahub" && !apiKey) throw new Error(`${name} API Key is empty`);
+  if (type === "rikkahub") {
+    const endpoint = "https://api.rikka-ai.com/v1/search";
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+      body: JSON.stringify({ q: "RikkaHub", depth: service.depth ?? "standard", outputType: "sourcedAnswer", includeImages: false }),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  if (type === "tavily") {
+    const endpoint = "https://api.tavily.com/search";
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ query: "RikkaHub", max_results: 1 }),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  if (type === "exa") {
+    const endpoint = "https://api.exa.ai/search";
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey },
+      body: JSON.stringify({ query: "RikkaHub", numResults: 1 }),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  if (type === "tinyfish") {
+    const endpoint = "https://api.search.tinyfish.ai?query=RikkaHub";
+    const response = await fetch(endpoint, {
+      headers: { "X-API-Key": apiKey },
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`Tinyfish search failed with code ${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  if (type === "zhipu") {
+    const endpoint = "https://open.bigmodel.cn/api/paas/v4/web_search";
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ search_query: "RikkaHub", search_engine: "search_std", count: 1 }),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  if (type === "brave") {
+    const endpoint = "https://api.search.brave.com/res/v1/web/search?q=RikkaHub&count=1";
+    const response = await fetch(endpoint, { headers: { Accept: "application/json", "X-Subscription-Token": apiKey } });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  if (type === "searxng") {
+    const baseUrl = String(service.url ?? "").trim().replace(/\/+$/, "");
+    if (!baseUrl) throw new Error("SearXNG URL is empty");
+    const endpoint = `${baseUrl}/search?q=RikkaHub&format=json`;
+    const headers: Record<string, string> = {};
+    const username = String(service.username ?? "");
+    const password = String(service.password ?? "");
+    if (username && password) headers.Authorization = `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
+    const response = await fetch(endpoint, { headers });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  if (type === "custom_js") {
+    const searchScript = String(service.searchScript ?? "").trim();
+    if (!searchScript) throw new Error("Custom JS search script is empty");
+    const result = await runCustomJsSearch(service, "RikkaHub", 1);
+    return { status: "ok", name, endpoint: "custom_js", preview: jsonBody(result) };
+  }
+  if (type === "firecrawl") {
+    const endpoint = "https://api.firecrawl.dev/v2/search";
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ query: "RikkaHub", limit: 1 }),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  if (type === "grok") {
+    const endpoint = String(service.customUrl ?? "").trim() || "https://api.x.ai/v1/responses";
+    const model = String(service.model ?? "").trim() || "grok-4-fast";
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model,
+        input: [
+          { role: "system", content: "You are a helpful search assistant." },
+          { role: "user", content: "RikkaHub" },
+        ],
+        tools: [{ type: "web_search" }, { type: "x_search" }],
+        store: false,
+      }),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  // 以下 6 个分支(perplexity/bocha/linkup/metaso/ollama/jina)此前缺失,导致这些类型在
+  // 设置页点「测试」全部落到末尾 throw "not supported"。请求体对齐 runSearchService 里
+  // 各自的实现,仅改成最小测试请求(query=RikkaHub、count/size=1)以验证 API Key 可用。
+  if (type === "perplexity") {
+    const endpoint = "https://api.perplexity.ai/search";
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "RikkaHub", max_results: 1 }),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  if (type === "bocha") {
+    const endpoint = "https://api.bochaai.com/v1/web-search";
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "RikkaHub", summary: false, count: 1 }),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  if (type === "linkup") {
+    const endpoint = "https://api.linkup.so/v1/search";
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ q: "RikkaHub", depth: "standard", outputType: "sourcedAnswer", includeImages: "false" }),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  if (type === "metaso") {
+    const endpoint = "https://metaso.cn/api/v1/search";
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ q: "RikkaHub", scope: "webpage", size: 1, includeSummary: false }),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  if (type === "ollama") {
+    const endpoint = "https://ollama.com/api/web_search";
+    // runSearchService 把 max_results clamp 到 [5,10],这里取下界 5 避免被上游拒绝。
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "RikkaHub", max_results: 5 }),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint, preview: textBody(text) };
+  }
+  if (type === "jina") {
+    const searchUrl = String(service.searchUrl ?? "").trim() || "https://s.jina.ai/";
+    const response = await fetch(searchUrl, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ q: "RikkaHub" }),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
+    return { status: "ok", name, endpoint: searchUrl, preview: textBody(text) };
+  }
+  throw new Error(`${name} search type '${type}' is not supported`);
+}
+
+function fallbackSvg(name: string) {
+  const first = (name.trim()[0] ?? "A")
+    .toUpperCase()
+    .replace("&", "&amp;")
+    .replace("<", "&lt;")
+    .replace(">", "&gt;")
+    .replace("\"", "&quot;")
+    .replace("'", "&apos;");
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="32" fill="#E9EAEE"/><text x="32" y="38" font-family="system-ui, sans-serif" font-size="24" font-weight="600" text-anchor="middle" fill="#4E5969">${first}</text></svg>`;
+}
+
+const iconRules: Array<[RegExp, string]> = [
+  [/rikka|auto/i, "rikkahub.svg"],
+  [/(gpt|openai|o\d)/i, "openai.svg"],
+  [/(gemini|nano-banana)/i, "gemini-color.svg"],
+  [/google/i, "google-color.svg"],
+  [/claude/i, "claude-color.svg"],
+  [/anthropic/i, "anthropic.svg"],
+  [/deepseek/i, "deepseek-color.svg"],
+  [/grok/i, "grok.svg"],
+  [/qwen|qwq|qvq/i, "qwen-color.svg"],
+  [/doubao/i, "doubao-color.svg"],
+  [/openrouter/i, "openrouter.svg"],
+  [/zhipu|智谱|glm/i, "zhipu-color.svg"],
+  [/mistral/i, "mistral-color.svg"],
+  [/meta\b|(?<!o)llama/i, "meta-color.svg"],
+  [/hunyuan|tencent|腾讯混元/i, "hunyuan-color.svg"],
+  [/gemma/i, "gemma-color.svg"],
+  [/perplexity/i, "perplexity-color.svg"],
+  [/aliyun|阿里云|百炼/i, "alibabacloud-color.svg"],
+  [/bytedance|火山/i, "bytedance-color.svg"],
+  [/silicon|硅基/i, "siliconflow.svg"],
+  [/aihubmix/i, "aihubmix-color.svg"],
+  [/ollama/i, "ollama.svg"],
+  [/github/i, "github.svg"],
+  [/cloudflare/i, "cloudflare-color.svg"],
+  [/minimax/i, "minimax-color.svg"],
+  [/xai/i, "xai.svg"],
+  [/juhenext/i, "juhenext.png"],
+  [/kimi/i, "kimi-color.svg"],
+  [/moonshot|月之暗面/i, "moonshot.svg"],
+  [/302/i, "302ai.svg"],
+  [/step|阶跃/i, "stepfun-color.svg"],
+  [/intern|书生/i, "internlm-color.svg"],
+  [/cohere|command-.+/i, "cohere-color.svg"],
+  [/tavern/i, "tavern.png"],
+  [/cerebras/i, "cerebras-color.svg"],
+  [/nvidia/i, "nvidia-color.svg"],
+  [/ppio|派欧/i, "ppio-color.svg"],
+  [/vercel/i, "vercel.svg"],
+  [/groq/i, "groq.svg"],
+  [/tokenpony|小马算力/i, "tokenpony.svg"],
+  [/ling|ring|百灵/i, "ling.png"],
+  [/mimo|xiaomi|小米/i, "xiaomimimo.svg"],
+  [/longcat/i, "longcat-color.svg"],
+  [/linkup/i, "linkup.png"],
+  [/bing/i, "bing.png"],
+  [/tavily/i, "tavily.png"],
+  [/exa/i, "exa.png"],
+  [/brave/i, "brave.svg"],
+  [/metaso|秘塔/i, "metaso.svg"],
+  [/firecrawl/i, "firecrawl.svg"],
+  [/jina/i, "jina.svg"],
+  [/tinyfish/i, "tinyfish.svg"],
+  [/searxng/i, "searxng.svg"],
+  [/naapi|钠/i, "naapi.jpg"],
+];
+
+function iconForName(name: string) {
+  return iconRules.find(([pattern]) => pattern.test(name))?.[1] ?? null;
+}
+
+async function serveAIIcon(name: string) {
+  const iconName = iconForName(name);
+  if (iconName) {
+    const candidates = [
+      resolve(executableDir, "icons", iconName),
+      resolve(rootDir, "icons", iconName),
+    ];
+    const target = candidates.find((candidate) => existsSync(candidate));
+    if (target) {
+      return new Response(Bun.file(target), {
+        headers: { "Content-Type": mime(target), "Cache-Control": "public, max-age=86400" },
+      });
+    }
+  }
+  return new Response(fallbackSvg(name), {
+    headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=3600" },
+  });
+}
+
+// ── 字体系统 ───────────────────────────────────────────────────────────────
+// 三层来源:
+//   builtin — 随应用分发。repo 根 fonts/ 经 Tauri resources 打到 executableDir/fonts/,
+//             跟 icons 完全同构;dev 时从 rootDir/fonts/ 读。
+//   custom  — 用户上传,存在 pc-data/fonts/(gitignored,更新不覆盖)。
+//   system  — 系统已装字体。Linux 走 `fc-list`,Windows 走 PowerShell +
+//             System.Drawing.Text.InstalledFontCollection(真枚举,非硬编码清单);
+//             两者都失败才降级到 COMMON_FONTS_FALLBACK。
+// 关键:@font-face 的 font-family 名由我们掌控(= 文件名 stem),所以不解析字体文件
+// 内部的 name 表——绕开了"从二进制读真实族名"这个最烦的活,也保证 @font-face 名与 CSS
+// font-family 链首项严格一致(浏览器靠这个名字匹配 @font-face 规则加载文件)。
+
+interface FontWeightFile {
+  fileName: string;   // 字体文件名
+  weight: number;     // CSS font-weight:100-900
+  style: "normal" | "italic";
+  format?: string;    // woff2/truetype/...(@font-face 的 format() 提示)
+}
+interface FontEntry {
+  id: string;        // catalog 内唯一:`builtin:<family>` / `custom:<file>` / `system:<name>`
+  label: string;     // 下拉框显示名
+  cssName: string;   // @font-face 的 font-family 名(builtin/custom);system 即族名本身。
+                     // 必须与 family 链首项一致——浏览器靠它匹配 @font-face。
+  family: string;    // 完整 CSS font-family 值(含 fallback 链)——root.tsx 实际注入 CSS 变量的值
+  source: "builtin" | "custom" | "system";
+  // 字体族由一个或多个文件组成。单字重字体只有一个元素。多字重字体(HarmonyOS Sans 6 个
+  // 字重)共享同一 cssName,每个文件声明对应 font-weight,这样浏览器遇到 <b>/700 自动
+  // 挑 Bold 文件,而不是用 Regular 合成假粗体。
+  weights: FontWeightFile[];
+}
+
+const FONT_EXTENSIONS = [".woff2", ".woff", ".ttf", ".otf", ".ttc"] as const;
+const FONT_EXTENSIONS_SET = new Set<string>(FONT_EXTENSIONS);
+const FONT_MIME: Record<string, string> = {
+  ".woff2": "font/woff2",
+  ".woff": "font/woff",
+  ".ttf": "font/ttf",
+  ".otf": "font/otf",
+  ".ttc": "font/collection",
+};
+const FONT_FORMAT: Record<string, string> = {
+  ".woff2": "woff2",
+  ".woff": "woff",
+  ".ttf": "truetype",
+  ".otf": "opentype",
+  // .ttc(TrueType Collection)没有独立的 format 值,浏览器只认 truetype/opentype 等;
+  // 写 "collection" 会让浏览器跳过整个 @font-face。用 truetype 取集合首个字形,是标准做法。
+  ".ttc": "truetype",
+};
+// CJK 单文件可能十几 MB,留 50MB 余量足够;超过几乎一定是误传。
+const MAX_FONT_BYTES = 50 * 1024 * 1024;
+const FONT_DEFAULT_FALLBACK = "system-ui, sans-serif";
+
+// 真枚举失败时的兜底清单(Windows 锁死系统等情况)。
+const COMMON_FONTS_FALLBACK: FontEntry[] = [
+  "Microsoft YaHei", "DengXian", "Segoe UI", "SimSun", "SimHei", "KaiTi", "FangSong",
+  "Consolas", "Times New Roman", "Arial", "Courier New",
+].map((name) => ({
+  id: `system:${name}`,
+  label: name,
+  cssName: name,
+  family: `"${name}", ${FONT_DEFAULT_FALLBACK}`,
+  source: "system" as const,
+  weights: [],
+}));
+
+function fontExtension(name: string): string {
+  return name.toLowerCase().match(/\.[a-z0-9]+$/)?.[0] ?? "";
+}
+function isFontFile(name: string): boolean {
+  return FONT_EXTENSIONS_SET.has(fontExtension(name));
+}
+// 纯文件名:无路径分隔符、无 NUL。用于拒绝 path traversal(../etc/passwd 之类)。
+function isBareFileName(name: string): boolean {
+  return !!name && !name.includes("/") && !name.includes("\\") && !name.includes("\0");
+}
+// @font-face family 名 = 文件名去扩展名。用全 stem(不去 -Regular 之类后缀)保证不撞名。
+function fontCssName(fileName: string): string {
+  return fileName.replace(/\.[^.]+$/, "");
+}
+function fontFormat(fileName: string): string | undefined {
+  return FONT_FORMAT[fontExtension(fileName)];
+}
+// 显示名美化:"LXGWWenKai-Regular" → "LXGWWenKai"。去掉常见字重后缀,空格替分隔符。
+function prettifyFontLabel(fileName: string): string {
+  return fontCssName(fileName)
+    .replace(/[-_](regular|normal|book|light|medium|semibold|demibold|bold|black|thin|extralight|extrabold)$/i, "")
+    .replace(/[-_]+/g, " ")
+    .trim() || fontCssName(fileName);
+}
+// 从 CSS font-family 链中取出第一个族名(@font-face 用它做 font-family)。
+// `"A B", serif` → `A B`;`Cursive, serif` → `Cursive`。
+function firstFamilyName(family: string): string {
+  const m = family.trim().match(/^"([^"]+)"|^'([^']+)'|^([^,]+)/);
+  return (m?.[1] ?? m?.[2] ?? m?.[3] ?? family.trim()).trim();
+}
+
+// 可选 builtin 清单:repo 根 fonts/manifest.json。
+// 两种写法:
+//   1) 单文件映射(向后兼容老 manifest):"<file>": { label?, family? }
+//   2) 字重族定义(一个 family 下多个文件):"<id>": { label, family, weights:[{file,weight,style?}] }
+//      weights 里每个 file 必须真实存在于 fonts/ 目录;family 是共享的 @font-face 名。
+type ManifestWeight = { file: string; weight: number; style?: "normal" | "italic" };
+interface ManifestEntry {
+  label?: string;
+  family?: string;
+  weights?: ManifestWeight[];
+}
+type BuiltinManifest = Record<string, ManifestEntry>;
+function readBuiltinFontManifest(): BuiltinManifest {
+  for (const p of [resolve(executableDir, "fonts", "manifest.json"), resolve(rootDir, "fonts", "manifest.json")]) {
+    if (existsSync(p)) {
+      try { return JSON.parse(readFileSync(p, "utf-8")) as BuiltinManifest; }
+      catch { /* 坏 manifest 忽略,降级到自动派生 */ }
+    }
+  }
+  return {};
+}
+
+// 用 manifest 的 weights 定义构造一个字重族 entry。校验每个文件真实存在,过滤掉缺失的。
+function makeWeightedFamilyEntry(source: "builtin" | "custom", manifestId: string, entry: ManifestEntry, fontDirs: string[]): FontEntry | null {
+  const family = entry.family?.trim();
+  if (!family || !Array.isArray(entry.weights) || entry.weights.length === 0) return null;
+  const cssName = firstFamilyName(family);
+  const weights: FontWeightFile[] = [];
+  const seenFiles = new Set<string>();
+  for (const w of entry.weights) {
+    const fileName = w.file;
+    if (!isBareFileName(fileName) || !isFontFile(fileName) || seenFiles.has(fileName.toLowerCase())) continue;
+    seenFiles.add(fileName.toLowerCase());
+    // 文件必须真实存在(任一目录),否则跳过——避免 @font-face 指向不存在的文件。
+    const exists = fontDirs.some((d) => existsSync(join(d, fileName)));
+    if (!exists) continue;
+    weights.push({ fileName, weight: w.weight || 400, style: w.style === "italic" ? "italic" : "normal", format: fontFormat(fileName) });
+  }
+  if (weights.length === 0) return null;
+  const label = entry.label?.trim() || cssName;
+  return { id: `${source}:${manifestId}`, label, cssName, family, source, weights };
+}
+
+function makeBundledFontEntry(source: "builtin" | "custom", fileName: string, override?: { label?: string; family?: string }): FontEntry {
+  const cssName = override?.family?.trim() ? firstFamilyName(override.family) : fontCssName(fileName);
+  const label = override?.label?.trim() || prettifyFontLabel(fileName);
+  const family = override?.family?.trim() || `"${fontCssName(fileName)}", ${FONT_DEFAULT_FALLBACK}`;
+  return {
+    id: `${source}:${fileName}`,
+    label,
+    cssName,
+    family,
+    source,
+    weights: [{ fileName, weight: 400, style: "normal", format: fontFormat(fileName) }],
+  };
+}
+
+function listBuiltinFonts(): FontEntry[] {
+  const manifest = readBuiltinFontManifest();
+  // 单文件 override 按文件名小写建索引,方便不区分大小写查找。
+  const manifestByLowerFile: Record<string, ManifestEntry> = {};
+  for (const [k, v] of Object.entries(manifest)) {
+    if (!v.weights) manifestByLowerFile[k.toLowerCase()] = v;
+  }
+  const fontDirs = [resolve(executableDir, "fonts"), resolve(rootDir, "fonts")];
+  const out: FontEntry[] = [];
+  const consumedFiles = new Set<string>();   // 已被某个 manifest 族消费的文件,跳过自动派生
+  const seenAutoFiles = new Set<string>();
+
+  // 1) 先处理 manifest 里带 weights 的字重族定义(HarmonyOS Sans 等)。
+  for (const [manifestId, entry] of Object.entries(manifest)) {
+    if (!entry.weights) continue;
+    const built = makeWeightedFamilyEntry("builtin", manifestId, entry, fontDirs);
+    if (built) {
+      out.push(built);
+      for (const w of built.weights) consumedFiles.add(w.fileName.toLowerCase());
+    }
+  }
+
+  // 2) 扫描目录,对未被 manifest weights 消费的文件,自动派生(或读 manifest 单文件 override)。
+  for (const dir of fontDirs) {
+    let entries: string[] = [];
+    try { entries = readdirSync(dir); } catch { continue; }
+    for (const name of entries) {
+      if (!isFontFile(name)) continue;
+      const key = name.toLowerCase();
+      if (seenAutoFiles.has(key) || consumedFiles.has(key)) continue;
+      seenAutoFiles.add(key);
+      out.push(makeBundledFontEntry("builtin", name, manifestByLowerFile[key]));
+    }
+  }
+  return out;
+}
+
+function listCustomFonts(): FontEntry[] {
+  try {
+    mkdirSync(customFontsDir, { recursive: true });
+    return readdirSync(customFontsDir)
+      .filter(isFontFile)
+      .map((name) => makeBundledFontEntry("custom", name));
+  } catch {
+    return [];
+  }
+}
+
+// 系统字体枚举结果缓存(平台层一次)。去重(剔除与 builtin 重名的)在 listFontCatalog 做,
+// 因为那依赖 builtin 列表,而 builtin 可能随 manifest 变化。
+let cachedRawSystemFamilies: string[] | null = null;
+function readSystemFontFamilies(): string[] {
+  if (cachedRawSystemFamilies) return cachedRawSystemFamilies;
+  const families = new Set<string>();
+  try {
+    if (process.platform === "linux") {
+      // fc-list 的 family 字段:每行一个或多个族名(逗号分隔)。
+      const proc = Bun.spawnSync(["fc-list", ":", "family"], { stdout: "pipe", stderr: "pipe", timeout: 5_000 });
+      const out = proc.stdout instanceof Buffer ? proc.stdout.toString("utf8") : String(proc.stdout ?? "");
+      for (const line of out.split(/\r?\n/)) {
+        for (const f of line.split(",")) {
+          const name = f.trim();
+          if (name && !name.includes(":")) families.add(name);
+        }
+      }
+    } else if (process.platform === "win32") {
+      // powershell.exe = Windows PowerShell 5.1,全 Windows 自带,System.Drawing 开箱即用。
+      // InstalledFontCollection 返回干净的族名(无需解析字体二进制 name 表)。
+      const script = "Add-Type -AssemblyName System.Drawing; (New-Object System.Drawing.Text.InstalledFontCollection).Families | ForEach-Object { $_.Name }";
+      const proc = Bun.spawnSync(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], { stdout: "pipe", stderr: "pipe", timeout: 15_000 });
+      const out = proc.stdout instanceof Buffer ? proc.stdout.toString("utf8") : String(proc.stdout ?? "");
+      for (const line of out.split(/\r?\n/)) {
+        const name = line.trim();
+        if (name) families.add(name);
+      }
+    }
+  } catch {
+    /* 枚举失败 → families 为空 → 走兜底清单 */
+  }
+  cachedRawSystemFamilies = families.size > 0 ? [...families].sort((a, b) => a.localeCompare(b)) : null;
+  return cachedRawSystemFamilies;
+}
+
+// 系统 FontEntry:剔除与 builtin/custom 同名的(用户:自带与系统重合的用自带的,不重复显示)。
+function listSystemFonts(excludeNames: Set<string>): FontEntry[] {
+  const raw = readSystemFontFamilies();
+  if (!raw) return COMMON_FONTS_FALLBACK.filter((entry) => !excludeNames.has(entry.cssName.toLowerCase()));
+  return raw
+    .filter((name) => !excludeNames.has(name.toLowerCase()))
+    .map((name) => ({
+      id: `system:${name}`,
+      label: name,
+      cssName: name,
+      family: `"${name}", ${FONT_DEFAULT_FALLBACK}`,
+      source: "system" as const,
+      weights: [],
+    }));
+}
+
+// 服务字体文件:builtin 从 executableDir/fonts 或 rootDir/fonts 找;custom 从 pc-data/fonts 找。
+function resolveFontFile(source: "builtin" | "custom", fileName: string): string | null {
+  if (!isBareFileName(fileName) || !isFontFile(fileName)) return null;
+  if (source === "custom") {
+    const p = join(customFontsDir, fileName);
+    return existsSync(p) ? p : null;
+  }
+  for (const dir of [resolve(executableDir, "fonts"), resolve(rootDir, "fonts")]) {
+    const p = join(dir, fileName);
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+async function callProvider(
+  conversation: Conversation,
+  signal?: AbortSignal,
+  hooks?: StreamHooks,
+) {
+  const assistant = findAssistant(conversation.assistantId);
+  const picked = findModel(assistant.chatModelId ?? state.settings.chatModelId);
+  const providerItem = picked.provider;
+  const selectedModel = picked.model.modelId === "auto" ? "gpt-4o-mini" : picked.model.modelId;
+  const url = endpointFor(providerItem);
+  const headers = applyRequestHeaders({ "Content-Type": "application/json" }, assistant, providerItem, picked.model);
+  // 对齐 e63d017：OpenAI 路径才让 includeHistoryReasoning 生效；
+  // claude/google 不走 OpenAI assistant 序列化，一律保持 true。
+  const includeHistoryReasoning =
+    providerItem.type === "openai" ? providerItem.includeHistoryReasoning !== false : true;
+  const messagesForApi = conversationMessagesForApi(conversation, assistant, includeHistoryReasoning);
+  let body: Record<string, any>;
+
+  if (providerItem.type === "google") {
+    // Gemini 鉴权：API key 走 query param（与安卓非 Vertex 路径的 x-goog-api-key 等价，
+    // 这里沿用既有 query 形式以兼容各类兼容网关）。
+    const apiKey = providerItem.apiKey;
+    const baseUrl = providerItem.baseUrl;
+    body = buildGoogleRequestBody(messagesForApi, picked.model, assistant);
+    const finalBody = applyCustomBody(body, assistant, picked.model);
+    // 有 hooks（来自会话）时走 SSE 流式 + 工具循环；辅助调用无 hooks 时退回非流式。
+    if (hooks?.message != null) {
+      return streamGoogleChatWithTools(baseUrl, headers, apiKey, selectedModel, finalBody, providerItem, assistant, signal, hooks);
+    }
+    const googleUrl = `${baseUrl.replace(/\/+$/, "")}/models/${selectedModel}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    return fetchText(googleUrl, headers, finalBody, providerItem, (raw) => raw.candidates?.[0]?.content?.parts?.map((part: any) => part?.text ?? "").join("") ?? "", signal);
+  }
+
+  if (providerItem.type === "claude") {
+    headers["x-api-key"] = providerItem.apiKey;
+    headers["anthropic-version"] = "2023-06-01";
+    const messages = messagesForApi;
+    const systemContent = messages.find((item) => item.role === "system")?.content;
+    const functionTools = supportsAbility(picked.model, "TOOL")
+      ? [...openAiSearchTools(), ...openAiLocalTools(assistant), ...openAiSkillTools(assistant), ...openAiMcpTools(assistant)]
+      : [];
+    const claudeTools = claudeToolsFromOpenAiTools(functionTools, providerItem);
+    const normalizedReasoning = reasoningLevelNormalized(assistant.reasoningLevel);
+    const reasoningActive = supportsAbility(picked.model, "REASONING") && normalizedReasoning !== "off";
+    // Always stream when invoked from a conversation (hooks present). The streaming path handles
+    // text + thinking + tool_use deltas live, matching Android (ClaudeProvider.streamText). The
+    // non-streaming fallback only runs for auxiliary calls without hooks (title/translate, etc.).
+    const canStream = hooks?.message != null;
+    body = {
+      model: selectedModel,
+      max_tokens: assistant.maxTokens ?? 64_000,
+      stream: canStream,
+      system: claudeSystemContent(systemContent, providerItem),
+      messages: claudeMessagesFromApiMessages(messages, providerItem),
+      // 顶层 cache_control: 让 Anthropic 自动管理缓存断点
+      // 对齐安卓 ClaudeProvider.kt:275-278 (commit d2e52106)
+      ...(providerItem.promptCaching === true
+        ? { cache_control: claudeCacheControlEphemeral(providerItem) }
+        : {}),
+      ...(assistant.temperature != null && !reasoningActive ? { temperature: assistant.temperature } : {}),
+      ...(assistant.topP != null ? { top_p: assistant.topP } : {}),
+      // thinking + output_config：DeepSeek 走 Claude 格式时用 display:"raw" 展示原始思维链
+      ...claudeThinkingPayload(picked.model, assistant.reasoningLevel),
+      ...(claudeTools.length ? { tools: claudeTools } : {}),
+    };
+    if (canStream) {
+      return streamClaudeChatWithTools(url, headers, applyCustomBody(body, assistant, picked.model), providerItem, assistant, signal, hooks!);
+    }
+    return fetchClaudeTextWithTools(url, headers, applyCustomBody(body, assistant, picked.model), providerItem, assistant, signal, hooks);
+  }
+
+  headers.Authorization = `Bearer ${providerItem.apiKey}`;
+  if (providerItem.useResponseApi) {
+    const functionTools = supportsAbility(picked.model, "TOOL") ? [...openAiSearchTools(), ...openAiLocalTools(assistant), ...openAiSkillTools(assistant), ...openAiMcpTools(assistant)] : [];
+    const builtInTools = responseApiBuiltInTools(picked.model);
+    const systemContent = conversationResponseApiInstructions(conversation, assistant);
+    const reasoning = responseApiReasoningForProvider(providerItem, picked.model, assistant.reasoningLevel);
+    const include = responseApiIncludeForProvider(providerItem, picked.model);
+    body = {
+      model: selectedModel,
+      stream: false,
+      store: false,
+      ...(systemContent ? { instructions: systemContent } : {}),
+      input: conversationResponseApiInput(conversation, assistant),
+      ...(isModelAllowTemperature(picked.model) ? { temperature: assistant.temperature ?? undefined } : {}),
+      ...(isModelAllowTemperature(picked.model) ? { top_p: assistant.topP ?? undefined } : {}),
+      ...(assistant.maxTokens != null ? { max_output_tokens: assistant.maxTokens } : {}),
+      ...(reasoning ? { reasoning } : {}),
+      ...(include ? { include } : {}),
+      tools: [
+        ...functionTools.map((tool: any) => ({
+          type: "function",
+          name: tool.function.name,
+          description: tool.function.description,
+          parameters: tool.function.parameters,
+        })),
+        ...builtInTools,
+      ].filter(Boolean),
+    };
+    if (!body.tools.length) delete body.tools;
+    return fetchText(url, headers, applyCustomBody(body, assistant, picked.model), providerItem, (raw) => raw.output_text ?? raw.output?.flatMap((item: any) => item.content ?? []).map((item: any) => item.text ?? "").join("\n"), signal);
+  }
+  const tools = supportsAbility(picked.model, "TOOL") ? [...openAiSearchTools(), ...openAiLocalTools(assistant), ...openAiSkillTools(assistant), ...openAiMcpTools(assistant)] : [];
+  body = {
+    model: selectedModel,
+    messages: messagesForApi,
+    temperature: isModelAllowTemperature(picked.model) ? assistant.temperature ?? undefined : undefined,
+    top_p: isModelAllowTemperature(picked.model) ? assistant.topP ?? undefined : undefined,
+    max_tokens: assistant.maxTokens ?? undefined,
+    ...(providerItem.type === "openai" ? { modalities: openAiChatCompletionsModalities(picked.model, providerItem) } : {}),
+    ...reasoningPayloadForProvider(providerItem, picked.model, assistant.reasoningLevel),
+    tools: tools.length ? tools : undefined,
+    tool_choice: tools.length ? "auto" : undefined,
+  };
+  return fetchOpenAiText(url, headers, applyCustomBody(body, assistant, picked.model), providerItem, assistant, signal, hooks);
+}
+
+type StreamHooks = {
+  message?: Message;
+  conversation?: Conversation;
+  node?: MessageNode;
+};
+
+function touchStream(hooks?: StreamHooks) {
+  if (!hooks?.conversation || !hooks.node) return;
+  hooks.conversation.updateAt = Date.now();
+  // 1.2.6:流式增量写活库——只标脏当前在长的会话行(updateAt)+ 节点,200ms 合并 upsert
+  // 进 SQLite。不再全量重写 state.json(会话已迁出 state.json)。N 路流式并发时各自标脏,
+  // flush 时逐行 upsert,SQLite WAL 串行化。流式结束(complete/abort)再全量 reconcile。
+  markConversationRowDirty(hooks.conversation.id);
+  markMessageNodeDirty(hooks.conversation.id, hooks.node.id);
+  scheduleThrottledConvFlush();
+  scheduleNodeBroadcast(hooks.conversation, hooks.node);
+}
+
+// Tracks which assistant messages have already received their first real streaming chunk.
+// We use it to rewrite `createdAt` from "when the send button was pressed" to "when the
+// first content delta arrived" — matching the Android client, which only constructs the
+// assistant UIMessage object on the first chunk. Without this correction, the token/s and
+// duration stats include the upstream TTFT (time-to-first-token) wait, understating speed.
+// In-memory only: it doesn't persist, which is fine because finished messages never stream
+// again; on reload they keep whatever createdAt was recorded during generation.
+const streamStartedMessages = new WeakSet<Message>();
+
+function markStreamFirstContent(msg: Message | undefined) {
+  if (!msg) return;
+  if (streamStartedMessages.has(msg)) return;
+  streamStartedMessages.add(msg);
+  msg.createdAt = new Date().toISOString();
+}
+
+function addStreamText(hooks: StreamHooks | undefined, text: string) {
+  if (!hooks?.message || !text) return;
+  markStreamFirstContent(hooks.message);
+  const hadOpenReasoning = hasOpenReasoningPart(hooks.message);
+  hooks.message.parts = hooks.message.parts.filter((part) => !(
+    part &&
+    typeof part === "object" &&
+    !Array.isArray(part) &&
+    (part.type === "loading" || (part.type === "reasoning" && part.reasoning === "正在生成回复"))
+  ));
+  if (hadOpenReasoning) {
+    finishReasoningParts(hooks.message);
+  }
+  appendTextPart(hooks.message, text);
+  touchStream(hooks);
+}
+
+// models.dev 开源模型目录缓存 —— 用于查询模型的最大上下文窗口,显示在对话统计行
+// (分子 = 当前上下文 = promptTokens,分母 = 模型 contextLimit)。
+// 数据源 https://models.dev/api.json,缓存到 pc-data,7 天 TTL,fetch 失败降级为空(不报错)。
+// 策略参考 opencode 的 models-dev.ts:磁盘缓存 + 原子写(tmp→rename)+ 失败用旧缓存。
+const MODELS_DEV_URL = "https://models.dev/api.json";
+const MODELS_DEV_CACHE_PATH = join(dataDir, "models-dev-cache.json");
+const MODELS_DEV_TTL_MS = 24 * 60 * 60 * 1000; // 1 天
+let modelsDevCache: Record<string, any> | null = null;
+let modelsDevLoading: Promise<void> | null = null;
+
+// 启动时 fire-and-forget 触发(见文件末尾),之后内存命中。失败只打日志,绝不抛。
+// force=true 时跳过磁盘 TTL 检查、总是拉最新(用于"获取模型列表"等用户主动想试新模型的场景)。
+async function loadModelsDev(force = false): Promise<void> {
+  // 正在加载 → 复用(避免并发 fetch);非强制且内存已有 → 复用。
+  if (modelsDevLoading) return modelsDevLoading;
+  if (!force && modelsDevCache !== null) return Promise.resolve();
+  modelsDevLoading = (async () => {
+    // 1. 磁盘缓存未过期且非强制 → 直接用(force 时跳过,总是拉最新)
+    if (!force) {
+      try {
+        const stat = statSync(MODELS_DEV_CACHE_PATH);
+        if (Date.now() - stat.mtimeMs < MODELS_DEV_TTL_MS) {
+          modelsDevCache = JSON.parse(readFileSync(MODELS_DEV_CACHE_PATH, "utf8"));
+          return;
+        }
+      } catch {
+        // 无缓存文件或损坏 → 继续 fetch
+      }
+    }
+    // 2. fetch(超时 10s)
+    try {
+      const res = await fetch(MODELS_DEV_URL, { signal: AbortSignal.timeout(10_000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      const parsed = JSON.parse(text) as Record<string, any>;
+      // 3. 原子写:tmp → rename,避免半截文件
+      const tmp = `${MODELS_DEV_CACHE_PATH}.${process.pid}.tmp`;
+      try {
+        writeFileSync(tmp, text);
+        renameSync(tmp, MODELS_DEV_CACHE_PATH);
+      } catch {
+        try { unlinkSync(tmp); } catch { /* best-effort */ }
+      }
+      modelsDevCache = parsed;
+    } catch (err) {
+      console.warn(
+        "[models-dev] fetch failed, falling back to stale cache or empty:",
+        err instanceof Error ? err.message : err,
+      );
+      try {
+        modelsDevCache = JSON.parse(readFileSync(MODELS_DEV_CACHE_PATH, "utf8"));
+      } catch {
+        modelsDevCache = {};
+      }
+    } finally {
+      modelsDevLoading = null;
+    }
+  })();
+  return modelsDevLoading;
+}
+
+// 按 provider type + modelId 查 context limit。匹配不到返回 null。
+// ① 精确:provider type → models.dev provider key(claude→anthropic),modelId 精确匹配;
+// ② 版本后缀前缀:claude-3-5-sonnet → claude-3-5-sonnet-20241022(models.dev 用带日期的 id,
+//    用户常用简短 id)。用 `modelId + "-"` 锚定,避免 gpt-4 误匹配 gpt-4o;
+// ③ 跨 provider:中转站可能 type=openai 但实际模型(如 deepseek)在别的 provider下;
+// ④ 都没有 → null(前端只显示分子)。
+function lookupContextLimit(
+  catalog: Record<string, any> | null,
+  providerType: string,
+  modelId: string,
+): number | null {
+  if (!catalog || !modelId) return null;
+  const providerKey = providerType === "claude" ? "anthropic" : providerType;
+  const contextOf = (models: any): number | null => {
+    if (!models) return null;
+    const exact = models[modelId]?.limit?.context;
+    if (typeof exact === "number" && exact > 0) return exact;
+    for (const key of Object.keys(models)) {
+      if (key.startsWith(`${modelId}-`) || key.startsWith(`${modelId}.`)) {
+        const v = models[key]?.limit?.context;
+        if (typeof v === "number" && v > 0) return v;
+      }
+    }
+    return null;
+  };
+  const primary = contextOf(catalog[providerKey]?.models);
+  if (primary) return primary;
+  for (const key of Object.keys(catalog)) {
+    const v = contextOf(catalog[key]?.models);
+    if (v) return v;
+  }
+  return null;
+}
+
+// 给 message.usage 填充 contextLimit(基于 msg.modelId 查 models.dev)。cache 未加载或
+// 匹配不到时填 null(降级:前端只显示分子)。已填则跳过,避免重复 findModel。
+function fillContextLimit(msg: Message) {
+  if (!msg.usage || typeof msg.usage !== "object") return;
+  const usage = msg.usage as Record<string, unknown>;
+  if (usage.contextLimit !== undefined) return;
+  if (!msg.modelId || !modelsDevCache) {
+    usage.contextLimit = null;
+    return;
+  }
+  const found = findModel(msg.modelId);
+  if (!found) {
+    usage.contextLimit = null;
+    return;
+  }
+  usage.contextLimit = lookupContextLimit(modelsDevCache, found.provider.type, found.model.modelId);
+}
+
+function appendUsageFromRaw(msg: Message | undefined, raw: any) {
+  if (!msg) return;
+  const usage = raw?.usage;
+  if (!usage || typeof usage !== "object") return;
+  // 流式过程中本函数会被多次调用(每个 usage delta),每次重设 msg.usage 对象会丢掉已填的
+  // contextLimit,触发 fillContextLimit 重查 models.dev。保留前值避免重复查找。
+  const prevContextLimit = (msg.usage as Record<string, unknown> | null)?.contextLimit;
+  msg.usage = {
+    promptTokens: Number(usage.prompt_tokens ?? usage.input_tokens ?? usage.promptTokens ?? 0),
+    completionTokens: Number(usage.completion_tokens ?? usage.output_tokens ?? usage.completionTokens ?? 0),
+    totalTokens: Number(usage.total_tokens ?? usage.totalTokens ?? 0),
+    cachedTokens: Number(usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens ?? usage.cachedTokens ?? 0),
+    ...(prevContextLimit !== undefined ? { contextLimit: prevContextLimit as number | null } : {}),
+  };
+  fillContextLimit(msg);
+}
+
+async function callProviderStreaming(conversation: Conversation, assistantMessage: Message, assistantNode: MessageNode, signal?: AbortSignal) {
+  const assistant = findAssistant(conversation.assistantId);
+  const picked = findModel(assistant.chatModelId ?? state.settings.chatModelId);
+  const providerItem = picked.provider;
+  const selectedModel = picked.model.modelId === "auto" ? "gpt-4o-mini" : picked.model.modelId;
+  const url = endpointFor(providerItem);
+  const headers = applyRequestHeaders(
+    { "Content-Type": "application/json", Authorization: `Bearer ${providerItem.apiKey}` },
+    assistant,
+    providerItem,
+    picked.model,
+  );
+  const messagesForApi = conversationMessagesForApi(
+    conversation,
+    assistant,
+    // 对齐 e63d017：OpenAI 类型 provider 才尊重 includeHistoryReasoning 选项；
+    // 默认 true，仅当用户显式关闭时才不回传历史 reasoning_content。
+    providerItem.type === "openai" ? providerItem.includeHistoryReasoning !== false : true,
+  );
+  const tools = supportsAbility(picked.model, "TOOL") ? [...openAiSearchTools(), ...openAiLocalTools(assistant), ...openAiSkillTools(assistant), ...openAiMcpTools(assistant)] : [];
+  if (providerItem.type !== "openai") {
+    return callProvider(conversation, signal, {
+      message: assistantMessage,
+      conversation,
+      node: assistantNode,
+    });
+  }
+  if (providerItem.useResponseApi) {
+    const responseTools = [
+      ...tools.map((tool: any) => ({
+        type: "function",
+        name: tool.function.name,
+        description: tool.function.description,
+        parameters: tool.function.parameters,
+      })),
+      ...responseApiBuiltInTools(picked.model),
+    ];
+    const systemContent = conversationResponseApiInstructions(conversation, assistant);
+    const reasoning = responseApiReasoningForProvider(providerItem, picked.model, assistant.reasoningLevel);
+    const include = responseApiIncludeForProvider(providerItem, picked.model);
+    const body = applyCustomBody({
+      model: selectedModel,
+      stream: true,
+      store: false,
+      ...(systemContent ? { instructions: systemContent } : {}),
+      input: conversationResponseApiInput(conversation, assistant),
+      ...(isModelAllowTemperature(picked.model) ? { temperature: assistant.temperature ?? undefined } : {}),
+      ...(isModelAllowTemperature(picked.model) ? { top_p: assistant.topP ?? undefined } : {}),
+      ...(assistant.maxTokens != null ? { max_output_tokens: assistant.maxTokens } : {}),
+      ...(reasoning ? { reasoning } : {}),
+      ...(include ? { include } : {}),
+      tools: responseTools.length ? responseTools : undefined,
+    }, assistant, picked.model);
+    return fetchOpenAiTextStreaming(url, headers, body, providerItem, assistant, {
+      message: assistantMessage,
+      conversation,
+      node: assistantNode,
+    }, signal);
+  }
+  const body = applyCustomBody({
+    model: selectedModel,
+    messages: messagesForApi,
+    temperature: isModelAllowTemperature(picked.model) ? assistant.temperature ?? undefined : undefined,
+    top_p: isModelAllowTemperature(picked.model) ? assistant.topP ?? undefined : undefined,
+    max_tokens: assistant.maxTokens ?? undefined,
+    ...(providerItem.type === "openai" ? { modalities: openAiChatCompletionsModalities(picked.model, providerItem) } : {}),
+    ...reasoningPayloadForProvider(providerItem, picked.model, assistant.reasoningLevel),
+    tools: tools.length ? tools : undefined,
+    tool_choice: tools.length ? "auto" : undefined,
+    stream: true,
+    stream_options: hostOfProvider(providerItem) === "api.mistral.ai" ? undefined : { include_usage: true },
+  }, assistant, picked.model);
+  return fetchOpenAiTextStreaming(url, headers, body, providerItem, assistant, {
+    message: assistantMessage,
+    conversation,
+    node: assistantNode,
+  }, signal);
+}
+
+async function fetchText(
+  url: string,
+  headers: Record<string, string>,
+  body: JsonValue | object,
+  providerItem: Provider,
+  pick: (raw: any) => string | undefined,
+  signal?: AbortSignal,
+) {
+  const started = Date.now();
+  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
+  const rawText = await response.text();
+  let raw: any = {};
+  try {
+    raw = rawText ? JSON.parse(rawText) : {};
+  } catch {
+    raw = { text: rawText };
+  }
+  addLog({
+    providerId: providerItem.id,
+    providerName: providerItem.name,
+    url,
+    ok: response.ok,
+    status: response.status,
+    kind: "provider:chat",
+    durationMs: Date.now() - started,
+    method: "POST",
+    requestHeaders: headers,
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    requestBody: jsonBody(body),
+    responseBody: textBody(rawText),
+    error: response.ok ? undefined : textBody(rawText),
+  });
+  if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${rawText.slice(0, 500)}`);
+  return pick(raw)?.trim() || "(empty response)";
+}
+
+function claudeTextFromContent(content: any[]) {
+  return content
+    .map((item) => {
+      if (!isRecord(item)) return "";
+      if (typeof item.text === "string") return item.text;
+      if (typeof item.thinking === "string") return "";
+      return "";
+    })
+    .join("")
+    .trim();
+}
+
+async function streamClaudeChat(
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, any>,
+  providerItem: Provider,
+  signal: AbortSignal | undefined,
+  hooks: StreamHooks,
+) {
+  const started = Date.now();
+  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
+  if (!response.ok) {
+    const text = await response.text();
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url,
+      ok: false,
+      status: response.status,
+      kind: "provider:chat:stream",
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders: headers,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody(body),
+      responseBody: textBody(text),
+      error: textBody(text),
+    });
+    throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
+  }
+  let usage: Message["usage"] | undefined;
+  const full = await readClaudeStream(response, (text, raw) => {
+    if (text) addStreamText(hooks, text);
+    if (raw && isRecord(raw) && (raw.usage || raw.message?.usage)) {
+      const u: any = raw.usage ?? raw.message?.usage;
+      if (u) {
+        const promptTokens = Number(u.input_tokens ?? 0);
+        const completionTokens = Number(u.output_tokens ?? 0);
+        usage = {
+          promptTokens,
+          completionTokens,
+          totalTokens: promptTokens + completionTokens,
+          cachedTokens: Number(u.cache_read_input_tokens ?? 0),
+        };
+      }
+    }
+  }, signal);
+  if (hooks.message && usage) hooks.message.usage = usage;
+  addLog({
+    providerId: providerItem.id,
+    providerName: providerItem.name,
+    url,
+    ok: true,
+    status: response.status,
+    kind: "provider:chat:stream",
+    durationMs: Date.now() - started,
+    method: "POST",
+    requestHeaders: headers,
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    requestBody: jsonBody(body),
+    responseBody: textBody(full),
+  });
+  return full || "(empty response)";
+}
+
+// Per-round Claude SSE reader. Returns the assistant content blocks captured during the stream
+// plus stop_reason + usage. Text/thinking/input_json deltas are emitted to the live UI as they
+// arrive. This is the building block of streamClaudeChatWithTools — we drive a tool loop on top
+// where the outer code dispatches tools and re-streams.
+type ClaudeStreamRoundResult = {
+  blocks: Array<Record<string, any>>;
+  textOut: string;
+  thinkingOut: string;
+  stopReason: string | null;
+  usage: Message["usage"] | undefined;
+  raw: string;
+};
+
+async function readClaudeStreamingRound(
+  response: Response,
+  hooks: StreamHooks,
+  assistant: Assistant,
+  signal?: AbortSignal,
+): Promise<ClaudeStreamRoundResult> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    return { blocks: [], textOut: "", thinkingOut: "", stopReason: null, usage: undefined, raw: "" };
+  }
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let raw = "";
+  // Index-keyed accumulators for the active content blocks. Claude emits content_block_start
+  // with an index, then deltas with the same index, then content_block_stop. We mirror that
+  // structure here so concurrent text + thinking + tool_use blocks all reconstruct correctly.
+  const blocks = new Map<number, Record<string, any>>();
+  let textOut = "";
+  let thinkingOut = "";
+  let stopReason: string | null = null;
+  let usage: Message["usage"] | undefined;
+  const setUsage = (u: any) => {
+    if (!u || typeof u !== "object") return;
+    const promptTokens = Number(u.input_tokens ?? 0);
+    const completionTokens = Number(u.output_tokens ?? 0);
+    usage = {
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens + completionTokens,
+      cachedTokens: Number(u.cache_read_input_tokens ?? 0),
+    };
+  };
+  const handleEvent = (eventName: string, dataJson: any) => {
+    if (!dataJson || typeof dataJson !== "object") return;
+    if (eventName === "message_start") {
+      const u = dataJson.message?.usage;
+      if (u) setUsage(u);
+      return;
+    }
+    if (eventName === "message_delta") {
+      if (dataJson.delta?.stop_reason) stopReason = String(dataJson.delta.stop_reason);
+      if (dataJson.usage) setUsage(dataJson.usage);
+      return;
+    }
+    if (eventName === "message_stop") return;
+    if (eventName === "error") {
+      const errMessage = dataJson.error?.message ?? "Claude stream error";
+      throw new Error(String(errMessage));
+    }
+    const index = typeof dataJson.index === "number" ? dataJson.index : -1;
+    if (eventName === "content_block_start") {
+      const block = dataJson.content_block ?? {};
+      blocks.set(index, { ...block, _inputBuffer: "" });
+      const type = String(block.type ?? "");
+      if (type === "tool_use") {
+        // Insert/refresh a Tool part immediately so the user sees the tool card appear right
+        // when Claude announces the call, even before the input_json_delta arrives.
+        if (hooks.message) {
+          finishReasoningParts(hooks.message);
+          const toolPart: JsonValue = {
+            type: "tool",
+            toolCallId: String(block.id ?? ""),
+            toolName: String(block.name ?? ""),
+            input: "",
+            output: [],
+            approvalState: initialApprovalState(String(block.name ?? ""), assistant),
+          };
+          replaceLoadingReasoningWithTool(hooks.message, toolPart);
+          touchStream(hooks);
+        }
+      } else if (type === "text" && block.text) {
+        textOut += block.text;
+        addStreamText(hooks, String(block.text));
+      } else if (type === "thinking" && block.thinking) {
+        thinkingOut += block.thinking;
+        appendReasoningDelta(hooks, String(block.thinking));
+      }
+      return;
+    }
+    if (eventName === "content_block_delta") {
+      const delta = dataJson.delta ?? {};
+      const dtype = String(delta.type ?? "");
+      const block = blocks.get(index) ?? {};
+      if (dtype === "text_delta" && typeof delta.text === "string") {
+        textOut += delta.text;
+        addStreamText(hooks, delta.text);
+      } else if (dtype === "thinking_delta" && typeof delta.thinking === "string") {
+        thinkingOut += delta.thinking;
+        appendReasoningDelta(hooks, delta.thinking);
+      } else if (dtype === "signature_delta" && typeof delta.signature === "string") {
+        block.signature = String(block.signature ?? "") + delta.signature;
+        blocks.set(index, block);
+      } else if (dtype === "input_json_delta" && typeof delta.partial_json === "string") {
+        block._inputBuffer = String(block._inputBuffer ?? "") + delta.partial_json;
+        blocks.set(index, block);
+        // Stream the partial input into the tool part so users see argument JSON taking shape.
+        if (hooks.message && block.type === "tool_use") {
+          const targetId = String(block.id ?? "");
+          if (targetId) {
+            hooks.message.parts = hooks.message.parts.map((part) => {
+              if (!isRecord(part) || part.type !== "tool" || part.toolCallId !== targetId) return part;
+              return { ...part, input: block._inputBuffer };
+            });
+            touchStream(hooks);
+          }
+        }
+      }
+      return;
+    }
+    if (eventName === "content_block_stop") {
+      const block = blocks.get(index);
+      if (!block) return;
+      if (block.type === "tool_use" && block._inputBuffer) {
+        // Finalize tool input as parsed object.
+        try {
+          block.input = JSON.parse(block._inputBuffer);
+        } catch {
+          block.input = block._inputBuffer;
+        }
+      }
+      delete block._inputBuffer;
+      blocks.set(index, block);
+      return;
+    }
+  };
+  let currentEvent = "message";
+  for (;;) {
+    if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    raw += chunk;
+    buffer += chunk;
+    // SSE frames are separated by a blank line. Inside a frame, lines starting with `event:`
+    // set the event type and `data:` lines contribute payload (concatenated). Anthropic
+    // always uses single-line data, but we handle the general case.
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      let eventName = "message";
+      const dataLines: string[] = [];
+      for (const line of frame.split(/\r?\n/)) {
+        if (line.startsWith("event:")) eventName = line.slice(6).trim() || "message";
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+      }
+      currentEvent = eventName;
+      const data = dataLines.join("\n");
+      if (!data || data === "[DONE]") continue;
+      try {
+        handleEvent(eventName, JSON.parse(data));
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith("Claude stream error")) throw err;
+        // Ignore malformed fragments — Anthropic occasionally pings.
+      }
+    }
+  }
+  // Drain the trailing partial frame if any.
+  if (buffer.trim()) {
+    let eventName = "message";
+    const dataLines: string[] = [];
+    for (const line of buffer.split(/\r?\n/)) {
+      if (line.startsWith("event:")) eventName = line.slice(6).trim() || "message";
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+    }
+    currentEvent = eventName;
+    const data = dataLines.join("\n");
+    if (data && data !== "[DONE]") {
+      try {
+        handleEvent(eventName, JSON.parse(data));
+      } catch {
+        // ignore
+      }
+    }
+  }
+  const orderedBlocks = [...blocks.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, block]) => block);
+  void currentEvent;
+  return { blocks: orderedBlocks, textOut, thinkingOut, stopReason, usage, raw };
+}
+
+async function streamClaudeChatWithTools(
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, any>,
+  providerItem: Provider,
+  assistant: Assistant,
+  signal: AbortSignal | undefined,
+  hooks: StreamHooks,
+) {
+  let messages = Array.isArray(body.messages) ? [...body.messages] : [];
+  let currentBody = { ...body, messages, stream: true };
+  let allContent = "";
+  for (let round = 0; round < MAX_TOOL_STEPS; round += 1) {
+    if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
+    const roundStarted = Date.now();
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { ...headers, Accept: "text/event-stream" },
+      body: JSON.stringify(currentBody),
+      signal,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      addLog({
+        providerId: providerItem.id,
+        providerName: providerItem.name,
+        url,
+        ok: false,
+        status: response.status,
+        kind: round === 0 ? "provider:chat:stream" : "provider:chat:tool_result:stream",
+        durationMs: Date.now() - roundStarted,
+        method: "POST",
+        requestHeaders: headers,
+        responseHeaders: Object.fromEntries(response.headers.entries()),
+        requestBody: jsonBody(currentBody),
+        responseBody: textBody(text),
+        error: textBody(text),
+      });
+      throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
+    }
+    const round_ = await readClaudeStreamingRound(response, hooks, assistant, signal);
+    if (hooks.message && round_.usage) hooks.message.usage = round_.usage;
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url,
+      ok: true,
+      status: response.status,
+      kind: round === 0 ? "provider:chat:stream" : "provider:chat:tool_result:stream",
+      durationMs: Date.now() - roundStarted,
+      method: "POST",
+      requestHeaders: headers,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody(currentBody),
+      responseBody: textBody(round_.raw),
+    });
+    if (round_.textOut) {
+      allContent += `${allContent ? "\n" : ""}${round_.textOut}`;
+    }
+    // Collect tool_use blocks and dispatch them.
+    const toolUses = round_.blocks.filter((b) => b.type === "tool_use");
+    if (toolUses.length === 0) {
+      finishReasoningParts(hooks.message!);
+      return allContent.trim() || "(empty response)";
+    }
+    const toolResultBlocks: Array<Record<string, JsonValue>> = [];
+    // Pre-scan for any tool that requires user approval. Anthropic requires every tool_use to
+    // be answered by a tool_result in the next turn, so we can't execute a mixed batch where
+    // some tools are pending — the safest correct behavior is to render the pending tool
+    // cards (already created during the stream above) and bail out of the turn. generateAnswer
+    // will see hasPendingToolApproval and pause until the user approves/denies.
+    const hasPendingInBatch = toolUses.some((toolUse) => toolNeedsApproval(String(toolUse.name ?? ""), assistant));
+    if (hasPendingInBatch) {
+      return allContent.trim() || "";
+    }
+    for (const toolUse of toolUses) {
+      const toolCallId = String(toolUse.id ?? id());
+      const toolName = String(toolUse.name ?? "");
+      const toolInput = isRecord(toolUse.input)
+        ? toolUse.input
+        : (typeof toolUse.input === "string" && toolUse.input ? safeJsonParse(toolUse.input) : {});
+      const toolCall = {
+        id: toolCallId,
+        type: "function" as const,
+        function: {
+          name: toolName,
+          arguments: JSON.stringify(toolInput ?? {}),
+        },
+      };
+      // The tool part was already created during the stream — find it and run the tool.
+      let toolResult: unknown;
+      try {
+        toolResult = await executeToolCall(toolCall, assistant);
+      } catch (err) {
+        toolResult = toolExecutionErrorPayload(err);
+      }
+      const outputParts = await toolResultToParts(toolResult);
+      if (hooks.message) {
+        hooks.message.parts = hooks.message.parts.map((part) => {
+          if (!isRecord(part) || part.type !== "tool" || part.toolCallId !== toolCallId) return part;
+          return { ...part, input: toolCall.function.arguments, output: outputParts as unknown as JsonValue };
+        });
+        touchStream(hooks);
+      }
+      toolResultBlocks.push({
+        type: "tool_result",
+        tool_use_id: toolCallId,
+        content: claudeBlocksFromUiParts(outputParts) as unknown as JsonValue,
+      });
+    }
+    // Anthropic requires us to echo the assistant's content blocks verbatim (including the
+    // tool_use entries) before sending the tool_result user turn. Strip our internal markers
+    // and pass the rest through.
+    const assistantBlocksForReplay = round_.blocks
+      .filter((block) => block && (block.type === "text" || block.type === "thinking" || block.type === "tool_use"))
+      .map((block) => {
+        if (block.type === "tool_use") {
+          return { type: "tool_use", id: block.id, name: block.name, input: block.input ?? {} };
+        }
+        if (block.type === "thinking") {
+          return block.signature
+            ? { type: "thinking", thinking: block.thinking ?? "", signature: block.signature }
+            : { type: "thinking", thinking: block.thinking ?? "" };
+        }
+        return { type: "text", text: block.text ?? "" };
+      });
+    messages = [
+      ...messages,
+      { role: "assistant", content: assistantBlocksForReplay },
+      { role: "user", content: toolResultBlocks },
+    ];
+    currentBody = { ...body, messages, stream: true };
+  }
+  throw new Error("Too many consecutive Claude tool calls without final assistant content");
+}
+
+function safeJsonParse(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
+  }
+}
+
+async function fetchClaudeTextWithTools(
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, any>,
+  providerItem: Provider,
+  assistant: Assistant,
+  signal?: AbortSignal,
+  hooks?: StreamHooks,
+) {
+  let messages = Array.isArray(body.messages) ? [...body.messages] : [];
+  let currentBody = { ...body, messages, stream: false };
+  let allContent = "";
+
+  for (let round = 0; round < MAX_TOOL_STEPS; round += 1) {
+    const started = Date.now();
+    const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(currentBody), signal });
+    const rawText = await response.text();
+    let raw: any = {};
+    try {
+      raw = rawText ? JSON.parse(rawText) : {};
+    } catch {
+      raw = { text: rawText };
+    }
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url,
+      ok: response.ok,
+      status: response.status,
+      kind: round === 0 ? "provider:chat" : "provider:chat:tool_result",
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders: headers,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody(currentBody),
+      responseBody: textBody(rawText),
+      error: response.ok ? undefined : textBody(rawText),
+    });
+    if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${rawText.slice(0, 500)}`);
+
+    const content = Array.isArray(raw.content) ? raw.content : [];
+    const text = claudeTextFromContent(content);
+    if (text) {
+      allContent += `${allContent ? "\n" : ""}${text}`;
+      addStreamText(hooks, text);
+    }
+    const toolUses = content.filter((item) => isRecord(item) && item.type === "tool_use");
+    if (toolUses.length === 0) return allContent.trim() || "(empty response)";
+
+    const toolResultBlocks = [];
+    // Same rationale as the stream path: bail out of the turn if any tool needs approval so
+    // we don't end up sending an unanswered tool_use to Anthropic on the next turn.
+    const hasPendingInBatch = toolUses.some((toolUse) => toolNeedsApproval(String(toolUse.name ?? ""), assistant));
+    for (const toolUse of toolUses) {
+      const toolCall = {
+        id: String(toolUse.id ?? id()),
+        type: "function",
+        function: {
+          name: String(toolUse.name ?? ""),
+          arguments: JSON.stringify(isRecord(toolUse.input) ? toolUse.input : {}),
+        },
+      };
+      const toolPart: JsonValue = {
+        type: "tool",
+        toolCallId: toolCall.id,
+        toolName: toolCall.function.name,
+        input: toolCall.function.arguments,
+        output: [],
+        approvalState: initialApprovalState(toolCall.function.name, assistant),
+      };
+      if (hooks?.message) {
+        finishReasoningParts(hooks.message);
+        replaceLoadingReasoningWithTool(hooks.message, toolPart);
+        touchStream(hooks);
+      }
+      if (hasPendingInBatch) {
+        // Tool card is in pending state; skip execution and let the rest of the batch land
+        // as pending cards too (so the UI shows the full set of decisions to approve/deny).
+        continue;
+      }
+      let toolResult: unknown;
+      try {
+        toolResult = await executeToolCall(toolCall, assistant);
+      } catch (err) {
+        toolResult = toolExecutionErrorPayload(err);
+      }
+      const outputParts = await toolResultToParts(toolResult);
+      (toolPart as Record<string, JsonValue>).output = outputParts as unknown as JsonValue;
+      touchStream(hooks);
+      toolResultBlocks.push({
+        type: "tool_result",
+        tool_use_id: toolCall.id,
+        content: claudeBlocksFromUiParts(outputParts),
+      });
+    }
+    if (hasPendingInBatch) {
+      return allContent.trim() || "";
+    }
+
+    messages = [
+      ...messages,
+      { role: "assistant", content },
+      { role: "user", content: toolResultBlocks },
+    ];
+    currentBody = { ...body, messages, stream: false };
+  }
+
+  throw new Error("Too many consecutive Claude tool calls without final assistant content");
+}
+
+// ===== Google / Gemini 流式 + 工具循环 =====
+// 镜像安卓 GoogleProvider.streamText：通过 streamGenerateContent?alt=sse 拿到 SSE，
+// 逐 chunk 解析 candidates[].content.parts，区分 thought(reasoning) / text / inlineData(图片)
+// / functionCall，并把增量推给实时 UI。返回该轮的聚合结果供工具循环驱动。
+type GoogleStreamRoundResult = {
+  textOut: string;
+  thinkingOut: string;
+  functionCalls: Array<{ id: string; name: string; args: Record<string, JsonValue>; thoughtSignature?: string }>;
+  modelParts: Record<string, JsonValue>[];
+  usage: Message["usage"] | undefined;
+  raw: string;
+};
+
+function googleUsageFromMeta(meta: any): Message["usage"] | undefined {
+  if (!meta || typeof meta !== "object") return undefined;
+  const promptTokens = Number(meta.promptTokenCount ?? 0);
+  const thoughtTokens = Number(meta.thoughtsTokenCount ?? 0);
+  const candidatesTokens = Number(meta.candidatesTokenCount ?? 0);
+  return {
+    promptTokens,
+    completionTokens: candidatesTokens + thoughtTokens,
+    totalTokens: Number(meta.totalTokenCount ?? 0),
+    cachedTokens: Number(meta.cachedContentTokenCount ?? 0),
+  };
+}
+
+async function readGoogleStreamingRound(
+  response: Response,
+  hooks: StreamHooks,
+  assistant: Assistant,
+  signal?: AbortSignal,
+): Promise<GoogleStreamRoundResult> {
+  const reader = response.body?.getReader();
+  const result: GoogleStreamRoundResult = {
+    textOut: "",
+    thinkingOut: "",
+    functionCalls: [],
+    modelParts: [],
+    usage: undefined,
+    raw: "",
+  };
+  if (!reader) return result;
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  const handleChunk = (raw: any) => {
+    if (!raw || typeof raw !== "object") return;
+    const blockReason = raw.promptFeedback?.blockReason;
+    if (blockReason) throw new Error(`Gemini blocked: ${blockReason}`);
+    const meta = raw.usageMetadata;
+    if (meta) result.usage = googleUsageFromMeta(meta) ?? result.usage;
+    const candidate = raw.candidates?.[0];
+    const parts = candidate?.content?.parts;
+    if (!Array.isArray(parts)) return;
+    for (const part of parts) {
+      if (!isRecord(part)) continue;
+      if (typeof part.text === "string" && part.text) {
+        if (part.thought === true) {
+          result.thinkingOut += part.text;
+          appendReasoningDelta(hooks, part.text);
+        } else {
+          result.textOut += part.text;
+          result.modelParts.push({ text: part.text });
+          addStreamText(hooks, part.text);
+        }
+      } else if (isRecord(part.inlineData)) {
+        const mime = String((part.inlineData as any).mimeType ?? "image/png");
+        const data = String((part.inlineData as any).data ?? "");
+        if (part.thought === true) {
+          // 思考过程中的草稿图直接忽略，对齐安卓 parseMessagePart。
+          continue;
+        }
+        if (data && mime.startsWith("image/")) {
+          addStreamImage(hooks, `data:${mime};base64,${data}`);
+        }
+      } else if (isRecord(part.functionCall)) {
+        const fc = part.functionCall as any;
+        const name = String(fc.name ?? "");
+        if (!name) continue;
+        const args = isRecord(fc.args) ? (fc.args as Record<string, JsonValue>) : {};
+        const thoughtSignature = part.thoughtSignature != null ? String(part.thoughtSignature) : undefined;
+        const callId = id();
+        result.functionCalls.push({ id: callId, name, args, thoughtSignature });
+        result.modelParts.push({
+          functionCall: { name, args },
+          ...(thoughtSignature ? { thoughtSignature } : {}),
+        });
+        if (hooks.message) {
+          finishReasoningParts(hooks.message);
+          replaceLoadingReasoningWithTool(hooks.message, {
+            type: "tool",
+            toolCallId: callId,
+            toolName: name,
+            input: JSON.stringify(args),
+            output: [],
+            approvalState: initialApprovalState(name, assistant),
+          });
+          touchStream(hooks);
+        }
+      }
+    }
+  };
+
+  for (;;) {
+    if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    result.raw += chunk;
+    buffer += chunk;
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      for (const payload of parseSseChunks(frame)) {
+        if (!payload || payload === "[DONE]") continue;
+        try {
+          handleChunk(JSON.parse(payload));
+        } catch (err) {
+          if (err instanceof Error && (err.message.startsWith("Gemini blocked") || err.message.startsWith("Gemini "))) throw err;
+          // 忽略 Gemini 偶发的非 JSON 行
+        }
+      }
+    }
+  }
+  if (buffer.trim()) {
+    for (const payload of parseSseChunks(buffer)) {
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        handleChunk(JSON.parse(payload));
+      } catch {
+        // ignore trailing fragment
+      }
+    }
+  }
+  return result;
+}
+
+// 驱动 Gemini 的流式工具循环。镜像安卓 GenerationHandler 的 step 循环 + GoogleProvider.streamText：
+// 每轮拿到 functionCall 就执行工具，把 functionResponse 作为 user 消息追加，再发起下一轮，
+// 直到模型不再请求工具。无 hooks（辅助调用）时不会走到这里。
+async function streamGoogleChatWithTools(
+  baseUrl: string,
+  headers: Record<string, string>,
+  apiKey: string,
+  modelId: string,
+  body: Record<string, any>,
+  providerItem: Provider,
+  assistant: Assistant,
+  signal: AbortSignal | undefined,
+  hooks: StreamHooks,
+) {
+  const streamUrl = `${baseUrl.replace(/\/+$/, "")}/models/${modelId}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
+  let contents = Array.isArray(body.contents) ? [...body.contents] : [];
+  let currentBody = { ...body, contents };
+  let allContent = "";
+  for (let round = 0; round < MAX_TOOL_STEPS; round += 1) {
+    if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
+    const roundStarted = Date.now();
+    const response = await fetch(streamUrl, {
+      method: "POST",
+      headers: { ...headers, Accept: "text/event-stream" },
+      body: JSON.stringify(currentBody),
+      signal,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      addLog({
+        providerId: providerItem.id,
+        providerName: providerItem.name,
+        url: streamUrl,
+        ok: false,
+        status: response.status,
+        kind: round === 0 ? "provider:chat:stream" : "provider:chat:tool_result:stream",
+        durationMs: Date.now() - roundStarted,
+        method: "POST",
+        requestHeaders: headers,
+        responseHeaders: Object.fromEntries(response.headers.entries()),
+        requestBody: jsonBody(currentBody),
+        responseBody: textBody(text),
+        error: textBody(text),
+      });
+      throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
+    }
+    const round_ = await readGoogleStreamingRound(response, hooks, assistant, signal);
+    if (hooks.message && round_.usage) hooks.message.usage = round_.usage;
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url: streamUrl,
+      ok: true,
+      status: response.status,
+      kind: round === 0 ? "provider:chat:stream" : "provider:chat:tool_result:stream",
+      durationMs: Date.now() - roundStarted,
+      method: "POST",
+      requestHeaders: headers,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody(currentBody),
+      responseBody: textBody(round_.raw),
+    });
+    if (round_.textOut) {
+      allContent += `${allContent ? "\n" : ""}${round_.textOut}`;
+    }
+    if (round_.functionCalls.length === 0) {
+      finishReasoningParts(hooks.message!);
+      return allContent.trim() || "(empty response)";
+    }
+    // 任何工具需要审批就暂停本轮，等用户决定（与 Claude/OpenAI 路径一致）。
+    const hasPendingInBatch = round_.functionCalls.some((fc) => toolNeedsApproval(fc.name, assistant));
+    if (hasPendingInBatch) {
+      return allContent.trim() || "";
+    }
+    const responseParts: Record<string, JsonValue>[] = [];
+    for (const fc of round_.functionCalls) {
+      const toolCall = {
+        id: fc.id,
+        type: "function" as const,
+        function: { name: fc.name, arguments: JSON.stringify(fc.args ?? {}) },
+      };
+      let toolResult: unknown;
+      try {
+        toolResult = await executeToolCall(toolCall, assistant);
+      } catch (err) {
+        toolResult = toolExecutionErrorPayload(err);
+      }
+      const outputParts = await toolResultToParts(toolResult);
+      if (hooks.message) {
+        hooks.message.parts = hooks.message.parts.map((part) => {
+          if (!isRecord(part) || part.type !== "tool" || part.toolCallId !== fc.id) return part;
+          return { ...part, input: toolCall.function.arguments, output: outputParts as unknown as JsonValue };
+        });
+        touchStream(hooks);
+      }
+      responseParts.push({
+        functionResponse: { name: fc.name, response: { result: apiContentText(partsToToolResultText(outputParts)) } },
+      });
+    }
+    // Gemini 要求把模型这轮的 parts（含 functionCall）原样回放，再追加 user 的 functionResponse。
+    contents = [
+      ...contents,
+      { role: "model", parts: round_.modelParts.length ? round_.modelParts : [{ text: round_.textOut }] },
+      { role: "user", parts: responseParts },
+    ];
+    currentBody = { ...body, contents };
+  }
+  throw new Error("Too many consecutive Gemini tool calls without final assistant content");
+}
+
+// functionResponse 的 result 文本：把工具输出 parts 拼成纯文本，对齐安卓
+// toFunctionResponsePart（只取 Text part 拼接）。
+function partsToToolResultText(parts: JsonValue[]): string {
+  if (!Array.isArray(parts)) return "";
+  return parts
+    .map((part) => (isRecord(part) && part.type === "text" ? String(part.text ?? "") : ""))
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function fetchOpenAiText(
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, any>,
+  providerItem: Provider,
+  assistant: Assistant,
+  signal?: AbortSignal,
+  hooks?: StreamHooks,
+) {
+  let messages = Array.isArray(body.messages) ? [...body.messages] : [];
+  let currentBody = { ...body, messages, stream: false };
+  let allContent = "";
+  for (let round = 0; round < MAX_TOOL_STEPS; round += 1) {
+    const started = Date.now();
+    const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(currentBody), signal });
+    const rawText = await response.text();
+    let raw: any = {};
+    try {
+      raw = rawText ? JSON.parse(rawText) : {};
+    } catch {
+      raw = { text: rawText };
+    }
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url,
+      ok: response.ok,
+      status: response.status,
+      kind: round === 0 ? "provider:chat" : "provider:chat:tool_result",
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders: headers,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody(currentBody),
+      responseBody: textBody(rawText),
+      error: response.ok ? undefined : textBody(rawText),
+    });
+    if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${rawText.slice(0, 500)}`);
+
+    const assistantMessage = raw.choices?.[0]?.message ?? {};
+    const content = completionMessageText(raw);
+    if (content) {
+      allContent += content;
+      addStreamText(hooks, content);
+    }
+    const toolCalls = Array.isArray(assistantMessage.tool_calls) ? assistantMessage.tool_calls : [];
+    if (toolCalls.length === 0) return allContent.trim() || "(empty response)";
+
+    const toolMessages = [];
+    const hasPendingInBatch = toolCalls.some((toolCall: any) => toolNeedsApproval(String(toolCall?.function?.name ?? ""), assistant));
+    for (const toolCall of toolCalls) {
+      const toolPart: JsonValue = {
+        type: "tool",
+        toolCallId: String(toolCall.id ?? id()),
+        toolName: String(toolCall.function?.name ?? ""),
+        input: String(toolCall.function?.arguments ?? "{}"),
+        output: [],
+        approvalState: initialApprovalState(String(toolCall.function?.name ?? ""), assistant),
+      };
+      if (hooks?.message) {
+        finishReasoningParts(hooks.message);
+        replaceLoadingReasoningWithTool(hooks.message, toolPart);
+        touchStream(hooks);
+      }
+      if (hasPendingInBatch) {
+        continue;
+      }
+      let toolResult: unknown;
+      try {
+        toolResult = await executeToolCall(toolCall, assistant);
+      } catch (err) {
+        toolResult = toolExecutionErrorPayload(err);
+      }
+      const outputParts = await toolResultToParts(toolResult);
+      (toolPart as Record<string, JsonValue>).output = outputParts as unknown as JsonValue;
+      touchStream(hooks);
+      toolMessages.push({
+        role: "tool",
+        tool_call_id: (toolPart as Record<string, JsonValue>).toolCallId,
+        content: openAiToolOutput(outputParts),
+      });
+    }
+    if (hasPendingInBatch) {
+      return allContent.trim() || "";
+    }
+    messages = [
+      ...messages,
+      compactAssistantToolMessage(
+        content,
+        toolCalls,
+        String(assistantMessage.reasoning_content ?? assistantMessage.reasoning ?? ""),
+      ),
+      ...toolMessages,
+    ];
+    currentBody = { ...body, messages, stream: false };
+  }
+  throw new Error("Too many consecutive tool calls without final assistant content");
+}
+
+function responseMessageText(raw: any): string {
+  const chunks: string[] = [];
+  const walk = (value: any) => {
+    if (value == null) return;
+    if (typeof value === "string") {
+      chunks.push(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(walk);
+      return;
+    }
+    if (typeof value !== "object") return;
+    const type = String(value.type ?? "");
+    if (
+      typeof value.text === "string" &&
+      (!type || type === "text" || type === "output_text" || type === "message")
+    ) {
+      chunks.push(value.text);
+    }
+    if (type === "image_generation_call" && typeof value.result === "string") {
+      chunks.push(`\n\n![generated image](${normalizeGeneratedImageUrl(value.result)})\n\n`);
+    }
+    if (typeof value.content === "string") chunks.push(value.content);
+    if (value.content) walk(value.content);
+    if (value.output_text) walk(value.output_text);
+  };
+  if (typeof raw.output_text === "string") chunks.push(raw.output_text);
+  walk(raw.output);
+  return chunks.join("").trim();
+}
+
+function completionMessageText(raw: any): string {
+  const message = raw.choices?.[0]?.message ?? raw.choices?.[0]?.delta ?? {};
+  const content = message.content;
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .map((item: any) => typeof item === "string" ? item : String(item?.text ?? item?.content ?? ""))
+      .join("")
+      .trim();
+  }
+  return responseMessageText(raw);
+}
+
+function parseSseChunks(text: string) {
+  return text
+    .split(/\n\n+/)
+    .flatMap((block) => {
+      const data = block
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim())
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+      if (!data) return [];
+      if (data === "[DONE]") return [data];
+      return data
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    });
+}
+
+function responseEventToDelta(raw: any) {
+  const type = String(raw.type ?? "");
+  if (type === "response.output_text.delta") return { content: String(raw.delta ?? "") };
+  if (type === "response.reasoning_summary_text.delta" || type === "response.reasoning_text.delta") {
+    return { reasoning_content: String(raw.delta ?? "") };
+  }
+  if (type === "response.output_item.added") {
+    const item = raw.item ?? {};
+    if (item.type === "image_generation_call") {
+      return {
+        image_url: "",
+        metadata: { openai_image_call_id: String(item.id ?? "") },
+      };
+    }
+    if (item.type === "reasoning") {
+      return {
+        reasoning_content: "",
+        metadata: {
+          reasoning_id: String(item.id ?? ""),
+          encrypted_content: String(item.encrypted_content ?? ""),
+        },
+      };
+    }
+    if (item.type === "function_call") {
+      return {
+        tool_calls: [{
+          index: Number(raw.output_index ?? 0),
+          id: String(item.call_id ?? item.id ?? ""),
+          type: "function",
+          function: {
+            name: String(item.name ?? ""),
+            arguments: String(item.arguments ?? ""),
+          },
+        }],
+      };
+    }
+  }
+  if (type === "response.output_item.done") {
+    const item = raw.item ?? {};
+    if (item.type === "image_generation_call") {
+      return {
+        image_url: String(item.result ?? ""),
+        metadata: { openai_image_call_id: String(item.id ?? "") },
+      };
+    }
+    if (item.type === "reasoning") {
+      const summary = Array.isArray(item.summary)
+        ? item.summary.map((part: any) => String(part?.text ?? "")).join("")
+        : "";
+      return {
+        reasoning_content: summary,
+        metadata: {
+          reasoning_id: String(item.id ?? ""),
+          encrypted_content: String(item.encrypted_content ?? ""),
+        },
+        _rikkahubSnapshot: true,
+      };
+    }
+  }
+  if (type === "response.function_call_arguments.delta") {
+    return {
+      tool_calls: [{
+        index: Number(raw.output_index ?? 0),
+        id: String(raw.item_id ?? raw.call_id ?? ""),
+        type: "function",
+        function: { name: "", arguments: String(raw.delta ?? "") },
+      }],
+    };
+  }
+  if (type === "response.function_call_arguments.done") {
+    return {
+      tool_calls: [{
+        index: Number(raw.output_index ?? 0),
+        id: String(raw.item_id ?? raw.call_id ?? ""),
+        type: "function",
+        function: { name: "", arguments: String(raw.arguments ?? "") },
+        _rikkahubSnapshot: true,
+      }],
+    };
+  }
+  return null;
+}
+
+function deltaTextContent(delta: any) {
+  if (typeof delta.content === "string") return delta.content;
+  if (typeof delta.text === "string") return delta.text;
+  if (typeof delta.output_text === "string") return delta.output_text;
+  if (Array.isArray(delta.content)) {
+    return delta.content
+      .map((item: any) => {
+        if (typeof item === "string") return item;
+        if (typeof item?.text === "string") return item.text;
+        if (typeof item?.delta === "string") return item.delta;
+        return "";
+      })
+      .join("");
+  }
+  return "";
+}
+
+function deltaReasoningContent(delta: any) {
+  const direct = delta.reasoning_content ?? delta.reasoning ?? delta.thinking ?? delta.reasoning_text ?? delta.reasoning_summary;
+  if (typeof direct === "string") return direct;
+  if (Array.isArray(delta.content)) {
+    return delta.content
+      .map((item: any) => {
+        if (typeof item?.thinking === "string") return item.thinking;
+        if (Array.isArray(item?.thinking)) return item.thinking.map((x: any) => String(x?.text ?? "")).join("");
+        if (item?.type === "reasoning" && typeof item?.text === "string") return item.text;
+        return "";
+      })
+      .join("");
+  }
+  return "";
+}
+
+async function readOpenAiStream(
+  response: Response,
+  onDelta: (delta: any, raw?: any) => { content?: string } | void,
+  signal?: AbortSignal,
+) {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let full = "";
+  const readWithIdleTimeout = async () => {
+    // Matches the 120s idle timeout in the other streaming reader (see server.ts:6063
+    // for full rationale — gist: drop from 10min to 2min so hung upstream connections
+    // release frontend pool slots before they impact unrelated requests).
+    const timeoutMs = 120_000;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise<ReadableStreamReadResult<Uint8Array>>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("Stream idle timeout: no data received for 10min")), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  };
+  for (;;) {
+    if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
+    const { done, value } = await readWithIdleTimeout();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split(/\n\n+/);
+    buffer = parts.pop() ?? "";
+    for (const part of parts) {
+      for (const payload of parseSseChunks(part)) {
+        if (payload === "[DONE]") continue;
+        try {
+          const raw = JSON.parse(payload);
+          const delta = raw.choices?.[0]?.delta ?? raw.choices?.[0]?.message ?? responseEventToDelta(raw) ?? {};
+          if (Object.keys(delta).length > 0) {
+            const applied = onDelta(delta, raw);
+            full += applied?.content ?? deltaTextContent(delta);
+          }
+        } catch {
+          // Ignore malformed stream fragments.
+        }
+      }
+    }
+  }
+  for (const payload of parseSseChunks(buffer)) {
+    if (payload === "[DONE]") continue;
+    try {
+      const raw = JSON.parse(payload);
+      const delta = raw.choices?.[0]?.delta ?? raw.choices?.[0]?.message ?? responseEventToDelta(raw) ?? {};
+      if (Object.keys(delta).length > 0) {
+        const applied = onDelta(delta, raw);
+        full += applied?.content ?? deltaTextContent(delta);
+      }
+    } catch {
+      // Ignore malformed trailing stream fragments.
+    }
+  }
+  return full;
+}
+
+function applyOpenAiDelta(
+  delta: any,
+  rawEvent: any,
+  hooks: StreamHooks,
+  toolCalls: any[],
+) {
+  appendUsageFromRaw(hooks.message, rawEvent);
+  let content = "";
+  let reasoning = "";
+  const isSnapshot = !!rawEvent?.choices?.[0]?.message;
+  const deltaMetadata = isRecord(delta.metadata) ? delta.metadata as Record<string, JsonValue> : undefined;
+  if (deltaMetadata && (deltaMetadata.reasoning_id || deltaMetadata.encrypted_content)) {
+    ensureReasoningPart(hooks, deltaMetadata);
+  }
+  const reasoningDelta = deltaReasoningContent(delta);
+  if (reasoningDelta) {
+    const currentReasoning = (isSnapshot || delta._rikkahubSnapshot) ? visibleReasoningFromMessage(hooks.message) : "";
+    const nextReasoning = (isSnapshot || delta._rikkahubSnapshot) && currentReasoning && reasoningDelta.startsWith(currentReasoning)
+      ? reasoningDelta.slice(currentReasoning.length)
+      : reasoningDelta;
+    if (nextReasoning) {
+      reasoning += nextReasoning;
+      appendReasoningDelta(hooks, nextReasoning, deltaMetadata);
+    }
+  }
+  const contentDelta = deltaTextContent(delta);
+  if (contentDelta) {
+    const currentText = isSnapshot ? visibleTextFromMessage(hooks.message) : "";
+    const nextContent = isSnapshot && currentText && contentDelta.startsWith(currentText)
+      ? contentDelta.slice(currentText.length)
+      : contentDelta;
+    if (nextContent) {
+      content += nextContent;
+      addStreamText(hooks, nextContent);
+    }
+  }
+  if (typeof delta.image_url === "string") {
+    addStreamImage(hooks, delta.image_url, isRecord(delta.metadata) ? delta.metadata as Record<string, JsonValue> : {});
+  }
+  if (Array.isArray(delta.tool_calls)) {
+    const mode = isSnapshot || delta.tool_calls.some((call: any) => call?._rikkahubSnapshot) ? "snapshot" : "delta";
+    mergeToolCallDeltas(toolCalls, delta.tool_calls, mode);
+  }
+  return { content, reasoning };
+}
+
+async function fetchOpenAiAuxiliaryStream(
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, any>,
+  providerItem: Provider,
+  onDelta: (text: string) => void,
+) {
+  const started = Date.now();
+  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  let text = "";
+  if (response.ok) {
+    text = await readOpenAiStream(response, (delta, raw) => {
+      const content = deltaTextContent(delta);
+      appendUsageFromRaw(undefined, raw);
+      onDelta(content);
+      return { content };
+    });
+  } else {
+    text = await response.text();
+  }
+  addLog({
+    providerId: providerItem.id,
+    providerName: providerItem.name,
+    url,
+    ok: response.ok,
+    status: response.status,
+    kind: "provider:aux:stream",
+    durationMs: Date.now() - started,
+    method: "POST",
+    requestHeaders: headers,
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    requestBody: jsonBody(body),
+    responseBody: textBody(text),
+    error: response.ok ? undefined : textBody(text),
+  });
+  if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
+  return text.trim() || "(empty response)";
+}
+
+async function fetchClaudeAuxiliaryStream(
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, any>,
+  providerItem: Provider,
+  onDelta: (text: string) => void,
+) {
+  const started = Date.now();
+  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  if (!response.ok) {
+    const text = await response.text();
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url,
+      ok: false,
+      status: response.status,
+      kind: "provider:aux:stream",
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders: headers,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody(body),
+      responseBody: textBody(text),
+      error: textBody(text),
+    });
+    throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
+  }
+  const text = await readClaudeStream(response, (content) => {
+    onDelta(content);
+  });
+  addLog({
+    providerId: providerItem.id,
+    providerName: providerItem.name,
+    url,
+    ok: true,
+    status: response.status,
+    kind: "provider:aux:stream",
+    durationMs: Date.now() - started,
+    method: "POST",
+    requestHeaders: headers,
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    requestBody: jsonBody(body),
+    responseBody: textBody(text),
+  });
+  return text.trim() || "(empty response)";
+}
+
+function claudeEventText(raw: any) {
+  const type = String(raw?.type ?? "");
+  const delta = raw?.delta ?? {};
+  if (type === "content_block_delta") {
+    if (delta.type === "text_delta") return String(delta.text ?? "");
+    if (delta.type === "thinking_delta") return "";
+  }
+  if (type === "content_block_start") {
+    const block = raw?.content_block ?? {};
+    return block.type === "text" ? String(block.text ?? "") : "";
+  }
+  if (typeof delta.text === "string") return delta.text;
+  return "";
+}
+
+async function readClaudeStream(response: Response, onDelta: (text: string, raw?: any) => void, signal?: AbortSignal) {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let full = "";
+  for (;;) {
+    if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split(/\n\n+/);
+    buffer = parts.pop() ?? "";
+    for (const part of parts) {
+      for (const payload of parseSseChunks(part)) {
+        try {
+          const raw = JSON.parse(payload);
+          const text = claudeEventText(raw);
+          if (!text) continue;
+          full += text;
+          onDelta(text, raw);
+        } catch {
+          // Ignore malformed Anthropic stream fragments.
+        }
+      }
+    }
+  }
+  for (const payload of parseSseChunks(buffer)) {
+    try {
+      const raw = JSON.parse(payload);
+      const text = claudeEventText(raw);
+      if (!text) continue;
+      full += text;
+      onDelta(text, raw);
+    } catch {
+      // Ignore malformed trailing Anthropic stream fragments.
+    }
+  }
+  return full;
+}
+
+async function fetchGoogleAuxiliaryStream(
+  url: string,
+  headers: Record<string, string>,
+  body: JsonValue | object,
+  providerItem: Provider,
+  onDelta: (text: string) => void,
+) {
+  const started = Date.now();
+  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const rawText = await response.text();
+  addLog({
+    providerId: providerItem.id,
+    providerName: providerItem.name,
+    url,
+    ok: response.ok,
+    status: response.status,
+    kind: "provider:aux:stream",
+    durationMs: Date.now() - started,
+    method: "POST",
+    requestHeaders: headers,
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    requestBody: jsonBody(body),
+    responseBody: textBody(rawText),
+    error: response.ok ? undefined : textBody(rawText),
+  });
+  if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${rawText.slice(0, 500)}`);
+  const chunks = rawText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+  let text = "";
+  for (const chunk of chunks) {
+    const delta = String(chunk?.candidates?.[0]?.content?.parts?.[0]?.text ?? "");
+    if (!delta) continue;
+    text += delta;
+    onDelta(delta);
+  }
+  return text.trim() || "(empty response)";
+}
+
+function readOpenAiSseTextIntoMessage(rawText: string, hooks: StreamHooks, toolCalls: any[]) {
+  let content = "";
+  let reasoning = "";
+  for (const payload of parseSseChunks(rawText)) {
+    if (payload === "[DONE]") continue;
+    try {
+      const raw = JSON.parse(payload);
+      const delta = raw.choices?.[0]?.delta ?? raw.choices?.[0]?.message ?? responseEventToDelta(raw) ?? {};
+      if (Object.keys(delta).length === 0) {
+        appendUsageFromRaw(hooks.message, raw);
+        continue;
+      }
+      const applied = applyOpenAiDelta(delta, raw, hooks, toolCalls);
+      content += applied.content;
+      reasoning += applied.reasoning;
+    } catch {
+      // Ignore malformed stream fragments, matching the streaming reader.
+    }
+  }
+  return { content, reasoning };
+}
+
+function reasoningFromParts(parts: JsonValue[]) {
+  return parts
+    .map((part) => (isRecord(part) && part.type === "reasoning" ? String(part.reasoning ?? "") : ""))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+function compactAssistantToolMessage(content: string, toolCalls: any[], reasoningContent = "") {
+  const payload: ApiMessage = {
+    role: "assistant",
+    content: content || "",
+    tool_calls: toolCalls,
+  };
+  if (reasoningContent.trim()) payload.reasoning_content = reasoningContent.trim();
+  return payload;
+}
+
+function responseApiToolCallItems(toolCalls: any[]) {
+  return toolCalls.map((toolCall) => ({
+    type: "function_call",
+    call_id: String(toolCall.id ?? ""),
+    name: String(toolCall.function?.name ?? ""),
+    arguments: String(toolCall.function?.arguments ?? "{}"),
+  }));
+}
+
+function apiToolCallFromPart(part: Record<string, JsonValue>) {
+  return {
+    id: String(part.toolCallId ?? id()),
+    type: "function",
+    function: {
+      name: String(part.toolName ?? ""),
+      arguments: String(part.input ?? "{}"),
+    },
+  };
+}
+
+async function executeApprovedToolPart(part: Record<string, JsonValue>, assistant: Assistant) {
+  const approvalType = toolApprovalType(part);
+  if (approvalType === "answered") return String((part.approvalState as Record<string, JsonValue>)?.answer ?? "");
+  if (approvalType === "denied") {
+    const reason = String((part.approvalState as Record<string, JsonValue>)?.reason ?? "").trim() || "No reason provided";
+    return { error: `Tool execution denied by user. Reason: ${reason}` };
+  }
+  return executeToolCall(apiToolCallFromPart(part), assistant);
+}
+
+async function resumeApprovedToolParts(
+  conversation: Conversation,
+  assistant: Assistant,
+  assistantMessage: Message,
+  assistantNode: MessageNode,
+  useResponseInput: boolean,
+) {
+  const toolMessages: ApiMessage[] = [];
+  let changed = false;
+  for (const part of assistantMessage.parts) {
+    if (!isRecord(part) || part.type !== "tool") continue;
+    if (Array.isArray(part.output) && part.output.length > 0) continue;
+    if (!canResumeToolExecution(part)) continue;
+    let toolResult: unknown;
+    try {
+      toolResult = await executeApprovedToolPart(part, assistant);
+    } catch (err) {
+      toolResult = toolExecutionErrorPayload(err);
+    }
+    part.output = await toolResultToParts(toolResult);
+    changed = true;
+    toolMessages.push(
+      useResponseInput
+        ? { type: "function_call_output", call_id: String(part.toolCallId ?? ""), output: resolvedToolOutput(part) }
+        : { role: "tool", tool_call_id: String(part.toolCallId ?? ""), content: resolvedToolOutput(part) },
+    );
+  }
+  if (changed) {
+    conversation.updateAt = Date.now();
+    saveState();
+    touchStream({ message: assistantMessage, conversation, node: assistantNode });
+  }
+  return toolMessages;
+}
+
+function extractToolNameFromArguments(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (typeof parsed?.name === "string") return parsed.name;
+    if (typeof parsed?.tool_name === "string") return parsed.tool_name;
+  } catch {
+    // Leave the original tool name unchanged if arguments are partial or non-JSON.
+  }
+  return "";
+}
+
+function mergeToolCallDeltas(existing: any[], deltaCalls: any[], mode: "delta" | "snapshot" = "delta") {
+  for (const delta of deltaCalls) {
+    const index = Number(delta.index ?? existing.length);
+    const current = existing[index] ?? { id: "", type: "function", function: { name: "", arguments: "" } };
+    const incomingName = String(delta.function?.name ?? "");
+    const incomingArguments = String(delta.function?.arguments ?? "");
+    const currentName = String(current.function?.name ?? "");
+    const currentArguments = String(current.function?.arguments ?? "");
+    const nextArguments = mode === "snapshot"
+      ? (incomingArguments || currentArguments)
+      : currentArguments + incomingArguments;
+    const inferredName = !currentName && !incomingName ? extractToolNameFromArguments(nextArguments) : "";
+    existing[index] = {
+      ...current,
+      id: delta.id ?? current.id,
+      type: delta.type ?? current.type,
+      function: {
+        name: incomingName || currentName || inferredName,
+        arguments: nextArguments,
+      },
+    };
+  }
+}
+
+function visibleTextFromMessage(msg: Message | undefined) {
+  return msg ? textFromParts(msg.parts) : "";
+}
+
+function visibleReasoningFromMessage(msg: Message | undefined) {
+  return msg
+    ? msg.parts
+        .map((part) => isRecord(part) && part.type === "reasoning" ? String(part.reasoning ?? "") : "")
+        .filter(Boolean)
+        .join("")
+    : "";
+}
+
+function ensureReasoningPart(hooks: StreamHooks, metadata?: Record<string, JsonValue>) {
+  if (!hooks.message) return null;
+  hooks.message.parts = hooks.message.parts.filter((part) => !(
+    part &&
+    typeof part === "object" &&
+    !Array.isArray(part) &&
+    (part.type === "loading" || (part.type === "reasoning" && part.reasoning === "正在生成回复"))
+  ));
+  const last = hooks.message.parts[hooks.message.parts.length - 1];
+  if (last && typeof last === "object" && !Array.isArray(last) && last.type === "reasoning") {
+    if (metadata && Object.keys(metadata).length > 0) {
+      last.metadata = { ...(isRecord(last.metadata) ? last.metadata : {}), ...metadata };
+    }
+    return last;
+  }
+  const next = {
+    type: "reasoning",
+    reasoning: "",
+    createdAt: new Date().toISOString(),
+    finishedAt: null,
+    ...(metadata && Object.keys(metadata).length > 0 ? { metadata } : {}),
+  };
+  hooks.message.parts.push(next);
+  return next;
+}
+
+function appendReasoningDelta(hooks: StreamHooks, text: string, metadata?: Record<string, JsonValue>) {
+  if (!hooks.message) return;
+  markStreamFirstContent(hooks.message);
+  const part = ensureReasoningPart(hooks, metadata);
+  if (part && text) part.reasoning = String(part.reasoning ?? "") + text;
+  touchStream(hooks);
+}
+
+function normalizeGeneratedImageUrl(value: string) {
+  const text = value.trim();
+  if (!text || text.startsWith("data:") || /^https?:\/\//i.test(text)) return text;
+  return `data:image/png;base64,${text}`;
+}
+
+function addStreamImage(hooks: StreamHooks | undefined, url: string, metadata: Record<string, JsonValue> = {}) {
+  if (!hooks?.message) return;
+  const normalized = normalizeGeneratedImageUrl(url);
+  if (!normalized) return;
+  markStreamFirstContent(hooks.message);
+  hooks.message.parts.push({ type: "image", url: normalized, metadata });
+  touchStream(hooks);
+}
+
+async function readOpenAiResponseIntoMessage(
+  response: Response,
+  hooks: StreamHooks,
+  signal?: AbortSignal,
+) {
+  const toolCalls: any[] = [];
+  const contentType = response.headers.get("content-type") ?? "";
+  let content = "";
+  let reasoning = "";
+  let rawText = "";
+  let raw: any = {};
+
+  if (contentType.includes("text/event-stream")) {
+    content = await readOpenAiStream(response, (delta, rawEvent) => {
+      const applied = applyOpenAiDelta(delta, rawEvent, hooks, toolCalls);
+      reasoning += applied.reasoning;
+      return applied;
+    }, signal);
+  } else {
+    rawText = await response.text();
+    if (/^\s*data:/m.test(rawText)) {
+      const streamed = readOpenAiSseTextIntoMessage(rawText, hooks, toolCalls);
+      content = streamed.content;
+      reasoning = streamed.reasoning;
+      return { content, reasoning, toolCalls, rawText, raw };
+    }
+    try {
+      raw = rawText ? JSON.parse(rawText) : {};
+    } catch {
+      raw = { text: rawText };
+    }
+    const message = raw.choices?.[0]?.message ?? {};
+    content = completionMessageText(raw);
+    reasoning = String(message.reasoning_content ?? message.reasoning ?? "").trim();
+    if (reasoning) appendReasoningDelta(hooks, reasoning);
+    if (content) addStreamText(hooks, content);
+    if (Array.isArray(message.tool_calls)) {
+      mergeToolCallDeltas(toolCalls, message.tool_calls.map((call: any, index: number) => ({ ...call, index })), "snapshot");
+    }
+    appendUsageFromRaw(hooks.message, raw);
+  }
+
+  return { content, reasoning, toolCalls, rawText, raw };
+}
+
+async function fetchOpenAiTextStreaming(
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, any>,
+  providerItem: Provider,
+  assistant: Assistant,
+  hooks: StreamHooks,
+  signal?: AbortSignal,
+) {
+  const started = Date.now();
+  const useResponseInput = Array.isArray(body.input) && !Array.isArray(body.messages);
+  let messages = [...(useResponseInput ? body.input ?? [] : body.messages ?? [])];
+  let currentBody = useResponseInput ? { ...body, input: messages } : { ...body, messages };
+  let allContent = "";
+  let forceNonStream = false;
+  const fetchRound = (requestBody: Record<string, any>) => {
+    const timeoutMs = requestBody.stream === false ? 180_000 : 600_000;
+    const controller = new AbortController();
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    let abortHandler: (() => void) | null = null;
+    const cleanup = () => {
+      if (timeout) clearTimeout(timeout);
+      if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
+    };
+    if (signal) {
+      abortHandler = () => controller.abort(signal.reason);
+      if (signal.aborted) controller.abort(signal.reason);
+      else signal.addEventListener("abort", abortHandler, { once: true });
+    }
+    timeout = setTimeout(() => controller.abort(new Error(`Response header timeout: no response from provider for ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
+    return fetch(url, {
+      method: "POST",
+      headers: requestBody.stream === false ? headers : { ...headers, Accept: "text/event-stream" },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal,
+    }).finally(cleanup);
+  };
+
+  for (let round = 0; round < MAX_TOOL_STEPS; round += 1) {
+    const roundStarted = Date.now();
+    const requestBody = forceNonStream
+      ? { ...currentBody, stream: false, stream_options: undefined }
+      : currentBody;
+    let response: Response;
+    try {
+      response = await fetchRound(requestBody);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      addLog({
+        providerId: providerItem.id,
+        providerName: providerItem.name,
+        url,
+        ok: false,
+        status: 0,
+        kind: round === 0 ? "provider:chat:stream" : "provider:chat:tool_result:stream",
+        durationMs: Date.now() - roundStarted,
+        method: "POST",
+        requestHeaders: headers,
+        requestBody: jsonBody(requestBody),
+        responseBody: "",
+        error: detail,
+      });
+      if (!forceNonStream && requestBody.stream !== false && !signal?.aborted) {
+        forceNonStream = true;
+        appendReasoningDelta(hooks, `\n流式连接失败，正在按非流式重试... ${detail}`);
+        round -= 1;
+        continue;
+      }
+      throw err;
+    }
+    if (!response.ok) {
+      const text = await response.text();
+      addLog({
+        providerId: providerItem.id,
+        providerName: providerItem.name,
+        url,
+        ok: false,
+        status: response.status,
+        kind: round === 0 ? "provider:chat:stream" : "provider:chat:tool_result:stream",
+        durationMs: Date.now() - roundStarted,
+        method: "POST",
+        requestHeaders: headers,
+        responseHeaders: Object.fromEntries(response.headers.entries()),
+        requestBody: jsonBody(requestBody),
+        responseBody: textBody(text),
+        error: textBody(text),
+      });
+      throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
+    }
+
+    let result: Awaited<ReturnType<typeof readOpenAiResponseIntoMessage>>;
+    try {
+      result = await readOpenAiResponseIntoMessage(response, hooks, signal);
+    } catch (err) {
+      addLog({
+        providerId: providerItem.id,
+        providerName: providerItem.name,
+        url,
+        ok: false,
+        status: response.status,
+        kind: round === 0 ? "provider:chat:stream" : "provider:chat:tool_result:stream",
+        durationMs: Date.now() - roundStarted,
+        method: "POST",
+        requestHeaders: headers,
+        responseHeaders: Object.fromEntries(response.headers.entries()),
+        requestBody: jsonBody(requestBody),
+        responseBody: "",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      if (!forceNonStream && !signal?.aborted) {
+        forceNonStream = true;
+        appendReasoningDelta(hooks, "\n流式连接中断，正在按非流式重试...");
+        round -= 1;
+        continue;
+      }
+      throw err;
+    }
+    allContent += result.content;
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url,
+      ok: true,
+      status: response.status,
+      kind: round === 0 ? "provider:chat:stream" : "provider:chat:tool_result:stream",
+      durationMs: Date.now() - roundStarted,
+      method: "POST",
+      requestHeaders: headers,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody(requestBody),
+      responseBody: textBody(result.rawText || result.content || JSON.stringify({
+        toolCalls: result.toolCalls.map((toolCall) => ({
+          id: toolCall.id,
+          name: toolCall.function?.name,
+          argumentsLength: String(toolCall.function?.arguments ?? "").length,
+        })),
+        reasoningLength: result.reasoning.length,
+      })),
+    });
+    if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
+    if (result.toolCalls.length === 0) return allContent.trim() || "(empty response)";
+
+    const toolMessages = [];
+    // Pre-scan as in the chat-completions path: any pending tool aborts the whole batch's
+    // execution so we don't leave Auto tools without a tool_result on the next turn.
+    const hasPendingInBatch = result.toolCalls.some((toolCall: any) =>
+      toolCall && typeof toolCall === "object" && toolCall.function?.name &&
+      toolNeedsApproval(String(toolCall.function?.name ?? ""), assistant)
+    );
+    for (const toolCall of result.toolCalls) {
+      // Skip sparse-array holes. The Responses API stream parser indexes into toolCalls[]
+      // by `output_index` (server.ts:7354) — when the model emits both a function_call
+      // (e.g. user-defined tool) and a web_search_call in the same response, the indices
+      // are non-contiguous and the resulting array has `undefined` slots. `for...of` over
+      // a sparse array yields those `undefined`s, which crashed at `toolCall.id` with
+      // "undefined is not an object" (the gpt-5.5 + web_search bug reported by users).
+      // The web_search_call is handled server-side by OpenAI itself — it doesn't need a
+      // local tool execution round-trip — so skipping holes is the correct behavior.
+      if (!toolCall || typeof toolCall !== "object") continue;
+      // Also skip entries with no function name — those are phantom deltas left over
+      // from non-function output items (e.g. arguments.delta events that arrived for an
+      // output_index that turned out to be a web_search_call).
+      if (!toolCall.function?.name) continue;
+      const toolPart = {
+        type: "tool",
+        toolCallId: String(toolCall.id ?? id()),
+        toolName: String(toolCall.function?.name ?? ""),
+        input: String(toolCall.function?.arguments ?? "{}"),
+        output: [],
+        approvalState: initialApprovalState(String(toolCall.function?.name ?? ""), assistant),
+      };
+      if (hooks.message) {
+        finishReasoningParts(hooks.message);
+        replaceLoadingReasoningWithTool(hooks.message, toolPart);
+        touchStream(hooks);
+      }
+      if (hasPendingInBatch) {
+        // Render the card in whatever state we set; defer execution until the user approves
+        // or denies the pending one(s).
+        continue;
+      }
+      let toolResult: unknown;
+      try {
+        toolResult = await executeToolCall(toolCall, assistant);
+      } catch (err) {
+        toolResult = toolExecutionErrorPayload(err);
+      }
+      toolPart.output = await toolResultToParts(toolResult);
+      touchStream(hooks);
+      toolMessages.push(
+        useResponseInput
+          ? { type: "function_call_output", call_id: toolPart.toolCallId, output: resolvedToolOutput(toolPart) }
+          : { role: "tool", tool_call_id: toolPart.toolCallId, content: resolvedToolOutput(toolPart) },
+      );
+    }
+    if (hasPendingInBatch) {
+      return allContent.trim() || "";
+    }
+
+    if (useResponseInput) {
+      messages = [...messages, ...responseApiToolCallItems(result.toolCalls), ...toolMessages];
+      currentBody = { ...body, input: messages, stream: !forceNonStream };
+    } else {
+      messages = [
+        ...messages,
+        compactAssistantToolMessage(result.content, result.toolCalls, result.reasoning || reasoningFromParts(hooks.message?.parts ?? [])),
+        ...toolMessages,
+      ];
+      currentBody = { ...body, messages, stream: !forceNonStream };
+    }
+  }
+
+  throw new Error("Too many consecutive tool calls without final assistant content");
+}
+
+function cleanAuxiliaryText(text: string, fallback = "") {
+  const cleaned = text.replace(/^["“”'‘’]+|["“”'‘’]+$/g, "").trim();
+  if (!cleaned || cleaned === "(empty response)") {
+    if (fallback) return fallback;
+    throw new Error("Auxiliary model returned empty response");
+  }
+  return cleaned;
+}
+
+function firstAuxiliaryLine(text: string) {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) ?? "";
+}
+
+function limitAuxiliaryText(text: string, limit: number) {
+  return Array.from(text).slice(0, limit).join("");
+}
+
+async function generateTitleForConversation(conversation: Conversation) {
+  const summary = conversationSummary(conversation, 4).trim();
+  const firstText = textFromParts(conversation.messages[0]?.messages[0]?.parts ?? []).trim();
+  const content = summary || firstText;
+  if (!content) return "New Conversation";
+  const prompt = applyPlaceholders(state.settings.titlePrompt || DEFAULT_TITLE_PROMPT, {
+    locale: localeDisplayName(),
+    content: selectedConversationMessages(conversation).slice(-4).map(summaryAsText).join("\n\n"),
+  });
+  const text = await fetchAuxiliaryText(state.settings.titleModelId, prompt, "title", {
+    reasoningLevel: "off",
+  });
+  return limitAuxiliaryText(
+    firstAuxiliaryLine(cleanAuxiliaryText(text, limitAuxiliaryText(firstText, TITLE_CHARACTER_LIMIT) || "New Conversation")),
+    TITLE_CHARACTER_LIMIT,
+  ) || "New Conversation";
+}
+
+function shouldAutoGenerateTitle(conversation: Conversation) {
+  const firstText = textFromParts(conversation.messages[0]?.messages[0]?.parts ?? []).trim();
+  const title = String(conversation.title ?? "").trim();
+  if (!title || title === "New Conversation") return true;
+  if (firstText && title === limitAuxiliaryText(firstText, TITLE_CHARACTER_LIMIT)) return true;
+  return false;
+}
+
+function conversationSummary(conversation: Conversation, takeLast = 8) {
+  return conversation.messages
+    .map((node) => node.messages[node.selectIndex] ?? node.messages[0])
+    .filter(Boolean)
+    .slice(-takeLast)
+    .map((msg) => summaryAsText(msg))
+    .filter((line) => line.trim().length > 6)
+    .join("\n\n");
+}
+
+interface AuxiliaryTextOptions {
+  maxTokens?: number | null;
+  temperature?: number | null;
+  topP?: number | null;
+  reasoningLevel?: string | null;
+  customBody?: Record<string, any>;
+  stream?: boolean;
+  onDelta?: (text: string) => void;
+}
+
+function isQwenMtModel(modelId: string) {
+  const normalized = modelId.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  return tokens.includes("qwen") && tokens.includes("mt");
+}
+
+function englishLanguageName(locale: string) {
+  const language = locale.trim() || Intl.DateTimeFormat().resolvedOptions().locale;
+  try {
+    const displayNames = new Intl.DisplayNames(["en"], { type: "language" });
+    return displayNames.of(language) || displayNames.of(language.split(/[-_]/)[0]) || language;
+  } catch {
+    return language.split(/[-_]/)[0] || language;
+  }
+}
+
+async function fetchAuxiliaryText(modelId: string, prompt: string, kind: string, options: AuxiliaryTextOptions = {}) {
+  const picked = findModel(modelId || state.settings.chatModelId);
+  const providerItem = picked.provider;
+  const modelItem = picked.model;
+  const selectedModel = modelItem.modelId === "auto" ? "gpt-4o-mini" : modelItem.modelId;
+  const maxTokens = options.maxTokens ?? null;
+  const reasoningLevel = options.reasoningLevel ?? null;
+  const stream = options.stream === true;
+  const pushDelta = (text: string) => {
+    if (text) options.onDelta?.(text);
+  };
+  const assistant = {
+    ...findAssistant(state.settings.assistantId),
+    chatModelId: modelItem.id,
+    systemPrompt: "",
+    temperature: options.temperature ?? null,
+    topP: null,
+    maxTokens,
+    streamOutput: false,
+    enabledSkills: [],
+    mcpServers: [],
+    localTools: [],
+    customBodies: options.customBody
+      ? Object.entries(options.customBody).map(([key, value]) => ({ key, value }))
+      : [],
+  } as Assistant;
+  const headers = applyRequestHeaders({ "Content-Type": "application/json" }, assistant, providerItem, modelItem);
+  let endpoint = endpointFor(providerItem);
+  let body: Record<string, any>;
+  if (providerItem.type === "google") {
+    endpoint = `${providerItem.baseUrl.replace(/\/+$/, "")}/models/${selectedModel}:generateContent?key=${encodeURIComponent(providerItem.apiKey)}`;
+    body = {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: {
+        ...(maxTokens != null ? { maxOutputTokens: maxTokens } : {}),
+        ...(options.temperature != null ? { temperature: options.temperature } : {}),
+      },
+    };
+    if (stream && options.onDelta) {
+      const streamEndpoint = `${providerItem.baseUrl.replace(/\/+$/, "")}/models/${selectedModel}:streamGenerateContent?key=${encodeURIComponent(providerItem.apiKey)}`;
+      try {
+        return cleanAuxiliaryText(await fetchGoogleAuxiliaryStream(streamEndpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, pushDelta));
+      } catch {
+        // Fall back to non-streaming auxiliary calls; some compatible gateways do not expose Gemini streaming.
+      }
+    }
+    return fetchText(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, (raw) => raw.candidates?.[0]?.content?.parts?.[0]?.text);
+  }
+  if (providerItem.type === "claude") {
+    headers["x-api-key"] = providerItem.apiKey;
+    headers["anthropic-version"] = "2023-06-01";
+    body = {
+      model: selectedModel,
+      max_tokens: maxTokens ?? 64_000,
+      messages: [{ role: "user", content: prompt }],
+      stream,
+      ...(options.temperature != null && (!reasoningLevel || !reasoningEnabled(reasoningLevel)) ? { temperature: options.temperature } : {}),
+      // 与主路径一致：thinking + output_config，DeepSeek 走 Claude 格式时 display:"raw"
+      ...(reasoningLevel ? claudeThinkingPayload(modelItem, reasoningLevel) : {}),
+    };
+    if (stream && options.onDelta) {
+      try {
+        return cleanAuxiliaryText(await fetchClaudeAuxiliaryStream(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, pushDelta));
+      } catch {
+        body.stream = false;
+      }
+    }
+    return fetchText(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, (raw) => raw.content?.map((item: { text?: string }) => item.text ?? "").join("\n"));
+  }
+  headers.Authorization = `Bearer ${providerItem.apiKey}`;
+  body = providerItem.useResponseApi
+    ? {
+        model: selectedModel,
+        input: [{ role: "user", content: prompt }],
+        stream,
+        store: false,
+        ...(maxTokens != null ? { max_output_tokens: maxTokens } : {}),
+        ...(reasoningLevel && supportsAbility(modelItem, "REASONING")
+          ? { reasoning: { summary: "auto", ...(reasoningLevelNormalized(reasoningLevel) !== "auto" ? { effort: reasoningLevelNormalized(reasoningLevel) === "off" ? "none" : reasoningLevelNormalized(reasoningLevel) } : {}) } }
+          : {}),
+      }
+    : {
+        model: selectedModel,
+        messages: [{ role: "user", content: prompt }],
+        stream,
+        ...(maxTokens != null ? { max_tokens: maxTokens } : {}),
+        ...(options.temperature != null && isModelAllowTemperature(modelItem) ? { temperature: options.temperature } : {}),
+        ...(options.topP != null && isModelAllowTemperature(modelItem) ? { top_p: options.topP } : {}),
+        ...auxiliaryReasoningPayloadForProvider(providerItem, modelItem, reasoningLevel),
+      };
+  if (stream && options.onDelta) {
+    try {
+      const text = await fetchOpenAiAuxiliaryStream(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, pushDelta);
+      if (!text || text === "(empty response)") throw new Error(`${kind} model returned empty response`);
+      return text;
+    } catch {
+      body.stream = false;
+    }
+  }
+  const text = await fetchText(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, completionMessageText);
+  if (!text || text === "(empty response)") throw new Error(`${kind} model returned empty response`);
+  return text;
+}
+
+function reasoningEnabled(level: string | null | undefined) {
+  return reasoningLevelNormalized(level) !== "off";
+}
+
+function modelExists(modelId: string | null | undefined) {
+  if (!modelId) return false;
+  if (modelId === DEFAULT_AUTO_MODEL_ID || modelId === "auto") return true;
+  return state.settings.providers.some((providerItem) =>
+    providerItem.models.some((modelItem) => modelItem.id === modelId || modelItem.modelId === modelId)
+  );
+}
+
+async function fetchAuxiliaryOcrText(imageUrl: string) {
+  if (!modelExists(state.settings.ocrModelId)) return "";
+  const picked = findModel(state.settings.ocrModelId);
+  const providerItem = picked.provider;
+  const modelItem = picked.model;
+  const selectedModel = modelItem.modelId === "auto" ? "gpt-4o-mini" : modelItem.modelId;
+  const assistant = {
+    ...findAssistant(state.settings.assistantId),
+    chatModelId: modelItem.id,
+    systemPrompt: "",
+    temperature: 0,
+    topP: null,
+    maxTokens: 2048,
+    streamOutput: false,
+    enabledSkills: [],
+    mcpServers: [],
+    localTools: [],
+  } as Assistant;
+  const prompt = state.settings.ocrPrompt || DEFAULT_OCR_PROMPT;
+  const dataUrl = dataUrlForMessageUrl(imageUrl);
+  const headers = applyRequestHeaders({ "Content-Type": "application/json" }, assistant, providerItem, modelItem);
+  let endpoint = endpointFor(providerItem);
+  let body: Record<string, any>;
+
+  if (providerItem.type === "google") {
+    const parsed = parseDataUrl(dataUrl);
+    if (!parsed) return "";
+    endpoint = `${providerItem.baseUrl.replace(/\/+$/, "")}/models/${selectedModel}:generateContent?key=${encodeURIComponent(providerItem.apiKey)}`;
+    body = {
+      contents: [{
+        role: "user",
+        parts: [
+          { text: prompt },
+          { inlineData: { mimeType: parsed.mime, data: parsed.data } },
+        ],
+      }],
+    };
+    return cleanAuxiliaryText(await fetchText(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, (raw) => raw.candidates?.[0]?.content?.parts?.[0]?.text));
+  }
+
+  if (providerItem.type === "claude") {
+    const parsed = parseDataUrl(dataUrl);
+    if (!parsed) return "";
+    headers["x-api-key"] = providerItem.apiKey;
+    headers["anthropic-version"] = "2023-06-01";
+    body = {
+      model: selectedModel,
+      max_tokens: 2048,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          { type: "image", source: { type: "base64", media_type: parsed.mime, data: parsed.data } },
+        ],
+      }],
+    };
+    return cleanAuxiliaryText(await fetchText(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, (raw) => raw.content?.map((item: { text?: string }) => item.text ?? "").join("\n")));
+  }
+
+  headers.Authorization = `Bearer ${providerItem.apiKey}`;
+  body = providerItem.useResponseApi
+    ? {
+        model: selectedModel,
+        input: [{
+          role: "user",
+          content: [
+            { type: "input_text", text: prompt },
+            { type: "input_image", image_url: dataUrl },
+          ],
+        }],
+        max_output_tokens: 2048,
+      }
+    : {
+        model: selectedModel,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            { type: "image_url", image_url: { url: dataUrl } },
+          ],
+        }],
+        max_tokens: 2048,
+        temperature: isModelAllowTemperature(modelItem) ? 0 : undefined,
+      };
+  return cleanAuxiliaryText(await fetchText(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, completionMessageText));
+}
+
+function shouldOcrForModel(modelItem: Model) {
+  return !supportsInputModality(modelItem, "IMAGE") && modelExists(state.settings.ocrModelId);
+}
+
+async function attachOcrToImageParts(parts: JsonValue[], modelItem: Model) {
+  if (!shouldOcrForModel(modelItem)) return parts;
+  const next = [...parts];
+  for (let index = 0; index < next.length; index += 1) {
+    const part = next[index];
+    if (!isRecord(part) || part.type !== "image") continue;
+    const metadata = isRecord(part.metadata) ? part.metadata : {};
+    if (String(metadata.ocrText ?? "").trim()) continue;
+    const url = String(part.url ?? "");
+    if (!url) continue;
+    try {
+      const ocrText = await fetchAuxiliaryOcrText(url);
+      if (ocrText) {
+        next[index] = { ...part, metadata: { ...metadata, ocrText, ocrStatus: "done" } };
+      }
+    } catch (err) {
+      next[index] = {
+        ...part,
+        metadata: {
+          ...metadata,
+          ocrStatus: "failed",
+          ocrError: err instanceof Error ? err.message : String(err),
+        },
+      };
+      console.warn("OCR failed:", err);
+    }
+  }
+  return next;
+}
+
+function markOcrPendingParts(parts: JsonValue[], modelItem: Model) {
+  if (!shouldOcrForModel(modelItem)) return parts;
+  return parts.map((part) => {
+    if (!isRecord(part) || part.type !== "image") return part;
+    const metadata = isRecord(part.metadata) ? part.metadata : {};
+    if (String(metadata.ocrText ?? "").trim()) return part;
+    return { ...part, metadata: { ...metadata, ocrStatus: "pending" } };
+  });
+}
+
+function imageSize(aspectRatio: string) {
+  switch (aspectRatio) {
+    case "landscape":
+      return { openai: "1536x1024", google: "16:9" };
+    case "portrait":
+      return { openai: "1024x1536", google: "9:16" };
+    default:
+      return { openai: "1024x1024", google: "1:1" };
+  }
+}
+
+function imageFileExtension(mime: string) {
+  if (mime.includes("jpeg") || mime.includes("jpg")) return ".jpg";
+  if (mime.includes("webp")) return ".webp";
+  return ".png";
+}
+
+// 对齐安卓 toImageMimeType:output_format 字段 → MIME。
+function imageFormatToMime(format: string | undefined): string {
+  const f = (format ?? "").toLowerCase();
+  if (f === "jpg" || f === "jpeg") return "image/jpeg";
+  if (f === "webp") return "image/webp";
+  return "image/png";
+}
+
+// 对齐安卓 OpenAIProvider.parseImageResponse / downloadImageAsBase64:
+// 单条 data item 优先取 b64_json(按 output_format 推导 MIME);否则取 url,
+// 下载图片并 base64 编码,用响应 Content-Type 作 MIME。
+// 兼容部分 OpenAI 兼容代理(如腾讯云 COS)只返回 url、不返回 b64_json 的情况。
+async function parseImageDataItem(
+  item: Record<string, JsonValue> | undefined,
+  defaultFormat: string,
+): Promise<{ data: string; mime: string } | null> {
+  if (!item || typeof item !== "object") return null;
+  const b64 = String(item.b64_json ?? "");
+  if (b64) {
+    const format = typeof item.output_format === "string" ? item.output_format : defaultFormat;
+    return { data: b64, mime: imageFormatToMime(format) };
+  }
+  const url = String(item.url ?? "");
+  if (!url) return null;
+  const dlResp = await fetch(url);
+  if (!dlResp.ok) throw new Error(`Failed to download generated image: ${dlResp.status}`);
+  const buf = Buffer.from(await dlResp.arrayBuffer());
+  const contentType = dlResp.headers.get("content-type")?.split(";")[0]?.trim();
+  return { data: buf.toString("base64"), mime: contentType || imageFormatToMime(defaultFormat) };
+}
+
+async function saveGeneratedImage(
+  data: string,
+  mime: string,
+  prompt: string,
+  model: Model,
+  type: GeneratedImage["type"],
+  sourceFileIds: number[] = [],
+) {
+  const fileId = state.nextFileId++;
+  const fileName = `generated-${Date.now()}-${fileId}${imageFileExtension(mime)}`;
+  const target = join(filesDir, fileName);
+  await Bun.write(target, Buffer.from(data, "base64"));
+  const fileEntry: StoredFile = { id: fileId, path: target, fileName, mime, size: statSync(target).size };
+  state.files.push(fileEntry);
+  const generated: GeneratedImage = {
+    id: String(state.nextGeneratedImageId++),
+    prompt,
+    fileId,
+    url: `/api/files/${fileId}/content`,
+    fileName,
+    mime,
+    model: model.displayName || model.modelId,
+    modelId: model.id,
+    type,
+    sourceFileIds,
+    sourcePaths: sourceFileIds.length ? sourceFileIds.join(",") : "",
+    createdAt: Date.now(),
+  };
+  state.generatedImages.unshift(generated);
+  state.generatedImages = state.generatedImages.slice(0, 300);
+  saveState();
+  return generated;
+}
+
+async function callImageGeneration(input: {
+  prompt: string;
+  numberOfImages: number;
+  aspectRatio: string;
+  referenceFileIds?: number[];
+}) {
+  const picked = findModel(state.settings.imageGenerationModelId);
+  const providerItem = picked.provider;
+  const modelItem = picked.model;
+  const selectedModel = modelItem.modelId === "auto" ? "gpt-image-2" : modelItem.modelId;
+  const count = Math.min(4, Math.max(1, Number(input.numberOfImages) || 1));
+  const sizes = imageSize(input.aspectRatio);
+  const references = (input.referenceFileIds ?? [])
+    .map((fileId) => state.files.find((file) => file.id === fileId))
+    .filter(Boolean) as StoredFile[];
+  const started = Date.now();
+
+  if (providerItem.type === "google") {
+    if (references.length > 0) throw new Error("Gemini image edit is not supported by the original provider implementation");
+    const endpoint = `${providerItem.baseUrl.replace(/\/+$/, "")}/models/${selectedModel}:predict?key=${encodeURIComponent(providerItem.apiKey)}`;
+    const body = applyModelCustomBody({
+      instances: [{ prompt: input.prompt }],
+      parameters: { sampleCount: count, aspectRatio: sizes.google },
+    }, modelItem);
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: applyModelRequestHeaders({ "Content-Type": "application/json" }, providerItem, modelItem),
+      body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url: endpoint,
+      ok: response.ok,
+      status: response.status,
+      kind: "provider:image:generation",
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders: applyModelRequestHeaders({ "Content-Type": "application/json" }, providerItem, modelItem),
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: jsonBody(body),
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`Failed to generate image: ${response.status} ${text.slice(0, 500)}`);
+    const raw = JSON.parse(text || "{}");
+    const predictions = Array.isArray(raw.predictions) ? raw.predictions : [];
+    const items = [];
+    for (const item of predictions) {
+      const data = String(item?.bytesBase64Encoded ?? "");
+      if (data) items.push(await saveGeneratedImage(data, "image/png", input.prompt, modelItem, "image_generation"));
+    }
+    return items;
+  }
+
+  if (providerItem.type !== "openai") {
+    throw new Error("Image generation is supported for OpenAI-compatible and Google providers");
+  }
+
+  const base = providerItem.baseUrl.replace(/\/+$/, "");
+  const headers = applyModelRequestHeaders(providerHeaders(providerItem), providerItem, modelItem);
+  if (references.length > 0) {
+    const endpoint = `${base}/images/edits`;
+    const form = new FormData();
+    form.append("model", selectedModel);
+    form.append("prompt", input.prompt);
+    form.append("n", String(count));
+    form.append("size", sizes.openai);
+    const field = references.length === 1 ? "image" : "image[]";
+    for (const reference of references) {
+      form.append(field, new Blob([readFileSync(reference.path)], { type: reference.mime || "image/png" }), reference.fileName);
+    }
+    for (const entry of customBodyEntriesForForm(modelItem)) {
+      form.append(entry.key, customFormValue(entry.value));
+    }
+    const response = await fetch(endpoint, { method: "POST", headers, body: form });
+    const text = await response.text();
+    addLog({
+      providerId: providerItem.id,
+      providerName: providerItem.name,
+      url: endpoint,
+      ok: response.ok,
+      status: response.status,
+      kind: "provider:image:edit",
+      durationMs: Date.now() - started,
+      method: "POST",
+      requestHeaders: headers,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+      requestBody: `multipart image edit\nmodel=${selectedModel}\nn=${count}\nsize=${sizes.openai}\nreferences=${references.map((file) => file.fileName).join(", ")}\ncustom=${customBodyEntriesForForm(modelItem).map((entry) => entry.key).join(", ") || "-"}`,
+      responseBody: textBody(text),
+      error: response.ok ? undefined : textBody(text),
+    });
+    if (!response.ok) throw new Error(`Failed to edit image: ${response.status} ${text.slice(0, 500)}`);
+    const raw = JSON.parse(text || "{}");
+    const defaultFormat = String(raw.output_format ?? "png");
+    const sourceFileIds = references.map((file) => file.id);
+    const items = [];
+    for (const item of Array.isArray(raw.data) ? raw.data : []) {
+      const parsed = await parseImageDataItem(item as Record<string, JsonValue> | undefined, defaultFormat);
+      if (parsed) items.push(await saveGeneratedImage(parsed.data, parsed.mime, input.prompt, modelItem, "image_edit", sourceFileIds));
+    }
+    return items;
+  }
+
+  const endpoint = `${base}/images/generations`;
+  const body = applyModelCustomBody({ model: selectedModel, prompt: input.prompt, n: count, size: sizes.openai }, modelItem);
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  addLog({
+    providerId: providerItem.id,
+    providerName: providerItem.name,
+    url: endpoint,
+    ok: response.ok,
+    status: response.status,
+    kind: "provider:image:generation",
+    durationMs: Date.now() - started,
+    method: "POST",
+    requestHeaders: headers,
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    requestBody: jsonBody(body),
+    responseBody: textBody(text),
+    error: response.ok ? undefined : textBody(text),
+  });
+  if (!response.ok) throw new Error(`Failed to generate image: ${response.status} ${text.slice(0, 500)}`);
+  const raw = JSON.parse(text || "{}");
+  const defaultFormat = String(raw.output_format ?? "png");
+  const items = [];
+  for (const item of Array.isArray(raw.data) ? raw.data : []) {
+    const parsed = await parseImageDataItem(item as Record<string, JsonValue> | undefined, defaultFormat);
+    if (parsed) items.push(await saveGeneratedImage(parsed.data, parsed.mime, input.prompt, modelItem, "image_generation"));
+  }
+  return items;
+}
+
+function selectedAsrProvider() {
+  return state.settings.asrProviders.find((provider) => provider.id === state.settings.selectedASRProviderId)
+    ?? state.settings.asrProviders[0]
+    ?? null;
+}
+
+function selectedTtsProvider(providerId?: string) {
+  return state.settings.ttsProviders.find((provider) => provider.id === providerId)
+    ?? state.settings.ttsProviders.find((provider) => provider.id === state.settings.selectedTTSProviderId)
+    ?? state.settings.ttsProviders[0]
+    ?? null;
+}
+
+function ttsMimeForProvider(provider: TtsProvider) {
+  if (provider.type === "groq" || provider.type === "gemini" || provider.type === "qwen" || provider.type === "mimo") return "audio/wav";
+  return "audio/mpeg";
+}
+
+function pcm16ToWav(pcm: Buffer, sampleRate = 24000, channels = 1) {
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * channels * bitsPerSample / 8;
+  const blockAlign = channels * bitsPerSample / 8;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+function decodeHexBytes(hexString: string) {
+  const clean = hexString.replace(/\s+/g, "");
+  if (!clean || clean.length % 2 !== 0) return Buffer.alloc(0);
+  return Buffer.from(clean, "hex");
+}
+
+async function collectSseAudio(
+  response: Response,
+  parseData: (data: string) => Buffer | null,
+) {
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: Buffer[] = [];
+  let buffer = "";
+  let currentData = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (value) {
+      buffer += decoder.decode(value, { stream: !done });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line.startsWith("data:")) {
+          currentData += line.slice(5).trim();
+        } else if (line.trim() === "" && currentData) {
+          const audio = parseData(currentData);
+          if (audio?.length) chunks.push(audio);
+          currentData = "";
+        }
+      }
+    }
+    if (done) break;
+  }
+  if (currentData) {
+    const audio = parseData(currentData);
+    if (audio?.length) chunks.push(audio);
+  }
+  return Buffer.concat(chunks);
+}
+
+async function generateSpeechWithTtsProvider(text: string, providerId?: string, speedOverride?: number) {
+  const provider = selectedTtsProvider(providerId);
+  if (!provider) throw new Error("No TTS provider configured");
+  const started = Date.now();
+  if (provider.type === "system") {
+    const speed = Number.isFinite(speedOverride) && (speedOverride as number) > 0
+      ? (speedOverride as number)
+      : Number(provider.speechRate ?? 1);
+    const wavBytes = await synthesizeSystemTtsToWav(text, speed);
+    addLog({
+      providerId: provider.id,
+      providerName: provider.name,
+      url: "windows:System.Speech",
+      ok: true,
+      kind: "provider:tts",
+      durationMs: Date.now() - started,
+      requestBody: text,
+      responseBody: `${wavBytes.length} bytes audio/wav`,
+    });
+    return { audio: wavBytes, mime: "audio/wav", provider };
+  }
+  if (!provider.apiKey.trim()) throw new Error("TTS API Key is empty");
+  let endpoint = "";
+  let body: Record<string, JsonValue> = {};
+  let mime = ttsMimeForProvider(provider);
+  let headers: Record<string, string> = { Authorization: `Bearer ${provider.apiKey}`, "Content-Type": "application/json" };
+  let parseAudio: ((response: Response) => Promise<Buffer>) | null = null;
+  if (provider.type === "openai" || provider.type === "groq") {
+    endpoint = `${provider.baseUrl.replace(/\/+$/, "")}/audio/speech`;
+    body = {
+      model: provider.model || (provider.type === "openai" ? "gpt-4o-mini-tts" : "canopylabs/orpheus-v1-english"),
+      input: text,
+      voice: provider.voice || (provider.type === "openai" ? "alloy" : "austin"),
+      response_format: provider.type === "groq" ? "wav" : "mp3",
+    };
+    parseAudio = async (response) => Buffer.from(await response.arrayBuffer());
+  } else if (provider.type === "gemini") {
+    endpoint = `${provider.baseUrl.replace(/\/+$/, "")}/models/${provider.model || "gemini-2.5-flash-preview-tts"}:generateContent`;
+    headers = { "x-goog-api-key": provider.apiKey, "Content-Type": "application/json" };
+    body = {
+      contents: [{ parts: [{ text }] }],
+      generationConfig: {
+        responseModalities: ["AUDIO"],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: provider.voiceName || "Kore" } } },
+      },
+      model: provider.model || "gemini-2.5-flash-preview-tts",
+    };
+    parseAudio = async (response) => {
+      const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
+      const candidates = Array.isArray(raw.candidates) ? raw.candidates : [];
+      const first = candidates[0] as Record<string, unknown> | undefined;
+      const content = first?.content as Record<string, unknown> | undefined;
+      const parts = Array.isArray(content?.parts) ? content.parts : [];
+      const part = parts[0] as Record<string, unknown> | undefined;
+      const inlineData = part?.inlineData as Record<string, unknown> | undefined;
+      const data = typeof inlineData?.data === "string" ? inlineData.data : "";
+      if (!data) throw new Error("No audio data returned from Gemini TTS");
+      return pcm16ToWav(Buffer.from(data, "base64"), 24000, 1);
+    };
+  } else if (provider.type === "minimax") {
+    endpoint = `${provider.baseUrl.replace(/\/+$/, "")}/t2a_v2`;
+    // MiniMax's `emotion` is a soft-optional field: when omitted entirely from the request,
+    // MiniMax auto-selects an emotion based on the text content. The UI exposes this as the
+    // "自动" option (stored as empty string). We must NOT send `emotion: ""` — that's
+    // rejected — we have to drop the field entirely. Hence the conditional spread.
+    const voiceSetting: Record<string, JsonValue> = {
+      voice_id: provider.voiceId || "female-shaonv",
+      speed: Number(provider.speed ?? 1),
+    };
+    if (provider.emotion) voiceSetting.emotion = provider.emotion;
+    body = {
+      model: provider.model || "speech-2.6-turbo",
+      text,
+      stream: true,
+      output_format: "hex",
+      stream_options: { exclude_aggregated_audio: true },
+      voice_setting: voiceSetting,
+    };
+    parseAudio = async (response) => collectSseAudio(response, (data) => {
+      if (data === "[DONE]") return null;
+      const raw = JSON.parse(data || "{}") as { data?: { audio?: string } };
+      return decodeHexBytes(raw.data?.audio ?? "");
+    });
+  } else if (provider.type === "qwen") {
+    endpoint = `${provider.baseUrl.replace(/\/+$/, "")}/services/aigc/multimodal-generation/generation`;
+    headers = { Authorization: `Bearer ${provider.apiKey}`, "Content-Type": "application/json", "X-DashScope-SSE": "enable" };
+    body = {
+      model: provider.model || "qwen3-tts-flash",
+      input: { text, voice: provider.voice || "Cherry", language_type: provider.languageType || "Auto" },
+    };
+    parseAudio = async (response) => {
+      const pcm = await collectSseAudio(response, (data) => {
+        const raw = JSON.parse(data || "{}") as { output?: { audio?: { data?: string } } };
+        const encoded = raw.output?.audio?.data ?? "";
+        return encoded ? Buffer.from(encoded, "base64") : null;
+      });
+      return pcm16ToWav(pcm, 24000, 1);
+    };
+  } else if (provider.type === "xai") {
+    endpoint = `${provider.baseUrl.replace(/\/+$/, "")}/tts`;
+    body = {
+      text,
+      voice_id: provider.voiceId || "eve",
+      language: provider.language || "auto",
+    };
+    parseAudio = async (response) => Buffer.from(await response.arrayBuffer());
+  } else if (provider.type === "mimo") {
+    endpoint = `${provider.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+    headers = { "api-key": provider.apiKey, "Content-Type": "application/json" };
+    body = {
+      model: provider.model || "mimo-v2-tts",
+      messages: [{ role: "assistant", content: text }],
+      audio: { format: "pcm16", voice: provider.voice || "mimo_default" },
+      stream: true,
+    };
+    parseAudio = async (response) => {
+      const pcm = await collectSseAudio(response, (data) => {
+        if (data === "[DONE]") return null;
+        const raw = JSON.parse(data || "{}") as { choices?: Array<{ delta?: { audio?: { data?: string } } }> };
+        const encoded = raw.choices?.[0]?.delta?.audio?.data ?? "";
+        return encoded ? Buffer.from(encoded, "base64") : null;
+      });
+      return pcm16ToWav(pcm, 24000, 1);
+    };
+  }
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  const audio = response.ok && parseAudio
+    ? await parseAudio(response)
+    : Buffer.from(await response.arrayBuffer());
+  addLog({
+    providerId: provider.id,
+    providerName: provider.name,
+    url: endpoint,
+    ok: response.ok,
+    status: response.status,
+    kind: "provider:tts",
+    durationMs: Date.now() - started,
+    method: "POST",
+    requestHeaders: headers,
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    requestBody: jsonBody(body),
+    responseBody: response.ok ? `${audio.length} bytes ${mime}` : textBody(audio.toString("utf8")),
+    error: response.ok ? undefined : textBody(audio.toString("utf8")),
+  });
+  if (!response.ok) throw new Error(`TTS request failed: ${response.status} ${audio.toString("utf8").slice(0, 500)}`);
+  return { audio, mime, provider };
+}
+
+function openAiAsrTranscriptionEndpoint(provider: AsrProvider) {
+  try {
+    const url = new URL(provider.websocketUrl || "wss://api.openai.com/v1/realtime?intent=transcription");
+    url.protocol = "https:";
+    const basePath = url.pathname.replace(/\/realtime\/?$/, "").replace(/\/$/, "");
+    url.pathname = `${basePath}/audio/transcriptions`;
+    url.search = "";
+    return url.toString();
+  } catch {
+    return "https://api.openai.com/v1/audio/transcriptions";
+  }
+}
+
+async function transcribeAudioWithAsrProvider(file: File) {
+  const provider = selectedAsrProvider();
+  if (!provider) throw new Error("No ASR provider configured");
+  if (!provider.apiKey.trim()) throw new Error("ASR API Key is empty");
+  const endpoint = provider.type === "openai_realtime"
+    ? openAiAsrTranscriptionEndpoint(provider)
+    : provider.type === "dashscope"
+      ? "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription"
+      : "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash";
+  const form = new FormData();
+  if (provider.type === "openai_realtime") {
+    form.append("file", file, file.name || "speech.webm");
+    form.append("model", provider.model || "gpt-4o-transcribe");
+    if (provider.language?.trim()) form.append("language", provider.language.trim());
+    if (provider.prompt?.trim()) form.append("prompt", provider.prompt.trim());
+  } else {
+    form.append("file", file, file.name || "speech.webm");
+    form.append("model", provider.model || (provider.type === "dashscope" ? "paraformer-realtime-v2" : "bigmodel"));
+    if (provider.language?.trim()) form.append("language", provider.language.trim());
+  }
+  const started = Date.now();
+  const headers: Record<string, string> = provider.type === "openai_realtime"
+    ? { Authorization: `Bearer ${provider.apiKey}` }
+    : provider.type === "dashscope"
+      ? { Authorization: `Bearer ${provider.apiKey}` }
+      : {
+          "X-Api-Key": provider.apiKey,
+          "X-Api-Resource-Id": provider.resourceId || "volc.seedasr.sauc.duration",
+          "X-Api-Request-Id": id(),
+        };
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: form,
+  });
+  const rawText = await response.text();
+  addLog({
+    providerId: provider.id,
+    providerName: provider.name,
+    url: endpoint,
+    ok: response.ok,
+    status: response.status,
+    kind: "provider:asr",
+    durationMs: Date.now() - started,
+    method: "POST",
+    requestHeaders: headers,
+    responseHeaders: Object.fromEntries(response.headers.entries()),
+    requestBody: `multipart audio transcription\nmodel=${provider.model || "gpt-4o-transcribe"}\nlanguage=${provider.language || "auto"}\nfile=${file.name || "speech.webm"}`,
+    responseBody: textBody(rawText),
+    error: response.ok ? undefined : textBody(rawText),
+  });
+  if (!response.ok) throw new Error(`ASR failed: ${response.status} ${rawText.slice(0, 500)}`);
+  let raw: any = {};
+  try {
+    raw = rawText ? JSON.parse(rawText) : {};
+  } catch {
+    raw = { text: rawText };
+  }
+  return String(
+    raw.text ??
+    raw.transcript ??
+    raw.output_text ??
+    raw.output?.text ??
+    raw.result?.text ??
+    raw.data?.text ??
+    raw.data?.result ??
+    "",
+  ).trim();
+}
+
+interface AsrRealtimeSession {
+  provider: AsrProvider;
+  client: any;
+  upstream: WebSocket | null;
+  completedTranscripts: string[];
+  partialTranscripts: Map<string, string>;
+  lastText: string;
+  pendingFrames: ArrayBuffer[];
+  opened: boolean;
+  finished: boolean;
+  startedAt: number;
+  volcSequence: number;
+}
+
+const asrRealtimeSessions = new WeakMap<object, AsrRealtimeSession>();
+
+function asrSendClient(session: AsrRealtimeSession, payload: Record<string, unknown>) {
+  try {
+    session.client.send(JSON.stringify(payload));
+  } catch {
+    // Client has gone away.
+  }
+}
+
+function asrPublishTranscript(session: AsrRealtimeSession) {
+  const transcript = [...session.completedTranscripts, ...session.partialTranscripts.values()]
+    .filter((text) => text.trim().length > 0)
+    .join(" ");
+  asrSendClient(session, { type: "transcript", transcript });
+}
+
+function asrFail(session: AsrRealtimeSession, message: string) {
+  if (session.finished) return;
+  asrSendClient(session, { type: "error", error: message });
+  addLog({
+    providerId: session.provider.id,
+    providerName: session.provider.name,
+    url: session.provider.websocketUrl,
+    ok: false,
+    status: 0,
+    kind: "provider:asr:realtime",
+    durationMs: Date.now() - session.startedAt,
+    error: message,
+  });
+}
+
+function openAiAsrEndpoint(provider: AsrProvider) {
+  const endpoint = (provider.websocketUrl || "wss://api.openai.com/v1/realtime?intent=transcription").trim();
+  if (endpoint.includes("intent=transcription") || endpoint.includes("model=")) return endpoint;
+  const separator = endpoint.includes("?") ? "&" : "?";
+  return `${endpoint.replace(/\/+$/, "")}${separator}intent=transcription`;
+}
+
+function dashScopeAsrEndpoint(provider: AsrProvider) {
+  const endpoint = (provider.websocketUrl || "wss://dashscope.aliyuncs.com/api-ws/v1/inference").trim().replace(/\/+$/, "");
+  if (endpoint.includes("model=")) return endpoint;
+  const separator = endpoint.includes("?") ? "&" : "?";
+  return `${endpoint}${separator}model=${encodeURIComponent(provider.model || "qwen3-asr-flash-realtime")}`;
+}
+
+function openAiAsrSessionUpdate(provider: AsrProvider) {
+  const transcription: Record<string, unknown> = { model: provider.model || "gpt-4o-transcribe" };
+  if (provider.language?.trim()) transcription.language = provider.language.trim();
+  if (provider.prompt?.trim()) transcription.prompt = provider.prompt.trim();
+  return {
+    type: "session.update",
+    session: {
+      type: "transcription",
+      audio: {
+        input: {
+          format: { type: "audio/pcm", rate: Number(provider.sampleRate || 24000) },
+          transcription,
+          noise_reduction: { type: "near_field" },
+          turn_detection: {
+            type: "server_vad",
+            threshold: Number(provider.vadThreshold ?? 0.5),
+            prefix_padding_ms: Number(provider.prefixPaddingMs ?? 300),
+            silence_duration_ms: Number(provider.silenceDurationMs ?? 500),
+          },
+        },
+      },
+    },
+  };
+}
+
+function dashScopeAsrSessionUpdate(provider: AsrProvider) {
+  const transcription: Record<string, unknown> = {};
+  if (provider.language?.trim()) transcription.language = provider.language.trim();
+  const session: Record<string, unknown> = {
+    modalities: ["text"],
+    input_audio_format: "pcm",
+    sample_rate: Number(provider.sampleRate || 16000),
+    input_audio_transcription: transcription,
+  };
+  const vad = Number(provider.vadThreshold ?? 0.2);
+  session.turn_detection = vad > 0
+    ? { type: "server_vad", threshold: vad, silence_duration_ms: Number(provider.silenceDurationMs ?? 800) }
+    : null;
+  return { event_id: "evt_session_update", type: "session.update", session };
+}
+
+function base64FromArrayBuffer(data: ArrayBuffer) {
+  return Buffer.from(data).toString("base64");
+}
+
+function handleTextAsrEvent(session: AsrRealtimeSession, text: string) {
+  const event = JSON.parse(text || "{}") as Record<string, any>;
+  switch (String(event.type ?? "")) {
+    case "conversation.item.input_audio_transcription.delta": {
+      const itemId = String(event.item_id || "default");
+      const delta = String(event.delta || "");
+      if (delta) {
+        session.partialTranscripts.set(itemId, `${session.partialTranscripts.get(itemId) ?? ""}${delta}`);
+        asrPublishTranscript(session);
+      }
+      break;
+    }
+    case "conversation.item.input_audio_transcription.text": {
+      const itemId = String(event.item_id || "default");
+      const content = String(event.text || "");
+      if (content) {
+        session.partialTranscripts.set(itemId, content);
+        asrPublishTranscript(session);
+      }
+      break;
+    }
+    case "conversation.item.input_audio_transcription.completed": {
+      const itemId = String(event.item_id || "default");
+      const transcript = String(event.transcript || "").trim();
+      session.partialTranscripts.delete(itemId);
+      if (transcript) session.completedTranscripts.push(transcript);
+      asrPublishTranscript(session);
+      break;
+    }
+    case "error": {
+      const message = String(event.error?.message || "ASR realtime error");
+      asrFail(session, message);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+const VOLC_MSG_FULL_CLIENT_REQUEST = 0x01;
+const VOLC_MSG_AUDIO_ONLY = 0x02;
+const VOLC_SER_NONE = 0x00;
+const VOLC_SER_JSON = 0x01;
+const VOLC_COMP_NONE = 0x00;
+const VOLC_COMP_GZIP = 0x01;
+const VOLC_FLAG_LAST_PACKET = 0x02;
+
+function volcFrame(messageType: number, flags: number, serialization: number, compression: number, payload: Buffer) {
+  const header = Buffer.from([0x11, ((messageType << 4) | (flags & 0x0f)) & 0xff, ((serialization << 4) | (compression & 0x0f)) & 0xff, 0x00]);
+  const size = Buffer.alloc(4);
+  size.writeInt32BE(payload.length, 0);
+  return Buffer.concat([header, size, payload]);
+}
+
+function volcStartPayload(provider: AsrProvider) {
+  const audio: Record<string, unknown> = { format: "pcm", rate: 16000, bits: 16, channel: 1 };
+  if (provider.language?.trim()) audio.language = provider.language.trim();
+  return Buffer.from(JSON.stringify({
+    user: { uid: "rikkahub" },
+    audio,
+    request: {
+      model_name: "bigmodel",
+      enable_itn: true,
+      enable_punc: true,
+      show_utterances: true,
+      result_type: "full",
+    },
+  }));
+}
+
+function handleVolcAsrEvent(session: AsrRealtimeSession, data: ArrayBuffer) {
+  const buffer = Buffer.from(data);
+  if (buffer.length < 4) return;
+  const byte1 = buffer[1] & 0xff;
+  const byte2 = buffer[2] & 0xff;
+  const messageType = (byte1 >> 4) & 0x0f;
+  const messageFlags = byte1 & 0x0f;
+  const compression = byte2 & 0x0f;
+  let offset = 4;
+  if (messageType === 0x09) {
+    if ((messageFlags & 0x01) !== 0) offset += 4;
+    if (offset + 4 > buffer.length) return;
+    const payloadSize = buffer.readInt32BE(offset);
+    offset += 4;
+    if (payloadSize <= 0 || offset + payloadSize > buffer.length) return;
+    let payload = buffer.subarray(offset, offset + payloadSize);
+    if (compression === VOLC_COMP_GZIP) payload = gunzipSync(payload);
+    const raw = JSON.parse(payload.toString("utf8")) as Record<string, any>;
+    const text = String(raw.result?.text || "");
+    if (text && text !== session.lastText) {
+      session.lastText = text;
+      asrSendClient(session, { type: "transcript", transcript: text });
+    }
+  } else if (messageType === 0x0f) {
+    if (offset + 8 > buffer.length) return;
+    offset += 4;
+    const size = buffer.readInt32BE(offset);
+    offset += 4;
+    const message = size > 0 && offset + size <= buffer.length ? buffer.subarray(offset, offset + size).toString("utf8") : "Volcengine ASR error";
+    asrFail(session, message);
+  }
+}
+
+function sendAsrAudio(session: AsrRealtimeSession, data: ArrayBuffer) {
+  if (!session.upstream || session.upstream.readyState !== WebSocket.OPEN) {
+    session.pendingFrames.push(data);
+    return;
+  }
+  if (session.provider.type === "volcengine") {
+    session.upstream.send(volcFrame(VOLC_MSG_AUDIO_ONLY, 0x00, VOLC_SER_NONE, VOLC_COMP_NONE, Buffer.from(data)));
+    return;
+  }
+  const event: Record<string, unknown> = {
+    type: "input_audio_buffer.append",
+    audio: base64FromArrayBuffer(data),
+  };
+  if (session.provider.type === "dashscope") event.event_id = `evt_${Date.now()}`;
+  session.upstream.send(JSON.stringify(event));
+}
+
+function startAsrRealtimeSession(client: any, providerId?: string) {
+  const provider = state.settings.asrProviders.find((item) => item.id === providerId) ?? selectedAsrProvider();
+  if (!provider) {
+    client.send(JSON.stringify({ type: "error", error: "No ASR provider configured" }));
+    return;
+  }
+  if (!provider.apiKey.trim()) {
+    client.send(JSON.stringify({ type: "error", error: "ASR API Key is empty" }));
+    return;
+  }
+  const endpoint = provider.type === "openai_realtime"
+    ? openAiAsrEndpoint(provider)
+    : provider.type === "dashscope"
+      ? dashScopeAsrEndpoint(provider)
+      : provider.websocketUrl || "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel";
+  const session: AsrRealtimeSession = {
+    provider,
+    client,
+    upstream: null,
+    completedTranscripts: [],
+    partialTranscripts: new Map(),
+    lastText: "",
+    pendingFrames: [],
+    opened: false,
+    finished: false,
+    startedAt: Date.now(),
+    volcSequence: 1,
+  };
+  asrRealtimeSessions.set(client, session);
+  const headers: Record<string, string> = provider.type === "volcengine"
+    ? {
+        "X-Api-Key": provider.apiKey,
+        "X-Api-Resource-Id": provider.resourceId || "volc.seedasr.sauc.duration",
+        "X-Api-Request-Id": id(),
+        "X-Api-Sequence": "-1",
+      }
+    : {
+        Authorization: `Bearer ${provider.apiKey}`,
+        ...(provider.type === "dashscope" ? { "OpenAI-Beta": "realtime=v1" } : {}),
+      };
+  const upstream = new WebSocket(endpoint, { headers });
+  session.upstream = upstream;
+  upstream.binaryType = "arraybuffer";
+  upstream.onopen = () => {
+    session.opened = true;
+    if (provider.type === "openai_realtime") upstream.send(JSON.stringify(openAiAsrSessionUpdate(provider)));
+    if (provider.type === "dashscope") upstream.send(JSON.stringify(dashScopeAsrSessionUpdate(provider)));
+    if (provider.type === "volcengine") {
+      upstream.send(volcFrame(VOLC_MSG_FULL_CLIENT_REQUEST, 0x00, VOLC_SER_JSON, VOLC_COMP_GZIP, gzipSync(volcStartPayload(provider))));
+    }
+    asrSendClient(session, { type: "status", status: "listening" });
+    for (const frame of session.pendingFrames.splice(0)) sendAsrAudio(session, frame);
+  };
+  upstream.onmessage = (event) => {
+    try {
+      if (typeof event.data === "string") handleTextAsrEvent(session, event.data);
+      else handleVolcAsrEvent(session, event.data as ArrayBuffer);
+    } catch (err) {
+      asrFail(session, err instanceof Error ? err.message : String(err));
+    }
+  };
+  upstream.onerror = () => asrFail(session, "ASR websocket failed");
+  upstream.onclose = () => {
+    session.finished = true;
+    addLog({
+      providerId: provider.id,
+      providerName: provider.name,
+      url: endpoint,
+      ok: true,
+      status: 0,
+      kind: "provider:asr:realtime",
+      durationMs: Date.now() - session.startedAt,
+      requestBody: `realtime pcm websocket\nprovider=${provider.type}\nsampleRate=${provider.sampleRate || (provider.type === "openai_realtime" ? 24000 : 16000)}`,
+      responseBody: session.lastText || [...session.completedTranscripts, ...session.partialTranscripts.values()].join(" "),
+    });
+    asrSendClient(session, { type: "status", status: "idle" });
+  };
+}
+
+function stopAsrRealtimeSession(client: any) {
+  const session = asrRealtimeSessions.get(client);
+  if (!session) return;
+  if (session.provider.type === "volcengine" && session.upstream?.readyState === WebSocket.OPEN) {
+    session.upstream.send(volcFrame(VOLC_MSG_AUDIO_ONLY, VOLC_FLAG_LAST_PACKET, VOLC_SER_NONE, VOLC_COMP_NONE, Buffer.alloc(0)));
+  }
+  session.upstream?.close(1000, "stop");
+  asrRealtimeSessions.delete(client);
+}
+
+async function generateSuggestionsForConversation(conversation: Conversation) {
+  const content = conversationSummary(conversation, 8);
+  if (!content) return [];
+  const prompt = applyPlaceholders(state.settings.suggestionPrompt || DEFAULT_SUGGESTION_PROMPT, {
+    locale: localeDisplayName(),
+    content: selectedConversationMessages(conversation).slice(-8).map(summaryAsText).join("\n\n"),
+  });
+  const text = await fetchAuxiliaryText(state.settings.suggestionModelId, prompt, "suggestion", {
+    reasoningLevel: "off",
+  });
+  return uniqueStrings(
+    text
+      .split(/\r?\n/)
+      .map((line) => line.replace(/^\s*(?:[-*]|\d+[.)、])\s*/, "").trim())
+      .filter(Boolean)
+      .map((line) => limitAuxiliaryText(line, SUGGESTION_CHARACTER_LIMIT))
+      .filter(Boolean),
+  ).slice(0, 10);
+}
+
+async function compressConversation(conversation: Conversation, additionalPrompt = "", targetTokens = 2000, keepRecentMessages = 32) {
+  const allMessages = selectedConversationMessages(conversation);
+  if (allMessages.length === 0) throw new Error("当前会话没有可压缩的消息");
+
+  let messagesToCompress: Message[];
+  let messagesToKeep: Message[];
+  if (keepRecentMessages > 0 && allMessages.length > keepRecentMessages) {
+    messagesToCompress = allMessages.slice(0, -keepRecentMessages);
+    messagesToKeep = allMessages.slice(-keepRecentMessages);
+  } else if (keepRecentMessages > 0) {
+    throw new Error("消息数量不足，无法在保留最近消息的同时压缩历史");
+  } else {
+    messagesToCompress = allMessages;
+    messagesToKeep = [];
+  }
+
+  const splitMessages = (messages: Message[]): Message[][] => {
+    if (messages.length <= 256) return [messages];
+    const mid = Math.floor(messages.length / 2);
+    return [...splitMessages(messages.slice(0, mid)), ...splitMessages(messages.slice(mid))];
+  };
+
+  const chunks = splitMessages(messagesToCompress);
+  const summaries: string[] = [];
+  for (const chunk of chunks) {
+    const prompt = applyPlaceholders(state.settings.compressPrompt || DEFAULT_COMPRESS_PROMPT, {
+      content: chunk.map(summaryAsText).join("\n\n"),
+      target_tokens: String(targetTokens),
+      additional_context: additionalPrompt.trim() ? `Additional instructions from user: ${additionalPrompt.trim()}` : "",
+      locale: localeDisplayName(),
+    });
+    summaries.push(cleanAuxiliaryText(await fetchAuxiliaryText(state.settings.compressModelId || state.settings.chatModelId, prompt, "compression", {
+      stream: true,
+      onDelta: (delta) => {
+        if (!delta) return;
+        conversation.chatSuggestions = [`正在压缩对话历史... ${Math.min(summaries.length + 1, chunks.length)}/${chunks.length}`];
+        conversation.updateAt = Date.now();
+        persistConversation(conversation);
+        saveState();
+        broadcastConversation(conversation);
+      },
+    })));
+  }
+
+  conversation.messages = [
+    ...summaries.filter(Boolean).map((summary) => ({ id: id(), messages: [message("USER", [{ type: "text", text: summary }])], selectIndex: 0 })),
+    ...messagesToKeep.map((msg) => ({ id: id(), messages: [JSON.parse(JSON.stringify(msg))], selectIndex: 0 })),
+  ];
+  conversation.truncateIndex = 0;
+  conversation.chatSuggestions = [];
+  conversation.updateAt = Date.now();
+  persistConversation(conversation);
+  saveState();
+  broadcastConversation(conversation);
+  return summaries;
+}
+
+const generating = new Map<string, AbortController>();
+
+function cloneConversation(conversation: Conversation): Conversation {
+  return JSON.parse(JSON.stringify(conversation)) as Conversation;
+}
+
+function completeConversationGeneration(conversationId: string, controller: AbortController) {
+  if (generating.get(conversationId) !== controller) return;
+  generating.delete(conversationId);
+  // The generating Map drives the sidebar's per-conversation streaming indicator
+  // (rendered via the conversations-list SSE). Now that broadcastNodeUpdateNow no
+  // longer pings the list on every chunk (see comment at server.ts:1495), we have
+  // to explicitly refresh on the false→true and true→false transitions so the
+  // indicator turns on/off. Caller `generateAnswer` calls broadcastConversation
+  // at start which already touches broadcastList, and we cover the end transition
+  // right here.
+  broadcastList();
+  // 1.2.6:流式结束,全量 reconcile 活库——刷残余脏标记 + persistConversation,把流式
+  // 期间增量 upsert 的节点和任何新增/删除的节点统一对齐(清孤立节点行)。幂等
+  // (INSERT OR REPLACE 会话行 + 删旧节点 + 重插)。会话已被并发删除时跳过;flushConvDirty
+  // 也会跳过已删会话的脏标记。
+  flushConvDirtyNow();
+  const conv = getConversation(conversationId);
+  if (conv) persistConversation(conv);
+}
+
+function conversationStillExists(conversationId: string) {
+  return state.conversations.some((item) => item.id === conversationId);
+}
+
+async function runPostGenerationTasks(conversationId: string, snapshot: Conversation, assistantMessageId: string) {
+  const liveConversation = () => getConversation(conversationId);
+  if (shouldAutoGenerateTitle(snapshot) && modelExists(state.settings.titleModelId)) {
+    try {
+      const title = await generateTitleForConversation(snapshot);
+      const live = liveConversation();
+      if (live && shouldAutoGenerateTitle(live)) {
+        live.title = title;
+        persistConversation(live);
+        broadcastConversation(live);
+      }
+    } catch (titleError) {
+      addLog({
+        providerId: "",
+        providerName: "RikkaHub PC",
+        url: "conversation:title",
+        ok: false,
+        status: 0,
+        kind: "aux:title",
+        error: titleError instanceof Error ? titleError.message : String(titleError),
+      });
+      // Title generation failed → fall back to first user message text (Android parity).
+      const live = liveConversation();
+      if (live && shouldAutoGenerateTitle(live)) {
+        const firstText = textFromParts(live.messages[0]?.messages[0]?.parts ?? []).trim();
+        const fallback = limitAuxiliaryText(firstText, TITLE_CHARACTER_LIMIT) || "New Conversation";
+        live.title = fallback;
+        persistConversation(live);
+        broadcastConversation(live);
+      }
+    }
+  } else if (shouldAutoGenerateTitle(snapshot)) {
+    // No title model configured at all → still give it a sensible name from the first user message.
+    const live = liveConversation();
+    if (live && shouldAutoGenerateTitle(live)) {
+      const firstText = textFromParts(live.messages[0]?.messages[0]?.parts ?? []).trim();
+      const fallback = limitAuxiliaryText(firstText, TITLE_CHARACTER_LIMIT) || "New Conversation";
+      if (fallback !== live.title) {
+        live.title = fallback;
+        persistConversation(live);
+        broadcastConversation(live);
+      }
+    }
+  }
+
+  if (modelExists(state.settings.suggestionModelId)) {
+    try {
+      const suggestions = await generateSuggestionsForConversation(snapshot);
+      const live = liveConversation();
+      const lastNode = live?.messages[live.messages.length - 1];
+      const lastMessage = lastNode?.messages[lastNode.selectIndex] ?? lastNode?.messages[0];
+      if (live && lastMessage?.id === assistantMessageId && !generating.has(live.id)) {
+        live.chatSuggestions = suggestions;
+        live.updateAt = Date.now();
+        persistConversation(live);
+        broadcastConversation(live);
+      }
+    } catch {
+      // Suggestions are auxiliary;正文生成状态不应受影响。
+    }
+  }
+}
+
+async function generateAnswer(conversation: Conversation, regenerateAtNodeId?: string) {
+  const controller = new AbortController();
+  generating.set(conversation.id, controller);
+  const assistant = findAssistant(conversation.assistantId);
+  const picked = findModel(assistant.chatModelId ?? state.settings.chatModelId);
+  // 重新生成 ASSISTANT:调用方已在该 node 追加空占位 message 并把 selectIndex 指向它,
+  // 直接复用,绕开 ensureAssistantGenerationNode(它会复用末尾 assistant 或新建 node,
+  // 都不是"在指定 node 上新增分支")。find 不到时安全回退到默认逻辑。
+  let assistantNode: MessageNode;
+  if (regenerateAtNodeId) {
+    const found = conversation.messages.find((n) => n.id === regenerateAtNodeId);
+    assistantNode = found ?? ensureAssistantGenerationNode(conversation, picked.model.id);
+  } else {
+    assistantNode = ensureAssistantGenerationNode(conversation, picked.model.id);
+  }
+  const currentMessage = assistantNode.messages[assistantNode.selectIndex];
+  const resumingApprovedTools = hasResumableToolParts(currentMessage);
+  currentMessage.finishedAt = null;
+  // Allow createdAt to be re-stamped on the first content chunk of this generation pass —
+  // supports regenerate, which reuses the same message object.
+  streamStartedMessages.delete(currentMessage);
+  if (!resumingApprovedTools) {
+    // Show a loading placeholder immediately so the UI has visual feedback during the
+    // upstream first-token wait. addStreamText / replaceLoadingReasoningWithTool will
+    // strip this placeholder as soon as the first real delta arrives.
+    setMessageLoading(currentMessage);
+  }
+  conversation.updateAt = Date.now();
+  saveState();
+  broadcastNodeUpdate(conversation, assistantNode);
+  try {
+    if (resumingApprovedTools) {
+      await resumeApprovedToolParts(conversation, assistant, currentMessage, assistantNode, false);
+    }
+    const content = await callProviderStreaming(conversation, currentMessage, assistantNode, controller.signal);
+    if (controller.signal.aborted) throw new DOMException("Generation stopped", "AbortError");
+    applyOutputTransforms(currentMessage, assistant);
+    finishReasoningParts(currentMessage);
+    if (hasPendingToolApproval(currentMessage)) {
+      currentMessage.finishedAt = null;
+      ensureUsage(currentMessage, conversation);
+      conversation.updateAt = Date.now();
+      saveState();
+      completeConversationGeneration(conversation.id, controller);
+      broadcastNodeUpdate(conversation, assistantNode);
+      broadcastConversation(conversation);
+      return;
+    }
+    if (currentMessage.parts.length === 0) {
+      finishMessage(currentMessage, [{ type: "text", text: content }]);
+    } else {
+      const hasText = textFromParts(currentMessage.parts).trim().length > 0;
+      if (!hasText && content && content !== "(empty response)") {
+        appendTextPart(currentMessage, content);
+      }
+      currentMessage.finishedAt = new Date().toISOString();
+    }
+    ensureUsage(currentMessage, conversation);
+    conversation.updateAt = Date.now();
+    saveState();
+    completeConversationGeneration(conversation.id, controller);
+    broadcastNodeUpdate(conversation, assistantNode);
+    broadcastConversation(conversation);
+    const snapshot = cloneConversation(conversation);
+    void runPostGenerationTasks(conversation.id, snapshot, currentMessage.id);
+  } catch (err) {
+    if (!conversationStillExists(conversation.id)) {
+      completeConversationGeneration(conversation.id, controller);
+      return;
+    }
+    if (err instanceof DOMException && err.name === "AbortError") {
+      applyOutputTransforms(currentMessage, assistant);
+      finishReasoningParts(currentMessage);
+      currentMessage.finishedAt = new Date().toISOString();
+      ensureUsage(currentMessage, conversation);
+      conversation.updateAt = Date.now();
+      saveState();
+      completeConversationGeneration(conversation.id, controller);
+      broadcastNodeUpdate(conversation, assistantNode);
+      broadcastConversation(conversation);
+      return;
+    }
+    const content = err instanceof Error ? err.message : String(err);
+    applyOutputTransforms(currentMessage, assistant);
+    finishReasoningParts(currentMessage);
+    if (currentMessage.parts.length === 0) {
+      finishMessage(currentMessage, [{ type: "text", text: `请求失败：${content}` }]);
+    } else {
+      appendTextPart(currentMessage, `\n\n请求失败：${content}`);
+      currentMessage.finishedAt = new Date().toISOString();
+    }
+    ensureUsage(currentMessage, conversation);
+    conversation.updateAt = Date.now();
+    saveState();
+    completeConversationGeneration(conversation.id, controller);
+    broadcastNodeUpdate(conversation, assistantNode);
+    broadcastConversation(conversation);
+  } finally {
+    completeConversationGeneration(conversation.id, controller);
+    if (!conversationStillExists(conversation.id)) return;
+    broadcastNodeUpdate(conversation, assistantNode);
+    broadcastConversation(conversation);
+  }
+}
+
+function ensureAssistantGenerationNode(conversation: Conversation, modelId: string): MessageNode {
+  const last = conversation.messages[conversation.messages.length - 1];
+  if (last?.messages[last.selectIndex]?.role === "ASSISTANT") {
+    const msg = last.messages[last.selectIndex];
+    msg.modelId = modelId;
+    if (hasToolParts(msg)) {
+      return last;
+    }
+    return last;
+  }
+  const assistantNode: MessageNode = {
+    id: id(),
+    messages: [message("ASSISTANT", [], modelId)],
+    selectIndex: 0,
+  };
+  conversation.messages.push(assistantNode);
+  return assistantNode;
+}
+
+function truncateConversationForRegenerate(conversation: Conversation, messageId?: string) {
+  if (!messageId) {
+    const last = conversation.messages[conversation.messages.length - 1];
+    if (last?.messages[last.selectIndex]?.role === "ASSISTANT") conversation.messages.pop();
+    return;
+  }
+  const nodeIndex = conversation.messages.findIndex((node) => node.messages.some((msg) => msg.id === messageId));
+  if (nodeIndex < 0) return;
+  const node = conversation.messages[nodeIndex];
+  const msg = node.messages.find((item) => item.id === messageId);
+  if (!msg) return;
+  if (msg.role === "USER") {
+    conversation.messages = conversation.messages.slice(0, nodeIndex + 1);
+    return;
+  }
+  conversation.messages = conversation.messages.slice(0, nodeIndex);
+}
+
+function updateSettings(next: Settings) {
+  state.settings = next;
+  saveState();
+  broadcastSettings();
+  broadcastList();
+}
+
+async function routeApi(request: Request, url: URL) {
+  const path = url.pathname.replace(/^\/api\/?/, "");
+
+  if (path === "health") return json({ ok: true, version: APP_VERSION, dataDir });
+  if (path === "ai-icon" && request.method === "GET") {
+    const name = url.searchParams.get("name")?.trim();
+    if (!name) return error("Missing name", 400);
+    return serveAIIcon(name);
+  }
+  // 字体目录:三层来源一起返回,前端拼下拉框 + 注入 @font-face。
+  // 系统/自定义字体去重:与 builtin 同名(cssName)的系统字体不返回,避免重复显示。
+  if (path === "fonts/list" && request.method === "GET") {
+    const builtin = listBuiltinFonts();
+    const custom = listCustomFonts();
+    const exclude = new Set<string>();
+    for (const entry of [...builtin, ...custom]) exclude.add(entry.cssName.toLowerCase());
+    const system = listSystemFonts(exclude);
+    return json({ builtin, custom, system });
+  }
+  const fontServe = path.match(/^fonts\/(builtin|custom)\/(.+)$/);
+  if (fontServe && request.method === "GET") {
+    const source = fontServe[1] as "builtin" | "custom";
+    let fileName: string;
+    try { fileName = decodeURIComponent(fontServe[2]); }
+    catch { return error("Invalid font name", 400); }
+    const target = resolveFontFile(source, fileName);
+    if (!target) return error("Font not found", 404);
+    return new Response(Bun.file(target), {
+      headers: {
+        "Content-Type": FONT_MIME[fontExtension(fileName)] ?? "application/octet-stream",
+        "Cache-Control": "public, max-age=86400",
+      },
+    });
+  }
+  if (path === "fonts/upload" && request.method === "POST") {
+    const form = await request.formData();
+    const file = form.get("file");
+    if (!(file instanceof File)) return error("Missing file", 400);
+    const ext = fontExtension(file.name);
+    if (!FONT_EXTENSIONS_SET.has(ext)) return error("Unsupported font format (use ttf/otf/woff/woff2)", 400);
+    if (file.size > MAX_FONT_BYTES) return error(`Font too large (max ${MAX_FONT_BYTES / 1024 / 1024}MB)`, 413);
+    // sanitize:只保留文件名部分,去掉任何路径前缀,防 traversal。
+    const rawName = fontCssName(file.name) + ext;
+    const safeName = rawName.replace(/[\\/ ]/g, "_");
+    if (!isBareFileName(safeName) || safeName === "." || safeName === "..") return error("Invalid filename", 400);
+    mkdirSync(customFontsDir, { recursive: true });
+    const target = join(customFontsDir, safeName);
+    await Bun.write(target, file);
+    console.log(`[fonts] uploaded ${safeName} (${(file.size / 1024).toFixed(1)} KB)`);
+    return json({ font: makeBundledFontEntry("custom", safeName) });
+  }
+  const fontDelete = path.match(/^fonts\/custom\/(.+)$/);
+  if (fontDelete && request.method === "DELETE") {
+    let fileName: string;
+    try { fileName = decodeURIComponent(fontDelete[1]); }
+    catch { return error("Invalid font name", 400); }
+    if (!isBareFileName(fileName) || !isFontFile(fileName)) return error("Invalid font name", 400);
+    const target = join(customFontsDir, fileName);
+    if (!existsSync(target)) return error("Font not found", 404);
+    rmSync(target, { force: true });
+    console.log(`[fonts] deleted ${fileName}`);
+    return json({ status: "deleted" });
+  }
+  if (path === "settings" && request.method === "GET") return json(state.settings);
+  if (path === "settings/stream") {
+    return openSse(
+      () => [["update", state.settings]],
+      (controller) => {
+        settingsClients.add(controller);
+        return () => settingsClients.delete(controller);
+      },
+    );
+  }
+  if (path === "conversations/stream") {
+    return openSse(
+      () => [["invalidate", { type: "invalidate", assistantId: state.settings.assistantId, timestamp: Date.now() }]],
+      (controller) => {
+        listClients.add(controller);
+        return () => listClients.delete(controller);
+      },
+    );
+  }
+
+  if (path === "settings/display" && request.method === "POST") {
+    const body = await readJson<Record<string, JsonValue>>(request);
+    updateSettings({ ...state.settings, displaySetting: { ...state.settings.displaySetting, ...body } });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/assistant" && request.method === "POST") {
+    const body = await readJson<{ assistantId: string }>(request);
+    if (!state.settings.assistants.some((assistant) => assistant.id === body.assistantId)) return error("Assistant not found", 404);
+    updateSettings({ ...state.settings, assistantId: body.assistantId });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/assistant/detail" && request.method === "POST") {
+    const body = await readJson<Assistant>(request);
+    const assistant = { ...defaultAssistant(), ...body, id: body.id || id() };
+    updateSettings({
+      ...state.settings,
+      assistantId: assistant.id,
+      assistants: state.settings.assistants.some((item) => item.id === assistant.id)
+        ? state.settings.assistants.map((item) => (item.id === assistant.id ? assistant : item))
+        : [...state.settings.assistants, assistant],
+    });
+    return json({ status: "ok", assistant });
+  }
+  const assistantDelete = path.match(/^settings\/assistant\/([^/]+)$/);
+  if (assistantDelete && request.method === "DELETE") {
+    const idValue = decodeURIComponent(assistantDelete[1]);
+    if (state.settings.assistants.length <= 1) return error("At least one assistant is required", 400);
+    const assistants = state.settings.assistants.filter((item) => item.id !== idValue);
+    state.memories = state.memories.filter((memory) => memory.assistantId !== idValue);
+    updateSettings({
+      ...state.settings,
+      assistants,
+      assistantId: state.settings.assistantId === idValue ? assistants[0].id : state.settings.assistantId,
+    });
+    return json({ status: "deleted" });
+  }
+  if (path === "settings/assistants/reorder" && request.method === "POST") {
+    const body = await readJson<{ ids: string[] }>(request);
+    const byId = new Map(state.settings.assistants.map((item) => [item.id, item]));
+    const ordered = body.ids.map((itemId) => byId.get(itemId)).filter(Boolean) as Assistant[];
+    const rest = state.settings.assistants.filter((item) => !body.ids.includes(item.id));
+    updateSettings({ ...state.settings, assistants: [...ordered, ...rest] });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/assistant/model" && request.method === "POST") {
+    const body = await readJson<{ assistantId: string; modelId: string }>(request);
+    updateSettings({
+      ...state.settings,
+      assistants: state.settings.assistants.map((assistant) =>
+        assistant.id === body.assistantId ? { ...assistant, chatModelId: body.modelId } : assistant,
+      ),
+    });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/assistant/thinking-budget" && request.method === "POST") {
+    const body = await readJson<{ assistantId: string; reasoningLevel: string }>(request);
+    updateSettings({
+      ...state.settings,
+      assistants: state.settings.assistants.map((assistant) =>
+        assistant.id === body.assistantId ? { ...assistant, reasoningLevel: body.reasoningLevel } : assistant,
+      ),
+    });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/assistant/mcp" && request.method === "POST") {
+    const body = await readJson<{ assistantId: string; mcpServerIds: string[] }>(request);
+    const assistantExists = state.settings.assistants.some((assistant) => assistant.id === body.assistantId);
+    if (!assistantExists) return error("Assistant not found", 404);
+    let mcpServerIds: string[];
+    try {
+      mcpServerIds = validateKnownJsonIds(state.settings.mcpServers, body.mcpServerIds, "mcpServerIds");
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 400);
+    }
+    updateSettings({
+      ...state.settings,
+      assistants: state.settings.assistants.map((assistant) => {
+        if (assistant.id !== body.assistantId) return assistant;
+        // Master-on transition for assistant-level MCP servers. Mirror the global server's
+        // behavior: when the user flips an assistant's MCP server master ON, if every tool
+        // in this server is currently disabled-by-override for THIS assistant (meaning
+        // there's no surviving user preference at the assistant scope), wipe the overrides
+        // so the freshly-enabled MCP exposes all globally-enabled tools. If even one tool
+        // override doesn't disable a tool, the user has expressed an intentional subset —
+        // leave overrides untouched.
+        const prevServers = new Set(getStringArray(assistant.mcpServers));
+        const nextServers = new Set(mcpServerIds);
+        const newlyAdded: string[] = mcpServerIds.filter((sid) => !prevServers.has(sid));
+        const overrides = isRecord(assistant.mcpToolOverrides)
+          ? { ...assistant.mcpToolOverrides as Record<string, Record<string, { enable?: boolean; needsApproval?: boolean }>> }
+          : {};
+        for (const sid of newlyAdded) {
+          const globalServer = (state.settings.mcpServers as Array<Record<string, JsonValue>>).find((s) => String(s.id) === sid);
+          const globalCommon = globalServer && isRecord(globalServer.commonOptions) ? globalServer.commonOptions : null;
+          const globalTools = globalCommon && Array.isArray(globalCommon.tools) ? globalCommon.tools.filter(isRecord) : [];
+          const visibleTools = globalTools.filter((tool) => tool.enable !== false);
+          if (visibleTools.length === 0) continue;
+          const perServerOverride = overrides[sid] ?? {};
+          // Every visible tool effectively disabled by THIS assistant means the override
+          // map is the only thing standing in the way of these tools being exposed.
+          const allOverriddenOff = visibleTools.every((tool) => perServerOverride[String(tool.name ?? "")]?.enable === false);
+          if (allOverriddenOff) {
+            // Strip per-tool `enable` overrides for this server. Keep needsApproval entries —
+            // they're an independent dimension and shouldn't get wiped just because the
+            // user re-enabled the master switch.
+            const cleanedServerOverride: Record<string, { enable?: boolean; needsApproval?: boolean }> = {};
+            for (const [toolName, ov] of Object.entries(perServerOverride)) {
+              if (typeof ov?.needsApproval === "boolean") {
+                cleanedServerOverride[toolName] = { needsApproval: ov.needsApproval };
+              }
+            }
+            if (Object.keys(cleanedServerOverride).length === 0) {
+              delete overrides[sid];
+            } else {
+              overrides[sid] = cleanedServerOverride;
+            }
+          }
+        }
+        return { ...assistant, mcpServers: mcpServerIds, mcpToolOverrides: overrides };
+      }),
+    });
+    return json({ status: "ok" });
+  }
+  // Per-tool override within one MCP server, for ONE assistant. Body shape:
+  //   { assistantId, serverId, toolName, enable?, needsApproval? }
+  // - enable: null/undefined → clear override (revert to global); true/false → set
+  // - needsApproval: same semantics
+  // Sending both nulls removes the entry from mcpToolOverrides[serverId][toolName]. If that
+  // makes the server's override map empty, we drop the server key as well to keep state.json
+  // tidy.
+  if (path === "settings/assistant/mcp-tool-override" && request.method === "POST") {
+    const body = await readJson<{
+      assistantId?: string;
+      serverId?: string;
+      toolName?: string;
+      enable?: boolean | null;
+      needsApproval?: boolean | null;
+    }>(request);
+    const assistantId = String(body.assistantId ?? "");
+    const serverId = String(body.serverId ?? "");
+    const toolName = String(body.toolName ?? "");
+    if (!assistantId || !serverId || !toolName) {
+      return error("assistantId, serverId, toolName are required", 400);
+    }
+    const assistantExists = state.settings.assistants.some((assistant) => assistant.id === assistantId);
+    if (!assistantExists) return error("Assistant not found", 404);
+    const serverKnown = (state.settings.mcpServers as Array<Record<string, JsonValue>>).some((server) => String(server.id) === serverId);
+    if (!serverKnown) return error("MCP server not found", 404);
+    updateSettings({
+      ...state.settings,
+      assistants: state.settings.assistants.map((assistant) => {
+        if (assistant.id !== assistantId) return assistant;
+        const overrides = isRecord(assistant.mcpToolOverrides)
+          ? { ...assistant.mcpToolOverrides as Record<string, Record<string, { enable?: boolean; needsApproval?: boolean }>> }
+          : {};
+        const serverOverrides = isRecord(overrides[serverId])
+          ? { ...overrides[serverId] }
+          : {};
+        const next: { enable?: boolean; needsApproval?: boolean } = { ...(serverOverrides[toolName] ?? {}) };
+        if (body.enable === null) delete next.enable;
+        else if (typeof body.enable === "boolean") next.enable = body.enable;
+        if (body.needsApproval === null) delete next.needsApproval;
+        else if (typeof body.needsApproval === "boolean") next.needsApproval = body.needsApproval;
+        if (Object.keys(next).length === 0) {
+          delete serverOverrides[toolName];
+        } else {
+          serverOverrides[toolName] = next;
+        }
+        if (Object.keys(serverOverrides).length === 0) {
+          delete overrides[serverId];
+        } else {
+          overrides[serverId] = serverOverrides;
+        }
+        // Mirror the global server's "all tools off → master off" rule at the assistant
+        // scope: if every globally-enabled tool on this server is now disabled-by-override
+        // for this assistant, remove the server from assistant.mcpServers (auto master-off).
+        // This is the assistant-level counterpart of Transition 2 in settings/mcp-server/detail.
+        let mcpServers = assistant.mcpServers;
+        if (assistant.mcpServers.includes(serverId)) {
+          const globalServer = (state.settings.mcpServers as Array<Record<string, JsonValue>>).find((s) => String(s.id) === serverId);
+          const globalCommon = globalServer && isRecord(globalServer.commonOptions) ? globalServer.commonOptions : null;
+          const globalTools = globalCommon && Array.isArray(globalCommon.tools) ? globalCommon.tools.filter(isRecord) : [];
+          const visibleTools = globalTools.filter((tool) => tool.enable !== false);
+          const serverOverrideForCheck = overrides[serverId] ?? {};
+          if (visibleTools.length > 0 && visibleTools.every((tool) => serverOverrideForCheck[String(tool.name ?? "")]?.enable === false)) {
+            mcpServers = assistant.mcpServers.filter((sid) => sid !== serverId);
+          }
+        }
+        return { ...assistant, mcpServers, mcpToolOverrides: overrides };
+      }),
+    });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/assistant/injections" && request.method === "POST") {
+    const body = await readJson<{
+      assistantId: string;
+      modeInjectionIds: string[];
+      lorebookIds: string[];
+      quickMessageIds: string[];
+    }>(request);
+    const assistantExists = state.settings.assistants.some((assistant) => assistant.id === body.assistantId);
+    if (!assistantExists) return error("Assistant not found", 404);
+    let modeInjectionIds: string[];
+    let lorebookIds: string[];
+    let quickMessageIds: string[];
+    try {
+      modeInjectionIds = validateKnownJsonIds(state.settings.modeInjections, body.modeInjectionIds, "modeInjectionIds");
+      lorebookIds = validateKnownJsonIds(state.settings.lorebooks, body.lorebookIds, "lorebookIds");
+      quickMessageIds = validateKnownJsonIds(state.settings.quickMessages, body.quickMessageIds, "quickMessageIds");
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 400);
+    }
+    updateSettings({
+      ...state.settings,
+      assistants: state.settings.assistants.map((assistant) =>
+        assistant.id === body.assistantId
+          ? {
+              ...assistant,
+              modeInjectionIds,
+              lorebookIds,
+              quickMessageIds,
+            }
+          : assistant,
+      ),
+    });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/assistant/skills" && request.method === "POST") {
+    const body = await readJson<{ assistantId: string; enabledSkills: string[] }>(request);
+    const assistantExists = state.settings.assistants.some((assistant) => assistant.id === body.assistantId);
+    if (!assistantExists) return error("Assistant not found", 404);
+    const installedSkillNames = new Set(listSkills().map((skill) => skill.name));
+    const enabledSkills = getStringArray(body.enabledSkills);
+    const unknownSkill = enabledSkills.find((skillName) => !installedSkillNames.has(skillName));
+    if (unknownSkill) return error(`enabledSkills contains unknown skill: ${unknownSkill}`, 400);
+    updateSettings({
+      ...state.settings,
+      assistants: state.settings.assistants.map((assistant) =>
+        assistant.id === body.assistantId ? { ...assistant, enabledSkills } : assistant,
+      ),
+    });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/memories" && request.method === "GET") {
+    const assistantId = url.searchParams.get("assistantId") ?? state.settings.assistantId;
+    const assistant = findAssistant(assistantId);
+    const memoryAssistantId = assistant.useGlobalMemory ? GLOBAL_MEMORY_ID : assistant.id;
+    return json({
+      assistantId: memoryAssistantId,
+      memories: state.memories
+        .filter((memory) => memory.assistantId === memoryAssistantId)
+        .sort((a, b) => a.id - b.id),
+    });
+  }
+  if (path === "settings/memory/detail" && request.method === "POST") {
+    const body = await readJson<{ assistantId?: string; id?: number; content?: string }>(request);
+    const assistant = findAssistant(body.assistantId ?? state.settings.assistantId);
+    const memoryAssistantId = assistant.useGlobalMemory ? GLOBAL_MEMORY_ID : assistant.id;
+    const content = String(body.content ?? "").trim();
+    if (!content) return error("Memory content is required", 400);
+    let memory: AssistantMemory | undefined;
+    if (Number.isInteger(Number(body.id)) && Number(body.id) > 0) {
+      const memoryId = Number(body.id);
+      memory = state.memories.find((item) => item.id === memoryId && item.assistantId === memoryAssistantId);
+      if (!memory) return error(`Memory record #${memoryId} not found`, 404);
+      memory.content = content;
+      memory.updatedAt = Date.now();
+    } else {
+      const now = Date.now();
+      memory = {
+        id: state.nextMemoryId++,
+        assistantId: memoryAssistantId,
+        content,
+        createdAt: now,
+        updatedAt: now,
+      };
+      state.memories.push(memory);
+    }
+    saveState();
+    broadcastSettings();
+    return json({ status: "ok", memory });
+  }
+  const memoryDelete = path.match(/^settings\/memory\/(\d+)$/);
+  if (memoryDelete && request.method === "DELETE") {
+    const memoryId = Number(memoryDelete[1]);
+    const before = state.memories.length;
+    state.memories = state.memories.filter((memory) => memory.id !== memoryId);
+    if (state.memories.length === before) return error(`Memory record #${memoryId} not found`, 404);
+    saveState();
+    broadcastSettings();
+    return json({ status: "deleted" });
+  }
+  if (path === "settings/mcp-server/detail" && request.method === "POST") {
+    const body = await readJson<Record<string, JsonValue>>(request);
+    const common = isRecord(body.commonOptions) ? body.commonOptions : {};
+    // Read the previous server state so we can detect the user transitioning the main MCP
+    // switch from off→on, which has special "revive child switches" semantics (see below).
+    const prevServer = (state.settings.mcpServers as Array<Record<string, JsonValue>>)
+      .find((item) => String(item.id) === String(body.id ?? "")) ?? null;
+    const prevCommon = prevServer && isRecord(prevServer.commonOptions) ? prevServer.commonOptions : null;
+    const wasEnabled = prevCommon ? prevCommon.enable !== false : false;
+    const willEnable = common.enable !== false;
+    let server: Record<string, JsonValue> = {
+      type: String(body.type ?? "streamable_http") === "sse" ? "sse" : "streamable_http",
+      url: String(body.url ?? ""),
+      ...body,
+      id: String(body.id ?? id()),
+      ssePostEndpoint: String(body.ssePostEndpoint ?? ""),
+      commonOptions: {
+        enable: willEnable,
+        name: String(common.name ?? body.name ?? "MCP Server"),
+        headers: Array.isArray(common.headers) ? common.headers : [],
+        tools: Array.isArray(common.tools) ? common.tools : [],
+        lastSyncAt: typeof common.lastSyncAt === "number" ? common.lastSyncAt : null,
+        lastSyncError: String(common.lastSyncError ?? ""),
+        connected: common.connected === true,
+      },
+    };
+    if (isRecord(server.commonOptions) && server.commonOptions.enable !== false && String(server.url ?? "").trim()) {
+      server = await syncMcpServerTools(server);
+    }
+    // ── Master/child switch coupling ─────────────────────────────────────────────────
+    // The MCP server's `commonOptions.enable` is a master switch; each tool's `enable`
+    // is a child switch that persists across master toggles to preserve user intent.
+    //
+    // Transition 1 — master off → on:
+    //   If every child is currently off (i.e. there's no surviving user preference),
+    //   revive them all to ON so the freshly-enabled MCP isn't a no-op surprise. If even
+    //   one child is on, the user has expressed an intentional subset — leave it alone.
+    //
+    // Transition 2 — master is on AND user just turned every child off:
+    //   Auto-flip master to off, since an MCP with no enabled tools is a dead control.
+    //   This pairs with Transition 1: re-enabling later will revive everything.
+    //
+    // Transition 3 — master on → off (manual):
+    //   DON'T touch child states. The user might just be temporarily hiding MCP from
+    //   chat; we want their next re-enable to remember which tools were on.
+    if (isRecord(server.commonOptions)) {
+      const finalCommon = server.commonOptions as Record<string, JsonValue>;
+      const tools = Array.isArray(finalCommon.tools) ? finalCommon.tools.filter(isRecord) : [];
+      const allOff = tools.length > 0 && tools.every((tool) => tool.enable === false);
+      if (!wasEnabled && willEnable && allOff) {
+        // Transition 1: revive child switches.
+        server.commonOptions = {
+          ...finalCommon,
+          tools: tools.map((tool) => ({ ...tool, enable: true })),
+        };
+      } else if (willEnable && allOff) {
+        // Transition 2: auto-flip master off. This catches the "user turned off the last
+        // tool" case from the per-tool save path (settings/mcp-server/detail also handles
+        // tool toggle saves since the UI debounces a full server snapshot).
+        server.commonOptions = { ...finalCommon, enable: false };
+      }
+      // Transition 3 needs no action — the tools array is already preserved verbatim.
+    }
+    const result = upsertById(state.settings.mcpServers as JsonValue[], server);
+    updateSettings({ ...state.settings, mcpServers: result.items });
+    return json({ status: "ok", server: result.item });
+  }
+  const mcpDelete = path.match(/^settings\/mcp-server\/([^/]+)$/);
+  if (mcpDelete && request.method === "DELETE") {
+    const idValue = decodeURIComponent(mcpDelete[1]);
+    updateSettings({
+      ...state.settings,
+      mcpServers: deleteById(state.settings.mcpServers as JsonValue[], idValue),
+      assistants: state.settings.assistants.map((assistant) => ({
+        ...assistant,
+        mcpServers: assistant.mcpServers.filter((serverId) => serverId !== idValue),
+      })),
+    });
+    return json({ status: "deleted" });
+  }
+  if (path === "settings/mcp-server/reorder" && request.method === "POST") {
+    const body = await readJson<{ ids: string[] }>(request);
+    updateSettings({ ...state.settings, mcpServers: reorderByIds(state.settings.mcpServers as JsonValue[], body.ids ?? []) });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/mcp-server/sync" && request.method === "POST") {
+    const body = await readJson<{ serverId: string }>(request);
+    const server = (state.settings.mcpServers as Array<Record<string, JsonValue>>).find((item) => String(item.id) === body.serverId);
+    if (!server) return error("MCP server not found", 404);
+    const nextServer = await syncMcpServerTools(server);
+    const result = upsertById(state.settings.mcpServers as JsonValue[], nextServer);
+    updateSettings({ ...state.settings, mcpServers: result.items });
+    const common = isRecord(nextServer.commonOptions) ? nextServer.commonOptions : {};
+    if (common.connected === false) return error(String(common.lastSyncError ?? "MCP sync failed"), 502);
+    return json({ status: "ok", tools: Array.isArray(common.tools) ? common.tools : [], server: result.item });
+  }
+  if (path === "settings/mcp-server/import" && request.method === "POST") {
+    const body = await readJson<{ json: string }>(request);
+    const rawText = String(body.json ?? "").trim();
+    if (!rawText) return error("JSON is required", 400);
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      return error("Invalid JSON", 400);
+    }
+    // Accept { mcpServers: { "name": { ... } } } (Claude Desktop standard format).
+    const serversMap = parsed.mcpServers ?? parsed.mcpServers ?? parsed;
+    if (!serversMap || typeof serversMap !== "object" || Array.isArray(serversMap)) {
+      return error("Expected {\"mcpServers\": {\"name\": {...}}} object format", 400);
+    }
+    const entries = Object.entries(serversMap as Record<string, unknown>);
+    if (entries.length === 0) return error("No MCP server entries found", 400);
+    const imported: Array<Record<string, JsonValue>> = [];
+    const skippedReasons: string[] = [];
+    let currentServers = state.settings.mcpServers as JsonValue[];
+    for (const [entryName, entryValue] of entries) {
+      if (!entryValue || typeof entryValue !== "object") {
+        skippedReasons.push(`${entryName}: invalid entry`);
+        continue;
+      }
+      const cfg = entryValue as Record<string, unknown>;
+      // stdio (command/args) mode is not supported on PC — skip with a clear reason.
+      if (cfg.command || cfg.args) {
+        skippedReasons.push(`${entryName}: stdio (command/args) mode is not supported — only Streamable HTTP and SSE`);
+        continue;
+      }
+      const url = String(cfg.url ?? "").trim();
+      if (!url) {
+        skippedReasons.push(`${entryName}: missing url`);
+        continue;
+      }
+      const rawType = String(cfg.type ?? "streamable_http").trim();
+      const type = rawType === "sse" ? "sse" : "streamable_http";
+      const name = String(cfg.name ?? entryName).trim() || entryName;
+      // Convert Claude Desktop headers map { "Key": "value" } → RikkaHub tuple [["Key","value"]].
+      let headers: JsonValue[] = [];
+      const rawHeaders = cfg.headers;
+      if (rawHeaders && typeof rawHeaders === "object") {
+        if (Array.isArray(rawHeaders)) {
+          headers = rawHeaders as JsonValue[];
+        } else {
+          headers = Object.entries(rawHeaders as Record<string, unknown>).map(([k, v]) => [k, String(v ?? "")]);
+        }
+      }
+      const server: Record<string, JsonValue> = {
+        id: id(),
+        type,
+        url,
+        commonOptions: {
+          enable: cfg.enable !== false,
+          name,
+          headers,
+          tools: [],
+          lastSyncAt: null,
+          lastSyncError: "",
+          connected: false,
+        },
+      };
+      // Pre-sync tools when the URL is provided and server is enabled.
+      let synced = server;
+      if (url) {
+        try {
+          synced = await syncMcpServerTools(server);
+        } catch {
+          // syncMcpServerTools already sets lastSyncError on failure; keep the server.
+        }
+      }
+      const result = upsertById(currentServers, synced);
+      currentServers = result.items;
+      imported.push(result.item);
+    }
+    if (imported.length === 0) {
+      return error(`No servers could be imported. ${skippedReasons.join("; ")}`, 400);
+    }
+    updateSettings({ ...state.settings, mcpServers: currentServers });
+    return json({ status: "ok", imported: imported.length, skipped: skippedReasons.length, servers: imported, skippedReasons });
+  }
+  if (path === "settings/mode-injection/detail" && request.method === "POST") {
+    const body = await readJson<Record<string, JsonValue>>(request);
+    const item = {
+      type: "mode",
+      enabled: true,
+      priority: 0,
+      position: "after_system_prompt",
+      content: "",
+      injectDepth: 4,
+      role: "USER",
+      ...body,
+      id: String(body.id ?? id()),
+      name: String(body.name ?? "Mode Injection"),
+    };
+    const result = upsertById(state.settings.modeInjections as JsonValue[], item);
+    updateSettings({ ...state.settings, modeInjections: result.items });
+    return json({ status: "ok", item: result.item });
+  }
+  const modeDelete = path.match(/^settings\/mode-injection\/([^/]+)$/);
+  if (modeDelete && request.method === "DELETE") {
+    const idValue = decodeURIComponent(modeDelete[1]);
+    updateSettings({
+      ...state.settings,
+      modeInjections: deleteById(state.settings.modeInjections as JsonValue[], idValue),
+      assistants: state.settings.assistants.map((assistant) => ({
+        ...assistant,
+        modeInjectionIds: assistant.modeInjectionIds.filter((itemId) => itemId !== idValue),
+      })),
+    });
+    return json({ status: "deleted" });
+  }
+  if (path === "settings/mode-injection/reorder" && request.method === "POST") {
+    const body = await readJson<{ ids: string[] }>(request);
+    updateSettings({ ...state.settings, modeInjections: reorderByIds(state.settings.modeInjections as JsonValue[], body.ids ?? []) });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/lorebook/detail" && request.method === "POST") {
+    const body = await readJson<Record<string, JsonValue>>(request);
+    const item = {
+      enabled: true,
+      description: "",
+      entries: [],
+      ...body,
+      id: String(body.id ?? id()),
+      name: String(body.name ?? "Lorebook"),
+    };
+    const result = upsertById(state.settings.lorebooks as JsonValue[], item);
+    updateSettings({ ...state.settings, lorebooks: result.items });
+    return json({ status: "ok", item: result.item });
+  }
+  const lorebookDelete = path.match(/^settings\/lorebook\/([^/]+)$/);
+  if (lorebookDelete && request.method === "DELETE") {
+    const idValue = decodeURIComponent(lorebookDelete[1]);
+    updateSettings({
+      ...state.settings,
+      lorebooks: deleteById(state.settings.lorebooks as JsonValue[], idValue),
+      assistants: state.settings.assistants.map((assistant) => ({
+        ...assistant,
+        lorebookIds: assistant.lorebookIds.filter((itemId) => itemId !== idValue),
+      })),
+    });
+    return json({ status: "deleted" });
+  }
+  if (path === "settings/lorebook/reorder" && request.method === "POST") {
+    const body = await readJson<{ ids: string[] }>(request);
+    updateSettings({ ...state.settings, lorebooks: reorderByIds(state.settings.lorebooks as JsonValue[], body.ids ?? []) });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/quick-message/detail" && request.method === "POST") {
+    const body = await readJson<Record<string, JsonValue>>(request);
+    const item = { title: "", content: "", ...body, id: String(body.id ?? id()) };
+    const result = upsertById(state.settings.quickMessages as JsonValue[], item);
+    updateSettings({ ...state.settings, quickMessages: result.items });
+    return json({ status: "ok", item: result.item });
+  }
+  const quickMessageDelete = path.match(/^settings\/quick-message\/([^/]+)$/);
+  if (quickMessageDelete && request.method === "DELETE") {
+    const idValue = decodeURIComponent(quickMessageDelete[1]);
+    updateSettings({
+      ...state.settings,
+      quickMessages: deleteById(state.settings.quickMessages as JsonValue[], idValue),
+      assistants: state.settings.assistants.map((assistant) => ({
+        ...assistant,
+        quickMessageIds: assistant.quickMessageIds.filter((itemId) => itemId !== idValue),
+      })),
+    });
+    return json({ status: "deleted" });
+  }
+  if (path === "settings/quick-message/reorder" && request.method === "POST") {
+    const body = await readJson<{ ids: string[] }>(request);
+    updateSettings({ ...state.settings, quickMessages: reorderByIds(state.settings.quickMessages as JsonValue[], body.ids ?? []) });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/search/enabled" && request.method === "POST") {
+    const body = await readJson<{ enabled: boolean }>(request);
+    updateSettings({ ...state.settings, enableWebSearch: body.enabled });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/search/service" && request.method === "POST") {
+    const body = await readJson<{ index: number }>(request);
+    updateSettings({ ...state.settings, searchServiceSelected: body.index });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/search/reorder" && request.method === "POST") {
+    const body = await readJson<{ ids: string[]; selectedId?: string }>(request);
+    const services = state.settings.searchServices as Array<Record<string, JsonValue>>;
+    const byId = new Map(services.map((item) => [String(item.id), item]));
+    const ordered = body.ids.map((itemId) => byId.get(String(itemId))).filter(Boolean) as JsonValue[];
+    const rest = services.filter((item) => !body.ids.includes(String(item.id)));
+    const searchServices = [...ordered, ...rest];
+    const selectedId = body.selectedId ?? String(services[state.settings.searchServiceSelected]?.id ?? "");
+    const selectedIndex = Math.max(0, searchServices.findIndex((item) => String((item as Record<string, JsonValue>).id) === selectedId));
+    updateSettings({ ...state.settings, searchServices, searchServiceSelected: selectedIndex });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/search/service/detail" && request.method === "POST") {
+    const body = await readJson<SearchService>(request);
+    const service: SearchService = { ...body, id: String(body.id ?? id()) };
+    const services = state.settings.searchServices as SearchService[];
+    const existing = services.find((item) => String(item.id) === String(service.id));
+    // Invalidate testPassed when any auth/endpoint field changes. Preset types
+    // (bing_local, rikkahub) don't need testPassed gating — they always show in chat.
+    if (existing && existing.testPassed === true) {
+      const authFields = ["type", "apiKey", "url", "customUrl", "model", "username", "password", "engines"];
+      const changed = authFields.some((key) => String(existing[key] ?? "") !== String(service[key] ?? ""));
+      if (changed) {
+        service.testPassed = false;
+        service.testPassedAt = 0;
+      } else {
+        service.testPassed = existing.testPassed;
+        service.testPassedAt = existing.testPassedAt;
+      }
+    }
+    updateSettings({
+      ...state.settings,
+      searchServices: existing ? services.map((item) => (String(item.id) === String(service.id) ? service : item)) : [...services, service],
+      searchServiceSelected: existing ? state.settings.searchServiceSelected : services.length,
+    });
+    return json({ status: "ok", service });
+  }
+  if (path === "settings/search/service/test" && request.method === "POST") {
+    const body = await readJson<SearchService>(request);
+    try {
+      const result = await testSearchService(body);
+      // Mark the persisted service as passing so the chat picker can include it.
+      const services = state.settings.searchServices as SearchService[];
+      const targetId = String(body.id ?? "");
+      if (targetId) {
+        updateSettings({
+          ...state.settings,
+          searchServices: services.map((item) =>
+            String(item.id) === targetId ? { ...item, testPassed: true, testPassedAt: Date.now() } : item,
+          ),
+        });
+      }
+      return json(result);
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  const searchDelete = path.match(/^settings\/search\/service\/([^/]+)$/);
+  if (searchDelete && request.method === "DELETE") {
+    const idValue = decodeURIComponent(searchDelete[1]);
+    const services = state.settings.searchServices as SearchService[];
+    const nextServices = services.filter((item) => String(item.id) !== idValue);
+    updateSettings({
+      ...state.settings,
+      searchServices: nextServices,
+      searchServiceSelected: Math.min(state.settings.searchServiceSelected, Math.max(0, nextServices.length - 1)),
+    });
+    return json({ status: "deleted" });
+  }
+  if (path === "settings/default-models" && request.method === "POST") {
+    const body = await readJson<Partial<Settings>>(request);
+    updateSettings({
+      ...state.settings,
+      chatModelId: String(body.chatModelId ?? state.settings.chatModelId),
+      titleModelId: String(body.titleModelId ?? state.settings.titleModelId),
+      translateModeId: String(body.translateModeId ?? state.settings.translateModeId),
+      suggestionModelId: String(body.suggestionModelId ?? state.settings.suggestionModelId),
+      imageGenerationModelId: String(body.imageGenerationModelId ?? state.settings.imageGenerationModelId),
+      ocrModelId: String(body.ocrModelId ?? state.settings.ocrModelId),
+      compressModelId: String(body.compressModelId ?? state.settings.compressModelId),
+      promptOptimizeModelId: String(body.promptOptimizeModelId ?? state.settings.promptOptimizeModelId ?? ""),
+      promptOptimizePrompt: String(body.promptOptimizePrompt ?? state.settings.promptOptimizePrompt ?? DEFAULT_PROMPT_OPTIMIZE_PROMPT),
+      titlePrompt: String(body.titlePrompt ?? state.settings.titlePrompt ?? DEFAULT_TITLE_PROMPT),
+      translatePrompt: String(body.translatePrompt ?? state.settings.translatePrompt ?? DEFAULT_TRANSLATION_PROMPT),
+      suggestionPrompt: String(body.suggestionPrompt ?? state.settings.suggestionPrompt ?? DEFAULT_SUGGESTION_PROMPT),
+      ocrPrompt: String(body.ocrPrompt ?? state.settings.ocrPrompt ?? DEFAULT_OCR_PROMPT),
+      compressPrompt: String(body.compressPrompt ?? state.settings.compressPrompt ?? DEFAULT_COMPRESS_PROMPT),
+    });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/favorite-models" && request.method === "POST") {
+    const body = await readJson<{ modelIds: string[] }>(request);
+    updateSettings({ ...state.settings, favoriteModels: body.modelIds ?? [] });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/model/built-in-tool" && request.method === "POST") {
+    const body = await readJson<{ modelId: string; tool: string; enabled: boolean }>(request);
+    const toolName = String(body.tool ?? "").trim();
+    updateSettings({
+      ...state.settings,
+      providers: state.settings.providers.map((providerItem) => ({
+        ...providerItem,
+        models: providerItem.models.map((modelItem) => {
+          if (modelItem.id !== body.modelId) return modelItem;
+          const existingTools = Array.isArray(modelItem.tools) ? modelItem.tools : [];
+          const nextTools = body.enabled
+            ? [...existingTools.filter((tool) => String((tool as Record<string, JsonValue>).type ?? tool) !== toolName), { type: toolName }]
+            : existingTools.filter((tool) => String((tool as Record<string, JsonValue>).type ?? tool) !== toolName);
+          return { ...modelItem, tools: nextTools };
+        }),
+      })),
+    });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/provider" && request.method === "POST") {
+    const body = await readJson<Provider>(request);
+    updateSettings({
+      ...state.settings,
+      providers: state.settings.providers.some((item) => item.id === body.id)
+        ? state.settings.providers.map((item) =>
+          item.id === body.id
+            ? {
+                ...item,
+                ...body,
+                testPassed: item.testPassed === true ? true : body.testPassed,
+                testPassedAt: item.testPassed === true ? item.testPassedAt : body.testPassedAt,
+              }
+            : item,
+        )
+        : [...state.settings.providers, { ...body, id: body.id || id(), builtIn: false }],
+    });
+    return json({ status: "ok" });
+  }
+  const providerDelete = path.match(/^settings\/provider\/([^/]+)$/);
+  if (providerDelete && request.method === "DELETE") {
+    const idValue = decodeURIComponent(providerDelete[1]);
+    if (state.settings.providers.length <= 1) return error("At least one provider is required", 400);
+    updateSettings({ ...state.settings, providers: state.settings.providers.filter((item) => item.id !== idValue) });
+    return json({ status: "deleted" });
+  }
+  if (path === "settings/provider/reorder" && request.method === "POST") {
+    const body = await readJson<{ ids: string[] }>(request);
+    const byId = new Map(state.settings.providers.map((item) => [item.id, item]));
+    const ordered = body.ids.map((itemId) => byId.get(itemId)).filter(Boolean) as Provider[];
+    const rest = state.settings.providers.filter((item) => !body.ids.includes(item.id));
+    updateSettings({ ...state.settings, providers: [...ordered, ...rest] });
+    return json({ status: "ok" });
+  }
+  if (path === "settings/provider/balance" && request.method === "POST") {
+    const body = await readJson<{ providerId: string }>(request);
+    const providerItem = state.settings.providers.find((item) => item.id === body.providerId);
+    if (!providerItem) return error("Provider not found", 404);
+    try {
+      return json(await fetchProviderBalance(providerItem));
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  if (path === "settings/provider/test" && request.method === "POST") {
+    const body = await readJson<{ providerId: string; modelId?: string }>(request);
+    const providerItem = state.settings.providers.find((item) => item.id === body.providerId);
+    if (!providerItem) return error("Provider not found", 404);
+    try {
+      const result = await fetchProviderModels(providerItem);
+      const selectedModel = firstProviderModel(providerItem, body.modelId, result.models);
+      const checks = [];
+      for (const mode of ["non_stream", "stream", "tools"] as const) {
+        checks.push(await runProviderCheck(providerItem, mode, selectedModel, result.models).catch((err) => ({
+          mode,
+          ok: false,
+          status: 0,
+          endpoint: endpointFor(providerItem),
+          preview: err instanceof Error ? err.message : String(err),
+        })));
+      }
+      markProviderTestResult(providerItem, result.models, checks);
+      return json({
+        status: "ok",
+        endpoint: result.endpoint,
+        responseApiEndpoint: endpointFor(providerItem),
+        testModelId: selectedModel,
+        modelCount: result.models.length,
+        models: result.models.slice(0, 20),
+        checks,
+        preview: result.preview,
+      });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+
+  if (path === "settings/provider/test/image" && request.method === "POST") {
+    const body = await readJson<{ providerId: string; modelId?: string; prompt?: string }>(request);
+    const providerItem = state.settings.providers.find((item) => item.id === body.providerId);
+    if (!providerItem) return error("Provider not found", 404);
+    const requestedModelId = String(body.modelId ?? "").trim();
+    const modelItem = (providerItem.models ?? []).find((item) => item.modelId === requestedModelId)
+      ?? (providerItem.models ?? []).find((item) => (item.type as string) === "IMAGE")
+      ?? null;
+    if (!modelItem) return error("No image model available for this provider", 400);
+    // Borrow the existing image-generation pipeline by temporarily swapping the
+    // imageGenerationModelId so callImageGeneration picks our target model.
+    const previousImageId = state.settings.imageGenerationModelId;
+    state.settings.imageGenerationModelId = modelItem.id;
+    try {
+      const prompt = String(body.prompt ?? "A red apple on a white background").trim() || "A red apple on a white background";
+      const images = await callImageGeneration({ prompt, numberOfImages: 1, aspectRatio: "square" });
+      const generated = images[0];
+      if (!generated) return error("Image generation returned no images", 502);
+      return json({
+        status: "ok",
+        modelId: modelItem.modelId,
+        image: { url: generated.url, mime: generated.mime, fileName: generated.fileName },
+      });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    } finally {
+      state.settings.imageGenerationModelId = previousImageId;
+    }
+  }
+
+  if (path === "settings/provider/test/stream" && request.method === "POST") {
+    const body = await readJson<{ providerId: string; modelId?: string }>(request);
+    const providerItem = state.settings.providers.find((item) => item.id === body.providerId);
+    if (!providerItem) return error("Provider not found", 404);
+
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const send = (event: string, payload: JsonValue | object) => controller.enqueue(sseFrame(event, payload));
+        try {
+          send("progress", { message: "正在读取模型列表..." });
+          const result = await fetchProviderModels(providerItem);
+          const selectedModel = firstProviderModel(providerItem, body.modelId, result.models);
+          send("models", {
+            endpoint: result.endpoint,
+            responseApiEndpoint: endpointFor(providerItem),
+            testModelId: selectedModel,
+            modelCount: result.models.length,
+            models: result.models.slice(0, 20),
+            preview: result.preview,
+          });
+          const checks = [];
+          for (const mode of ["non_stream", "stream", "tools"] as const) {
+            send("progress", { message: `正在测试 ${mode}...` });
+            const check = await runProviderCheck(providerItem, mode, selectedModel, result.models).catch((err) => ({
+              mode,
+              ok: false,
+              status: 0,
+              endpoint: endpointFor(providerItem),
+              preview: err instanceof Error ? err.message : String(err),
+            }));
+            checks.push(check);
+            send("check", check);
+          }
+          markProviderTestResult(providerItem, result.models, checks);
+          send("done", {
+            status: "ok",
+            endpoint: result.endpoint,
+            responseApiEndpoint: endpointFor(providerItem),
+            testModelId: selectedModel,
+            modelCount: result.models.length,
+            models: result.models.slice(0, 20),
+            checks,
+            preview: result.preview,
+          });
+        } catch (err) {
+          send("error", { error: err instanceof Error ? err.message : String(err) });
+        } finally {
+          controller.close();
+        }
+      },
+    });
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    });
+  }
+  if (path === "context-limit" && request.method === "GET") {
+    // 查询某模型的 context window 上限(来自 models.dev)。前端切换当前模型时调用,
+    // 让统计行分母跟随"当前选中模型"而非"生成时模型"。匹配不到返回 null。
+    const mid = url.searchParams.get("modelId");
+    const ptype = url.searchParams.get("providerType") ?? "";
+    if (!mid) return json({ contextLimit: null });
+    // 首次启动时前端可能赶在 models.dev 加载完之前发请求。await 一下:已加载则立即返回
+    // (常态),还在加载则等它完(loadModelsDev 内部有 10s fetch timeout 兜底)。这样 null 的
+    // 语义是确定的"models.dev 里查不到此模型",前端可以安全缓存,不会把启动期的临时空
+    // 缓存永久当真。loadModelsDev 对并发调用做了去重,多个请求共用同一个 in-flight promise。
+    await loadModelsDev();
+    if (!modelsDevCache) return json({ contextLimit: null });
+    return json({ contextLimit: lookupContextLimit(modelsDevCache, ptype, mid) });
+  }
+  if (path === "prompt/optimize" && request.method === "POST") {
+    // 用户在对话输入框点"优化提示词":把原文(+可选的最近几轮对话上下文)+ meta-prompt
+    // 发给"提示词优化模型",返回优化后的文本由前端直接替换输入框内容。
+    // 上下文让优化模型能理解"那个""上次的"等指代——首条消息或无对话时省略。
+    // 未配置模型时返回 400,前端引导去设置页。
+    const body = await readJson<{ text: string; context?: string }>(request);
+    const text = String(body.text ?? "").trim();
+    if (!text) return error("没有可优化的文本", 400);
+    const modelId = state.settings.promptOptimizeModelId;
+    if (!modelId) {
+      return error("未配置提示词优化模型,请在「设置 - 默认模型与提示词」中指定一个模型", 400);
+    }
+    const context = String(body.context ?? "").trim();
+    let prompt = String(state.settings.promptOptimizePrompt ?? "").trim() || DEFAULT_PROMPT_OPTIMIZE_PROMPT;
+    if (context) {
+      // 条件式上下文:明确告诉模型"只在提示词承接对话时才用,否则忽略",防止无关背景
+      // 污染独立提示词。同时禁止把背景内容写进优化结果(防止泄漏/跑题)。
+      prompt += `\n\n## 对话背景(仅供理解,不要优化这部分,也不要把它的内容写进结果)\n\n下面是用户与 AI 之前的几轮对话。只有当待优化的提示词明显是在承接这段对话时(出现"那个""上面说的""再…一下"等指代),你才用它来理解用户指的是什么,从而让优化后的表达更明确。如果提示词本身独立、完整,或和这段对话无关,就忽略这段背景,把它当成全新请求来优化。\n\n<对话背景>\n${context}\n</对话背景>`;
+    }
+    prompt += `\n\n请优化以下提示词,直接输出优化后的版本:\n\n<original_prompt>\n${text}\n</original_prompt>`;
+    try {
+      // temperature 0.5:既要能找到更好的措辞,又不能偏离原意乱发挥。
+      // maxTokens 4096:优化后的提示词可能比原文长(结构化展开),给足余量避免截断。
+      // reasoningLevel 不设(用模型默认,跟上下文压缩一致)——提示词优化是重写润色,不是推理任务。
+      const optimized = await fetchAuxiliaryText(modelId, prompt, "prompt-optimize", {
+        maxTokens: 4096,
+        temperature: 0.5,
+      });
+      return json({ text: optimized });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  if (path === "settings/provider/models" && request.method === "POST") {
+    const body = await readJson<{ providerId: string; save?: boolean }>(request);
+    const providerItem = state.settings.providers.find((item) => item.id === body.providerId);
+    if (!providerItem) return error("Provider not found", 404);
+    // 用户主动获取模型列表——大概率是想试新模型。顺带刷新 models.dev 缓存,让新模型
+    // 的 context 上限立即可用(不用等每日 TTL)。fire-and-forget,不阻塞模型列表返回。
+    void loadModelsDev(true);
+    try {
+      const result = await fetchProviderModels(providerItem);
+      if (body.save) {
+        updateSettings({
+          ...state.settings,
+          providers: state.settings.providers.map((item) =>
+            item.id === providerItem.id ? { ...item, models: result.models } : item,
+          ),
+        });
+      }
+      return json({ status: "ok", endpoint: result.endpoint, models: result.models, preview: result.preview });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+
+  if (path === "conversations/batch-delete" && request.method === "POST") {
+    const body = await readJson<{ ids?: string[] }>(request);
+    const ids = new Set((body.ids ?? []).map(String).filter(Boolean));
+    if (ids.size === 0) return error("No conversations selected", 400);
+    deleteConversationsById(ids);
+    return json({ status: "deleted", deleted: ids.size });
+  }
+
+  if (path === "conversations" && request.method === "GET") {
+    return json(state.conversations.filter((item) => item.assistantId === state.settings.assistantId).map(toListDto));
+  }
+  if (path === "conversations/paged" && request.method === "GET") {
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    const limit = Number(url.searchParams.get("limit") ?? "20");
+    const query = (url.searchParams.get("query") ?? "").toLowerCase();
+    const items = state.conversations
+      .filter((item) => item.assistantId === state.settings.assistantId)
+      .filter((item) => !query || item.title.toLowerCase().includes(query))
+      .sort((a, b) => Number(b.isPinned) - Number(a.isPinned) || b.updateAt - a.updateAt);
+    const page = items.slice(offset, offset + limit);
+    return json({ items: page.map(toListDto), nextOffset: offset + limit < items.length ? offset + limit : null, hasMore: offset + limit < items.length });
+  }
+  if (path === "conversations/search" && request.method === "GET") {
+    const queryText = (url.searchParams.get("query") ?? "").toLowerCase();
+    const results = queryText
+      ? state.conversations
+          .filter((conversation) => conversation.assistantId === state.settings.assistantId)
+          .flatMap((conversation) =>
+            conversation.messages.flatMap((node) =>
+            node.messages.flatMap((msg) => {
+              const snippet = textFromParts(msg.parts);
+              return snippet.toLowerCase().includes(queryText)
+                ? [{ nodeId: node.id, messageId: msg.id, conversationId: conversation.id, title: conversation.title, updateAt: conversation.updateAt, snippet }]
+                : [];
+            }),
+          ),
+        )
+      : [];
+    return json(results);
+  }
+
+  const conversationStream = path.match(/^conversations\/([^/]+)\/stream$/);
+  if (conversationStream) {
+    const conversation = getConversation(conversationStream[1]);
+    if (!conversation) return error("Conversation not found", 404);
+    return openSse(
+      () => [["snapshot", { type: "snapshot", seq: Date.now(), conversation: toConversationDto(conversation), serverTime: Date.now() }]],
+      (controller) => {
+        const set = conversationClients.get(conversation.id) ?? new Set<ReadableStreamDefaultController<Uint8Array>>();
+        set.add(controller);
+        conversationClients.set(conversation.id, set);
+        return () => set.delete(controller);
+      },
+    );
+  }
+
+  const conversationRoute = path.match(/^conversations\/([^/]+)(?:\/(.*))?$/);
+  if (conversationRoute) {
+    const conversationId = conversationRoute[1];
+    const sub = conversationRoute[2] ?? "";
+
+    if (!sub && request.method === "DELETE") {
+      deleteConversationsById(new Set([conversationId]));
+      return new Response(null, { status: 204 });
+    }
+    const conversation = (sub === "messages" || sub === "system-prompt") && request.method === "POST"
+      ? ensureConversation(conversationId)
+      : getConversation(conversationId);
+    if (!conversation) return error("Conversation not found", 404);
+
+    if (!sub && request.method === "GET") return json(toConversationDto(conversation));
+    if (sub === "messages" && request.method === "POST") {
+      const body = await readJson<{ parts: JsonValue[] }>(request);
+      const assistant = findAssistant(conversation.assistantId);
+      const picked = findModel(assistant.chatModelId ?? state.settings.chatModelId);
+      // 用户在 ask_user 等待中直接发新消息时，旧 generation 可能还在跑（不太常
+      // 见，因为 ask_user 通常会中止流并等待）也可能已经停了。无论如何先 abort
+      // 旧 controller，避免后续 race；然后把上一条 ASSISTANT 残留的 pending 工具
+      // 标记为"用户取消"，让历史回放时模型看到的是 denied tool 结果而不是空 output
+      // ——对齐安卓 commit 05c12488 finishInterruptedPendingTools 的修复目标。
+      generating.get(conversation.id)?.abort();
+      generating.delete(conversation.id);
+      finishInterruptedPendingToolsInConversation(conversation);
+      const processedParts = applyInputRegexTransformParts(body.parts ?? [], assistant);
+      const userMessage = message("USER", markOcrPendingParts(processedParts, picked.model));
+      analyticsMsgCount++;
+      const userNode = { id: id(), messages: [userMessage], selectIndex: 0 };
+      conversation.messages.push(userNode);
+      conversation.chatSuggestions = [];
+      conversation.updateAt = Date.now();
+      if (!conversation.title) conversation.title = "New Conversation";
+      persistConversation(conversation);
+      saveState();
+      broadcastConversation(conversation);
+      void (async () => {
+        userMessage.parts = await attachOcrToImageParts(userMessage.parts, picked.model);
+        conversation.updateAt = Date.now();
+        persistConversation(conversation);
+        saveState();
+        broadcastNodeUpdate(conversation, userNode);
+        void generateAnswer(conversation);
+      })();
+      return json({ status: "accepted" }, { status: 202 });
+    }
+    if (sub === "pin" && request.method === "POST") {
+      conversation.isPinned = !conversation.isPinned;
+      conversation.updateAt = Date.now();
+      persistConversation(conversation);
+      saveState();
+      broadcastConversation(conversation);
+      return json({ status: "updated" });
+    }
+    if (sub === "title" && request.method === "POST") {
+      const body = await readJson<{ title: string }>(request);
+      conversation.title = body.title?.trim() || conversation.title;
+      conversation.updateAt = Date.now();
+      persistConversation(conversation);
+      saveState();
+      broadcastConversation(conversation);
+      return json({ status: "updated" });
+    }
+    if (sub === "move" && request.method === "POST") {
+      const body = await readJson<{ assistantId: string }>(request);
+      conversation.assistantId = body.assistantId;
+      conversation.updateAt = Date.now();
+      persistConversation(conversation);
+      saveState();
+      broadcastConversation(conversation);
+      return json({ status: "updated" });
+    }
+    if (sub === "system-prompt" && request.method === "POST") {
+      const body = await readJson<{ systemPrompt?: string }>(request);
+      conversation.systemPrompt = String(body.systemPrompt ?? "").trim() || null;
+      conversation.updateAt = Date.now();
+      persistConversation(conversation);
+      saveState();
+      broadcastConversation(conversation);
+      return json({ status: "updated" });
+    }
+    if (sub === "stop" && request.method === "POST") {
+      // Abort the in-flight upstream fetch. Some providers take a moment to actually close the
+      // socket after `controller.abort()` returns, so we proactively flush any throttled state
+      // and broadcast immediately — the UI shouldn't have to wait for the next streaming chunk.
+      const controller = generating.get(conversation.id);
+      controller?.abort();
+      generating.delete(conversation.id);
+      // 与新消息入口对齐：用户主动停止时，也把残留的 pending tool 标记成"用户取消"，
+      // 否则下次重生成/继续时会基于一条 output 为空的 pending tool 节点继续。
+      // 对齐安卓 commit 05c12488 把 finishInterruptedPendingTools 同时用在新消息
+      // 和 stopGenerating 两条路径上。
+      finishInterruptedPendingToolsInConversation(conversation);
+      const lastNode = conversation.messages[conversation.messages.length - 1];
+      if (lastNode) {
+        const msg = lastNode.messages[lastNode.selectIndex];
+        if (msg) {
+          // Strip the loading placeholder — otherwise the user sees the typing "..." linger
+          // because the placeholder part rendering doesn't depend on isGenerating.
+          msg.parts = msg.parts.filter((part) => !(
+            part && typeof part === "object" && !Array.isArray(part) && part.type === "loading"
+          ));
+          if (!msg.finishedAt) msg.finishedAt = new Date().toISOString();
+        }
+        broadcastNodeUpdate(conversation, lastNode);
+      }
+      conversation.updateAt = Date.now();
+      persistConversation(conversation);
+      saveState();
+      broadcastConversation(conversation);
+      return json({ status: "stopped" });
+    }
+    if (sub === "regenerate-title" && request.method === "POST") {
+      try {
+        conversation.title = await generateTitleForConversation(conversation);
+      } catch (err) {
+        return error(err instanceof Error ? err.message : String(err), 400);
+      }
+      persistConversation(conversation);
+      saveState();
+      broadcastConversation(conversation);
+      return json({ status: "updated", title: conversation.title });
+    }
+    if (sub === "regenerate" && request.method === "POST") {
+      const body = await readJson<{ messageId?: string }>(request);
+      let regenerateAtNodeId: string | undefined;
+      if (body.messageId) {
+        const nodeIndex = conversation.messages.findIndex((n) =>
+          n.messages.some((m) => m.id === body.messageId),
+        );
+        if (nodeIndex >= 0) {
+          const targetNode = conversation.messages[nodeIndex];
+          const targetMsg = targetNode.messages.find((m) => m.id === body.messageId);
+          if (targetMsg?.role === "ASSISTANT") {
+            // 对齐安卓 regenerateAtMessage:重新生成 ASSISTANT = 在原 node 追加新分支,
+            // 旧回复保留(前端 < 2 / 2 > 切换器生效)。截断到该 node(含)丢弃其后所有 node,
+            // 保证组装 API 历史时上下文 = [0..nodeIndex-1]——新空分支会被
+            // appendAssistantApiMessages.flushAssistant 跳过,旧分支不在 selectIndex 不被取到,
+            // 等价于安卓的 messageRange = 0..<nodeIndex;同时避免"新回复 + 旧后续脱节"。
+            conversation.messages = conversation.messages.slice(0, nodeIndex + 1);
+            const assistant = findAssistant(conversation.assistantId);
+            const picked = findModel(assistant.chatModelId ?? state.settings.chatModelId);
+            const newMsg = message("ASSISTANT", [], picked.model.id);
+            targetNode.messages.push(newMsg);
+            targetNode.selectIndex = targetNode.messages.length - 1;
+            regenerateAtNodeId = targetNode.id;
+          } else {
+            // USER 重新生成:截断到该 USER node(含),丢弃后续 assistant(行为不变)。
+            truncateConversationForRegenerate(conversation, body.messageId);
+          }
+        } else {
+          truncateConversationForRegenerate(conversation, body.messageId);
+        }
+      } else {
+        truncateConversationForRegenerate(conversation, body.messageId);
+      }
+      conversation.updateAt = Date.now();
+      persistConversation(conversation);
+      saveState();
+      broadcastConversation(conversation);
+      void generateAnswer(conversation, regenerateAtNodeId);
+      return json({ status: "accepted" }, { status: 202 });
+    }
+    const nodeSelect = sub.match(/^nodes\/([^/]+)\/select$/);
+    if (nodeSelect && request.method === "POST") {
+      const body = await readJson<{ selectIndex?: number }>(request);
+      const node = conversation.messages.find((item) => item.id === decodeURIComponent(nodeSelect[1]));
+      if (!node) return error("Node not found", 404);
+      const nextIndex = Number(body.selectIndex ?? node.selectIndex);
+      if (!Number.isInteger(nextIndex) || nextIndex < 0 || nextIndex >= node.messages.length) return error("Invalid branch index", 400);
+      node.selectIndex = nextIndex;
+      conversation.updateAt = Date.now();
+      persistConversation(conversation);
+      saveState();
+      broadcastConversation(conversation);
+      return json({ status: "updated" });
+    }
+    const messageDelete = sub.match(/^messages\/([^/]+)$/);
+    if (messageDelete && request.method === "DELETE") {
+      const messageId = decodeURIComponent(messageDelete[1]);
+      let changed = false;
+      conversation.messages = conversation.messages
+        .map((node) => {
+          const messages = node.messages.filter((msg) => msg.id !== messageId);
+          if (messages.length !== node.messages.length) changed = true;
+          return { ...node, messages, selectIndex: Math.min(node.selectIndex, Math.max(messages.length - 1, 0)) };
+        })
+        .filter((node) => node.messages.length > 0);
+      if (!changed) return error("Message not found", 404);
+      conversation.updateAt = Date.now();
+      persistConversation(conversation);
+      saveState();
+      broadcastConversation(conversation);
+      return json({ status: "deleted" });
+    }
+    const messageEdit = sub.match(/^messages\/([^/]+)\/edit$/);
+    if (messageEdit && request.method === "POST") {
+      const body = await readJson<{ parts?: JsonValue[] }>(request);
+      const messageId = decodeURIComponent(messageEdit[1]);
+      const nodeIndex = conversation.messages.findIndex((node) => node.messages.some((msg) => msg.id === messageId));
+      if (nodeIndex < 0) return error("Message not found", 404);
+      const node = conversation.messages[nodeIndex];
+      const msgIndex = node.messages.findIndex((msg) => msg.id === messageId);
+      const msg = node.messages[msgIndex];
+      const assistant = findAssistant(conversation.assistantId);
+      const picked = findModel(assistant.chatModelId ?? state.settings.chatModelId);
+      const editedParts = msg.role === "USER"
+        ? applyInputRegexTransformParts(body.parts ?? msg.parts, assistant)
+        : body.parts ?? msg.parts;
+      msg.parts = markOcrPendingParts(editedParts, picked.model);
+      msg.translation = null;
+      msg.finishedAt = msg.role === "ASSISTANT" ? new Date().toISOString() : null;
+      node.selectIndex = msgIndex;
+      conversation.messages = conversation.messages.slice(0, nodeIndex + 1);
+      conversation.chatSuggestions = [];
+      conversation.updateAt = Date.now();
+      persistConversation(conversation);
+      saveState();
+      broadcastConversation(conversation);
+      if (msg.role === "USER") {
+        void (async () => {
+          msg.parts = await attachOcrToImageParts(msg.parts, picked.model);
+          conversation.updateAt = Date.now();
+          persistConversation(conversation);
+          saveState();
+          broadcastNodeUpdate(conversation, node);
+          void generateAnswer(conversation);
+        })();
+      }
+      return json({ status: "updated" }, { status: msg.role === "USER" ? 202 : 200 });
+    }
+    const messageTranslate = sub.match(/^messages\/([^/]+)\/translate$/);
+    if (messageTranslate && request.method === "POST") {
+      const body = await readJson<{ targetLanguage?: string }>(request).catch(() => ({ targetLanguage: "" }));
+      const messageId = decodeURIComponent(messageTranslate[1]);
+      const msg = conversation.messages.flatMap((node) => node.messages).find((item) => item.id === messageId);
+      if (!msg) return error("Message not found", 404);
+      const sourceText = textFromParts(msg.parts).trim();
+      if (!sourceText) return error("Message has no text to translate", 400);
+      const targetLanguage = String(body.targetLanguage ?? "").trim() || Intl.DateTimeFormat().resolvedOptions().locale;
+      msg.translation = "正在翻译...";
+      conversation.updateAt = Date.now();
+      persistConversation(conversation);
+      saveState();
+      broadcastConversation(conversation);
+      void (async () => {
+        try {
+          const pickedTranslationModel = findModel(state.settings.translateModeId || state.settings.chatModelId);
+          const useQwenMt = isQwenMtModel(pickedTranslationModel.model.modelId);
+          const prompt = useQwenMt
+            ? sourceText
+            : applyPlaceholders(state.settings.translatePrompt || DEFAULT_TRANSLATION_PROMPT, {
+                source_text: sourceText,
+                target_lang: targetLanguage,
+              });
+          let streamedTranslation = "";
+          msg.translation = await fetchAuxiliaryText(state.settings.translateModeId, prompt, "translation", {
+            reasoningLevel: useQwenMt ? null : (state.settings.translateThinkingBudget ?? 0) > 0 ? "LOW" : null,
+            temperature: useQwenMt ? 0.3 : null,
+            topP: useQwenMt ? 0.95 : null,
+            customBody: useQwenMt
+              ? { translation_options: { source_lang: "auto", target_lang: englishLanguageName(targetLanguage) } }
+              : undefined,
+            stream: !useQwenMt,
+            onDelta: (delta) => {
+              streamedTranslation += delta;
+              msg.translation = streamedTranslation || "正在翻译...";
+              conversation.updateAt = Date.now();
+              persistConversation(conversation);
+              saveState();
+              broadcastConversation(conversation);
+            },
+          });
+        } catch (err) {
+          msg.translation = `翻译失败：${err instanceof Error ? err.message : String(err)}`;
+        } finally {
+          conversation.updateAt = Date.now();
+          saveState();
+          broadcastConversation(conversation);
+        }
+      })();
+      return json({ status: "accepted", translation: msg.translation }, { status: 202 });
+    }
+    if (sub === "compress" && request.method === "POST") {
+      const body = await readJson<{ additionalPrompt?: string; targetTokens?: number; keepRecentMessages?: number }>(request);
+      try {
+        const summaries = await compressConversation(
+          conversation,
+          String(body.additionalPrompt ?? ""),
+          Math.max(256, Number(body.targetTokens ?? 2000) || 2000),
+          Math.max(0, Number(body.keepRecentMessages ?? 32) || 0),
+        );
+        return json({ status: "compressed", summaries });
+      } catch (err) {
+        return error(err instanceof Error ? err.message : String(err), 400);
+      }
+    }
+    if (sub === "fork" && request.method === "POST") {
+      const body = await readJson<{ messageId?: string }>(request);
+      const messageId = String(body.messageId ?? "");
+      const nodeIndex = conversation.messages.findIndex((node) => node.messages.some((msg) => msg.id === messageId));
+      if (nodeIndex < 0) return error("Message not found", 404);
+      const fork: Conversation = {
+        ...JSON.parse(JSON.stringify(conversation)),
+        id: id(),
+        title: conversation.title ? `${conversation.title} Fork` : "Fork",
+        messages: JSON.parse(JSON.stringify(conversation.messages.slice(0, nodeIndex + 1))),
+        isPinned: false,
+        createAt: Date.now(),
+        updateAt: Date.now(),
+      };
+      state.conversations.unshift(fork);
+      persistConversation(fork);
+      saveState();
+      broadcastList();
+      return json({ conversationId: fork.id });
+    }
+    if (sub === "tool-approval" && request.method === "POST") {
+      const body = await readJson<{ toolCallId?: string; approved?: boolean; reason?: string; answer?: string }>(request);
+      let changed = false;
+      for (const node of conversation.messages) {
+        for (const msg of node.messages) {
+          msg.parts = msg.parts.map((part) => {
+            if (!part || typeof part !== "object" || Array.isArray(part) || part.type !== "tool" || part.toolCallId !== body.toolCallId) return part;
+            changed = true;
+            return {
+              ...part,
+              approvalState: body.approved
+                ? { type: body.answer ? "answered" : "approved", answer: body.answer ?? "" }
+                : { type: "denied", reason: body.reason ?? "" },
+            };
+          });
+        }
+      }
+      if (!changed) return error("Tool call not found", 404);
+      conversation.updateAt = Date.now();
+      persistConversation(conversation);
+      saveState();
+      broadcastConversation(conversation);
+      const hasPendingTools = conversation.messages.some((node) =>
+        node.messages.some((msg) => hasPendingToolApproval(msg))
+      );
+      if (!hasPendingTools) {
+        void generateAnswer(conversation);
+        return json({ status: "accepted" }, { status: 202 });
+      }
+      return json({ status: "updated" });
+    }
+  }
+
+  if (path === "files/upload" && request.method === "POST") {
+    const form = await request.formData();
+    const uploaded = await Promise.all(
+      form.getAll("files").filter((item): item is File => item instanceof File).map(async (file) => {
+        const fileId = state.nextFileId++;
+        const target = join(filesDir, `${fileId}${extname(file.name)}`);
+        await Bun.write(target, file);
+        const entry: StoredFile = { id: fileId, path: target, fileName: file.name, mime: file.type || "application/octet-stream", size: file.size };
+        const t0 = Date.now();
+        const extractedText = await extractStoredFileText(entry);
+        if (extractedText) {
+          entry.extractedText = extractedText;
+          entry.extractedAt = Date.now();
+        }
+        console.log(`[upload] ${entry.fileName} (${(file.size / 1024).toFixed(1)} KB) extracted ${extractedText.length} chars in ${Date.now() - t0}ms`);
+        state.files.push(entry);
+        return {
+          id: fileId,
+          url: `/api/files/${fileId}/content`,
+          fileName: entry.fileName,
+          mime: entry.mime,
+          size: entry.size,
+          extractedTextLength: entry.extractedText?.length ?? 0,
+        };
+      }),
+    );
+    saveState();
+    return json({ files: uploaded });
+  }
+  const fileContent = path.match(/^files\/(\d+)\/content$/);
+  if (fileContent) {
+    const entry = state.files.find((item) => item.id === Number(fileContent[1]));
+    if (!entry || !existsSync(entry.path)) return error("File not found", 404);
+    // File IDs are integer primary keys assigned at upload time; content for a given id
+    // never changes (upload is write-once). The `immutable` directive tells the browser
+    // never to revalidate this URL, so switching back to a previously-viewed conversation
+    // hits the in-memory cache instantly instead of round-tripping to localhost.
+    // Without this, the browser used heuristic caching (effectively none for /api/...
+    // paths) and the user saw every image re-load on every conversation switch — even
+    // ones they'd viewed seconds earlier. The ETag is a belt-and-suspenders fallback for
+    // browsers that disregard `immutable`.
+    return new Response(Bun.file(entry.path), {
+      headers: {
+        "Content-Type": entry.mime,
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "ETag": `"${entry.id}"`,
+      },
+    });
+  }
+  const fileByPath = path.match(/^files\/path\/(.+)$/);
+  if (fileByPath) {
+    const target = safeDataFilePath(fileByPath[1]);
+    if (!target) return error("File not found", 404);
+    // Same caching rationale as the by-id endpoint above. Path-based fetches typically
+    // come from Android-imported messages whose URL references survived migration —
+    // those resolved paths point to immutable on-disk files.
+    return new Response(Bun.file(target), {
+      headers: {
+        "Content-Type": mime(target),
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "ETag": `"path:${fileByPath[1]}"`,
+      },
+    });
+  }
+  const fileDelete = path.match(/^files\/(\d+)$/);
+  if (fileDelete && request.method === "DELETE") {
+    state.files = state.files.filter((item) => item.id !== Number(fileDelete[1]));
+    saveState();
+    return json({ status: "deleted" });
+  }
+
+  if (path === "skills" && request.method === "GET") return json(listSkills());
+  const skillFiles = path.match(/^skills\/([^/]+)\/files$/);
+  if (skillFiles && request.method === "GET") {
+    const name = decodeURIComponent(skillFiles[1]);
+    const metadata = skillMetadataFromFile(name);
+    if (!metadata) return error("Skill not found", 404);
+    return json({ files: listSkillFiles(name) });
+  }
+  const skillDetail = path.match(/^skills\/([^/]+)$/);
+  if (skillDetail && request.method === "GET") {
+    const name = decodeURIComponent(skillDetail[1]);
+    const metadata = skillMetadataFromFile(name);
+    const content = readSkillContent(name);
+    if (!metadata || content == null) return error("Skill not found", 404);
+    return json({ ...metadata, content });
+  }
+  if (path === "skills/detail" && request.method === "POST") {
+    const body = await readJson<{ name?: string; content?: string }>(request);
+    const requestedName = String(body.name ?? parseSkillFrontmatter(body.content ?? "").name ?? "new-skill").trim();
+    const dir = safeSkillDir(requestedName);
+    if (!dir) return error("Invalid skill name", 400);
+    mkdirSync(dir, { recursive: true });
+    const content = String(body.content ?? defaultSkillContent(requestedName));
+    writeFileSync(join(dir, "SKILL.md"), content);
+    const metadata = skillMetadataFromFile(requestedName);
+    if (!metadata) return error("Skill frontmatter must include name and description", 400);
+    return json({ status: "ok", skill: { ...metadata, content } });
+  }
+  if (path === "skills/import-github" && request.method === "POST") {
+    const body = await readJson<{ repoUrl?: string }>(request);
+    try {
+      const skill = await importSkillFromGitHub(String(body.repoUrl ?? ""));
+      return json({ status: "ok", skill });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  if (path === "skills/import-file" && request.method === "POST") {
+    // 对齐安卓 commit af9b1f35：支持从本地文件导入单个 Markdown 或 ZIP 技能包。
+    // 前端用 multipart/form-data 把文件 POST 上来；这里取出二进制内容后委派给
+    // importSkillFromBuffer 处理。
+    try {
+      const form = await request.formData();
+      const file = form.get("file");
+      if (!(file instanceof File)) return error("Missing file", 400);
+      const buf = Buffer.from(await file.arrayBuffer());
+      const imported = importSkillFromBuffer(file.name || "", buf);
+      const skills = imported.map((name) => {
+        const metadata = skillMetadataFromFile(name);
+        const content = readSkillContent(name) ?? "";
+        return metadata ? { ...metadata, content } : { name, description: "", content };
+      });
+      return json({ status: "ok", imported, skills });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 400);
+    }
+  }
+  if (skillDetail && request.method === "DELETE") {
+    const name = decodeURIComponent(skillDetail[1]);
+    const dir = safeSkillDir(name);
+    if (!dir || !existsSync(dir)) return error("Skill not found", 404);
+    rmSync(dir, { recursive: true, force: true });
+    updateSettings({
+      ...state.settings,
+      assistants: state.settings.assistants.map((assistant) => ({
+        ...assistant,
+        enabledSkills: assistant.enabledSkills.filter((skillName) => skillName !== name),
+      })),
+    });
+    return json({ status: "deleted" });
+  }
+
+  if (path === "logs" && request.method === "GET") return json(state.logs);
+  if (path === "logs" && request.method === "DELETE") {
+    state.logs = [];
+    saveState();
+    return json({ ok: true });
+  }
+  if (path === "stats" && request.method === "GET") return json(computeStats());
+  // ── 赞助者列表(预留接口,待接入数据源)──────────────────────────
+  // 前端 DonateSection 暂未展示该列表;数据源就绪后在此返回即自动渲染。
+  // 方案(零服务器):GitHub Actions 定时调爱发电 query-order API
+  // (user_id + token 的 md5 签名鉴权)分页拉订单 → 按赞助者聚合成下方结构 →
+  // 发布为公开静态 JSON(GitHub Pages / jsDelivr)→ 此处 fetch 并返回(建议加短时缓存)。
+  // token 必须保密(放 Actions Secret,切勿入库)。返回结构须与前端 Sponsor 类型一致:
+  //   { userName: string, avatar: string, amount?: string }
+  if (path === "sponsors" && request.method === "GET") return json([]);
+  if (path === "data/webdav/config" && request.method === "POST") {
+    const body = await readJson<Partial<WebDavConfig>>(request);
+    const webDavConfig = normalizeWebDavConfig(body);
+    updateSettings({ ...state.settings, webDavConfig });
+    return json({ status: "ok", config: webDavConfig });
+  }
+  if (path === "data/webdav/test" && request.method === "POST") {
+    const config = normalizeWebDavConfig((await readJson<{ config?: Partial<WebDavConfig> }>(request)).config ?? state.settings.webDavConfig);
+    try {
+      await webDavEnsureCollection(config);
+      return json({ status: "ok" });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  if (path === "data/webdav/list" && request.method === "GET") {
+    try {
+      return json({ items: await webDavListBackups(state.settings.webDavConfig) });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  if (path === "data/webdav/backup" && request.method === "POST") {
+    try {
+      const result = await webDavBackup(state.settings.webDavConfig);
+      return json({ status: "ok", ...result, items: await webDavListBackups(state.settings.webDavConfig) });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  if (path === "data/webdav/restore" && request.method === "POST") {
+    const body = await readJson<{ fileName?: string }>(request);
+    const fileName = String(body.fileName ?? "").trim();
+    if (!fileName || fileName.includes("/") || fileName.includes("\\")) return error("Invalid WebDAV backup file name", 400);
+    try {
+      await webDavRestore(state.settings.webDavConfig, fileName);
+      return json({ status: "restored", settings: state.settings });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  if (path === "data/webdav/delete" && request.method === "POST") {
+    const body = await readJson<{ fileName?: string }>(request);
+    const fileName = String(body.fileName ?? "").trim();
+    if (!fileName || fileName.includes("/") || fileName.includes("\\")) return error("Invalid WebDAV backup file name", 400);
+    try {
+      await webDavDelete(state.settings.webDavConfig, fileName);
+      return json({ status: "deleted", items: await webDavListBackups(state.settings.webDavConfig) });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  if (path === "data/webdav/backup/stream" && request.method === "POST") {
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const send = (event: string, payload: Record<string, unknown>) => controller.enqueue(sseFrame(event, payload));
+        try {
+          const result = await webDavBackup(state.settings.webDavConfig, (message, percent) => {
+            send("progress", { message, percent: percent ?? 0 });
+          });
+          const items = await webDavListBackups(state.settings.webDavConfig);
+          send("done", { status: "ok", fileName: result.fileName, size: result.size, items });
+        } catch (err) {
+          send("error", { error: err instanceof Error ? err.message : String(err) });
+        } finally {
+          controller.close();
+        }
+      },
+    });
+    return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } });
+  }
+  if (path === "data/webdav/restore/stream" && request.method === "POST") {
+    const body = await readJson<{ fileName?: string }>(request);
+    const fileName = String(body.fileName ?? "").trim();
+    if (!fileName || fileName.includes("/") || fileName.includes("\\")) return error("Invalid WebDAV backup file name", 400);
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const send = (event: string, payload: Record<string, unknown>) => controller.enqueue(sseFrame(event, payload));
+        try {
+          await webDavRestore(state.settings.webDavConfig, fileName, (message, percent) => {
+            send("progress", { message, percent: percent ?? 0 });
+          });
+          send("done", { status: "restored", settings: state.settings });
+        } catch (err) {
+          send("error", { error: err instanceof Error ? err.message : String(err) });
+        } finally {
+          controller.close();
+        }
+      },
+    });
+    return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } });
+  }
+  if (path === "data/s3/config" && request.method === "POST") {
+    const body = await readJson<Partial<S3Config>>(request);
+    const s3Config = normalizeS3Config(body);
+    updateSettings({ ...state.settings, s3Config });
+    return json({ status: "ok", config: s3Config });
+  }
+  if (path === "data/s3/test" && request.method === "POST") {
+    const config = normalizeS3Config((await readJson<{ config?: Partial<S3Config> }>(request)).config ?? state.settings.s3Config);
+    try {
+      await s3TestConnection(config);
+      return json({ status: "ok" });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  if (path === "data/s3/list" && request.method === "GET") {
+    try {
+      return json({ items: await s3ListBackups(state.settings.s3Config) });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  if (path === "data/s3/backup" && request.method === "POST") {
+    try {
+      const result = await s3Backup(state.settings.s3Config);
+      return json({ status: "ok", ...result, items: await s3ListBackups(state.settings.s3Config) });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  if (path === "data/s3/restore" && request.method === "POST") {
+    const body = await readJson<{ fileName?: string }>(request);
+    const fileName = String(body.fileName ?? "").trim();
+    if (!fileName || fileName.includes("\\")) return error("Invalid S3 backup file name", 400);
+    try {
+      await s3Restore(state.settings.s3Config, fileName);
+      return json({ status: "restored", settings: state.settings });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  if (path === "data/s3/delete" && request.method === "POST") {
+    const body = await readJson<{ fileName?: string }>(request);
+    const fileName = String(body.fileName ?? "").trim();
+    if (!fileName || fileName.includes("\\")) return error("Invalid S3 backup file name", 400);
+    try {
+      await s3Delete(state.settings.s3Config, fileName);
+      return json({ status: "deleted", items: await s3ListBackups(state.settings.s3Config) });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  if (path === "data/s3/backup/stream" && request.method === "POST") {
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const send = (event: string, payload: Record<string, unknown>) => controller.enqueue(sseFrame(event, payload));
+        try {
+          const result = await s3Backup(state.settings.s3Config, (message, percent) => {
+            send("progress", { message, percent: percent ?? 0 });
+          });
+          const items = await s3ListBackups(state.settings.s3Config);
+          send("done", { status: "ok", fileName: result.fileName, size: result.size, items });
+        } catch (err) {
+          send("error", { error: err instanceof Error ? err.message : String(err) });
+        } finally {
+          controller.close();
+        }
+      },
+    });
+    return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } });
+  }
+  if (path === "data/s3/restore/stream" && request.method === "POST") {
+    const body = await readJson<{ fileName?: string }>(request);
+    const fileName = String(body.fileName ?? "").trim();
+    if (!fileName || fileName.includes("\\")) return error("Invalid S3 backup file name", 400);
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const send = (event: string, payload: Record<string, unknown>) => controller.enqueue(sseFrame(event, payload));
+        try {
+          await s3Restore(state.settings.s3Config, fileName, (message, percent) => {
+            send("progress", { message, percent: percent ?? 0 });
+          });
+          send("done", { status: "restored", settings: state.settings });
+        } catch (err) {
+          send("error", { error: err instanceof Error ? err.message : String(err) });
+        } finally {
+          controller.close();
+        }
+      },
+    });
+    return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } });
+  }
+  if (path === "settings/proxy" && request.method === "POST") {
+    const body = await readJson<Partial<ProxyConfig>>(request);
+    const proxyConfig = normalizeProxyConfig(body);
+    updateSettings({ ...state.settings, proxyConfig });
+    applyEffectiveProxy();
+    return json({ status: "ok", config: proxyConfig, ...proxyStatusPayload() });
+  }
+  if (path === "settings/port" && request.method === "POST") {
+    const body = await readJson<{ port?: number | null }>(request).catch(
+      () => ({}) as { port?: number | null },
+    );
+    const preferredPort = normalizePreferredPort(body?.port);
+    updateSettings({ ...state.settings, preferredPort });
+    // The port is only consulted at startup, so this change takes effect on the next launch.
+    // The running server keeps its current port; we return requiresRestart so the UI can tell
+    // the user to restart.
+    return json({ status: "ok", preferredPort, requiresRestart: true });
+  }
+  if (path === "settings/proxy/detect" && request.method === "POST") {
+    const detected = readWindowsSystemProxy();
+    return json({ detected: detected ?? null });
+  }
+  if (path === "settings/proxy/status" && request.method === "GET") {
+    return json(proxyStatusPayload());
+  }
+  if (path === "data/export/status" && request.method === "GET") {
+    const cachedDbPath = join(dataDir, "rikka_hub_cached.db");
+    let schemaInfo: { identityHash: string; version: number } | null = null;
+    if (existsSync(cachedDbPath)) {
+      try {
+        const db = new Database(cachedDbPath, { readonly: true });
+        const hash = (db.query("SELECT identity_hash FROM room_master_table").get() as any)?.identity_hash;
+        const ver = (db.query("PRAGMA user_version").get() as any)?.user_version;
+        db.close();
+        if (hash) schemaInfo = { identityHash: hash, version: ver ?? 0 };
+      } catch { /* */ }
+    }
+    return json({
+      hasAndroidSchema: !!schemaInfo,
+      schemaInfo,
+      conversationCount: state.conversations.length,
+    });
+  }
+  if (path === "data/register-schema" && request.method === "POST") {
+    const tmpRoot = join(tempDir(), `rikkahub-schema-${Date.now()}`);
+    mkdirSync(tmpRoot, { recursive: true });
+    const zipPath = join(tmpRoot, "upload.zip");
+    try {
+      // Support both FormData upload and raw body
+      const contentType = request.headers.get("content-type") ?? "";
+      let zipBuffer: Buffer;
+      if (contentType.includes("multipart/form-data")) {
+        const formData = await request.formData();
+        const file = formData.get("file") as Blob | null;
+        if (!file) return error("未找到上传文件", 400);
+        zipBuffer = Buffer.from(await file.arrayBuffer());
+      } else {
+        zipBuffer = Buffer.from(await request.arrayBuffer());
+      }
+      writeFileSync(zipPath, zipBuffer);
+      const extractDir = join(tmpRoot, "extracted");
+      mkdirSync(extractDir, { recursive: true });
+      if (process.platform === "win32") {
+        const script = [
+          "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+          `[System.IO.Compression.ZipFile]::ExtractToDirectory('${zipPath.replace(/'/g, "''")}', '${extractDir.replace(/'/g, "''")}')`,
+        ].join("; ");
+        Bun.spawnSync(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]);
+      } else {
+        Bun.spawnSync(["unzip", "-o", zipPath, "-d", extractDir]);
+      }
+      const dbFile = join(extractDir, "rikka_hub.db");
+      if (!existsSync(dbFile)) return error("备份文件中未找到 rikka_hub.db", 400);
+      // Rename WAL files for SQLite to pick up
+      for (const [src, dest] of [["rikka_hub-wal", "rikka_hub.db-wal"], ["rikka_hub-shm", "rikka_hub.db-shm"]]) {
+        const s = join(extractDir, src);
+        const d = join(extractDir, dest);
+        if (existsSync(s) && !existsSync(d)) try { renameSync(s, d); } catch { /* */ }
+      }
+      // Open db (readonly) to read schema, then serialize (consolidates WAL) and cache
+      const db = new Database(dbFile, { readonly: true });
+      const hash = (db.query("SELECT identity_hash FROM room_master_table").get() as any)?.identity_hash;
+      const ver = (db.query("PRAGMA user_version").get() as any)?.user_version ?? 0;
+      const bytes = db.serialize();
+      db.close();
+      if (!hash) return error("无法从数据库中读取 identity_hash", 400);
+      const cachedDbPath = join(dataDir, "rikka_hub_cached.db");
+      writeFileSync(cachedDbPath, bytes);
+      return json({ status: "ok", schemaInfo: { identityHash: hash, version: ver } });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 500);
+    } finally {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* */ }
+    }
+  }
+  if (path === "data/export" && request.method === "GET") {
+    // Export as a zip — Android-compatible layout (settings.json + upload/ + skills/) plus
+    // a PC-only pc-backup.json for full-fidelity self-restore. Streams the zip directly off
+    // disk via Bun.file() so multi-GB exports never go through the JS heap. This replaces
+    // the old `.json` path that base64-inlined every uploaded file and OOM'd on users with
+    // large attachment libraries (issue reported 2026-05).
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").replace(/T/, "_").replace(/Z$/, "").replace(/-/g, "").slice(0, 15);
+    const exportFileName = `rikkahub-backup-${stamp}.zip`;
+    const tmpRoot = join(tempDir(), `rikkahub-export-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    mkdirSync(tmpRoot, { recursive: true });
+    const zipPath = join(tmpRoot, exportFileName);
+    try {
+      const size = createSettingsBackupZipToPath(zipPath);
+      // Stream the file as the response body — Bun handles the file-to-stream conversion
+      // without buffering. We can't auto-delete the temp dir mid-stream, so register a
+      // delayed cleanup; if the user cancels mid-download Bun closes the stream and the
+      // next launch's startup cleanup pass (if you have one) eventually reaps the dir.
+      const fileStream = Bun.file(zipPath).stream();
+      setTimeout(() => {
+        try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }, 5 * 60 * 1000);
+      return new Response(fileStream, {
+        headers: {
+          "Content-Type": "application/zip",
+          "Content-Length": String(size),
+          "Content-Disposition": `attachment; filename="${exportFileName}"`,
+          // Expose to client so the UI can show "saved as X" in its success toast.
+          "X-Export-Filename": exportFileName,
+        },
+      });
+    } catch (err) {
+      console.error("[export] failed:", err);
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+      return error(err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+  if (path === "data/import" && request.method === "POST") {
+    // Two upload paths supported:
+    //   • multipart/form-data — legacy path, used by the in-browser import UI for small
+    //     backups. `request.formData()` buffers the whole upload in JS heap.
+    //   • application/octet-stream — streaming path used for large backups (1-10+ GB).
+    //     The frontend sends the raw file body with an `X-Filename` header; we pipe
+    //     `request.body` directly to a temp file on disk, never buffering the whole thing
+    //     in memory. Required because some users report 10 GB+ backups.
+    //
+    // Format detection (zip vs PC json) is done on the on-disk file's first 4 bytes after
+    // the upload completes, regardless of which path we took.
+    const importStartedAt = Date.now();
+    const tmpRoot = join(dataDir, ".import-tmp");
+    try {
+      rmSync(tmpRoot, { recursive: true, force: true });
+      mkdirSync(tmpRoot, { recursive: true });
+      // The on-disk temp file MUST end in `.zip` even though we don't know the format yet —
+      // PowerShell's `Expand-Archive` checks the extension (not magic bytes) and refuses
+      // anything else with "not a supported archive file format". For the PC-JSON path
+      // the extension is a harmless lie; we still detect format from magic bytes below.
+      const onDiskPath = join(tmpRoot, "backup.zip");
+
+      const contentType = (request.headers.get("Content-Type") ?? "").toLowerCase();
+      let originalFilename = request.headers.get("X-Filename") ?? "backup";
+
+      if (contentType.startsWith("application/octet-stream") || contentType.startsWith("application/zip")) {
+        // STREAMING PATH — pipe request.body straight to disk.
+        const body = request.body;
+        if (!body) {
+          return error("No request body", 400);
+        }
+        const writer = Bun.file(onDiskPath).writer();
+        const reader = body.getReader();
+        let bytesReceived = 0;
+        let lastLog = Date.now();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            writer.write(value);
+            bytesReceived += value.length;
+            // Log every 5s so a 10-minute upload doesn't go silent in the console.
+            if (Date.now() - lastLog > 5000) {
+              console.log(`[import] streamed ${(bytesReceived / (1024 * 1024)).toFixed(1)} MB so far...`);
+              lastLog = Date.now();
+            }
+          }
+        } finally {
+          await writer.end();
+        }
+        console.log(`[import] streamed upload complete: ${originalFilename} ${(bytesReceived / (1024 * 1024)).toFixed(1)} MB`);
+      } else {
+        // LEGACY MULTIPART PATH — works for small backups only.
+        console.log("[import] receiving multipart upload...");
+        const form = await request.formData();
+        const file = form.get("file");
+        if (!(file instanceof File)) {
+          console.warn("[import] no file in form data");
+          return error("No backup file uploaded", 400);
+        }
+        originalFilename = file.name;
+        const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
+        console.log(`[import] multipart file ${file.name} (${sizeMB} MB), buffering then writing to disk...`);
+        writeFileSync(onDiskPath, Buffer.from(await file.arrayBuffer()));
+      }
+
+      // Detect format from first 4 bytes of the on-disk file.
+      const magicBytes = new Uint8Array(await Bun.file(onDiskPath).slice(0, 4).arrayBuffer());
+      const isZip = magicBytes.length >= 4 && magicBytes[0] === 0x50 && magicBytes[1] === 0x4B && magicBytes[2] === 0x03 && magicBytes[3] === 0x04;
+      console.log(`[import] file format: ${isZip ? "Android zip" : "PC json"}`);
+
+      if (isZip) {
+        const summary = applyAndroidZipBackupFromPath(onDiskPath);
+        const elapsed = ((Date.now() - importStartedAt) / 1000).toFixed(1);
+        console.log(`[import] Android zip processed in ${elapsed}s: settings=${summary.settingsImported} files=${summary.filesImported} skills=${summary.skillsImported} convs=${summary.conversationsImported} dbErr=${summary.dbReadError ?? "none"}`);
+        const messages = [
+          summary.settingsImported ? "已恢复设置（供应商、助手、搜索服务、MCP、提示注入、世界书、快捷消息）" : "未发现可恢复的设置文件",
+          summary.conversationsImported ? `已恢复 ${summary.conversationsImported} 条对话历史` : "",
+          summary.filesImported ? `已恢复 ${summary.filesImported} 个附件` : "",
+          summary.skillsImported ? `已恢复 ${summary.skillsImported} 个 Skill 文件` : "",
+          summary.dbReadError ? `对话历史导入失败：${summary.dbReadError}` : "",
+        ].filter(Boolean);
+        return json({ status: "imported", source: "android-zip", summary: messages, settings: state.settings });
+      }
+      // PC JSON path — safe to read fully into memory; JSON backups are KB-MB, not GB.
+      const text = readFileSync(onDiskPath, "utf-8");
+      const body = JSON.parse(text) as { state?: Partial<State>; skills?: unknown } & Partial<State>;
+      applyBackupPayload(body);
+      const elapsed = ((Date.now() - importStartedAt) / 1000).toFixed(1);
+      console.log(`[import] PC json processed in ${elapsed}s`);
+      return json({ status: "imported", source: "pc-json", settings: state.settings });
+    } catch (err) {
+      const elapsed = ((Date.now() - importStartedAt) / 1000).toFixed(1);
+      console.error(`[import] failed after ${elapsed}s:`, err);
+      return error(err instanceof Error ? err.message : "Invalid backup file", 400);
+    } finally {
+      // Always clean up the upload temp dir on success or failure. Avoids accumulating
+      // 10+ GB of stale uploads on disk if the user retries.
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
+
+  // -- Update check / download ---------------------------------------------------
+  // Queries GitHub Releases for the latest published release of the PC repo, compares its
+  // tag (e.g. "v1.0.1") to APP_VERSION, and returns the diff so the About page can decide
+  // whether to prompt the user. Unauthenticated GitHub API is capped at 60 req/hr/IP and
+  // can 403 when the user's IP (or anyone behind the same NAT) has been hammering GitHub;
+  // when that happens we fall back to scraping the public `github.com/<repo>/releases/latest`
+  // redirect, which doesn't hit the API and isn't rate-limited.
+  if (path === "update/check" && request.method === "GET") {
+    const repo = "yuh-G/rikkahub-desktop";
+
+    // 按当前运行平台挑选 release asset。命名约定：
+    //   Windows: Rikkahub_<tag>_x64-setup.exe   (NSIS 安装器,含 exe+web-ui+icons)
+    //   Linux:   Rikkahub_<tag>_linux_x64.tar.gz (二进制 + 前端资源一起打包,
+    //            因为前端由 routeStatic 在运行时从文件系统读取,不嵌入二进制)
+    //   macOS:   暂未发布 —— 返回 undefined,前端引导用户去 Release 页手动下载。
+    // 容器化部署(Docker 等)无法通过替换二进制持久更新,直接返回 undefined,
+    // 前端会提示用 docker pull 升级镜像。
+    const pickAsset = (assets: GithubRelease["assets"]): GithubRelease["assets"][number] | undefined => {
+      if (RUNNING_IN_CONTAINER) return undefined;
+      if (RUNTIME_PLATFORM === "linux") {
+        return assets.find((a) => /linux[-_]x64.*\.tar\.gz$/i.test(a.name ?? ""));
+      }
+      if (RUNTIME_PLATFORM === "mac") {
+        return assets.find((a) => /\.dmg$/i.test(a.name ?? ""))
+          ?? assets.find((a) => /(?:macos|darwin|mac)[-_]x64/i.test(a.name ?? ""));
+      }
+      return assets.find((a) => /x64[-_]setup\.exe$/i.test(a.name ?? ""))
+        ?? assets.find((a) => /\.exe$/i.test(a.name ?? ""));
+    };
+
+    // API 不可用(rate limit)时的兜底:按命名约定直接拼 asset URL。
+    const predictAssetName = (tag: string): string =>
+      RUNTIME_PLATFORM === "linux" ? `Rikkahub_${tag}_linux_x64.tar.gz`
+      : RUNTIME_PLATFORM === "mac" ? `Rikkahub_${tag}_mac_x64.dmg`
+      : `Rikkahub_${tag}_x64-setup.exe`;
+
+    // Helper: build the JSON response for a given release tag + metadata, apply skip logic.
+    const buildResponse = (fields: Record<string, unknown>) => {
+      const latest = String(fields.latest ?? "");
+      const isNewer = compareSemver(latest, APP_VERSION) > 0;
+      const skipped = readSkippedVersion();
+      fields.current = APP_VERSION;
+      fields.isNewer = isNewer;
+      fields.isSkipped = isNewer && latest === skipped;
+      fields.platform = RUNTIME_PLATFORM;
+      fields.containerized = RUNNING_IN_CONTAINER;
+      // 缓存探测只对 Windows 有意义(.exe 安装器可直接启动)。Linux 下 download 需要先解压
+      // tar.gz 才能得到 apply 用的二进制路径,缓存的 tar.gz 不能直接 apply,所以跳过。
+      if (!RUNNING_IN_CONTAINER && RUNTIME_PLATFORM === "win") {
+        fields.cachedInstallerPath = probeCachedInstaller(String(fields.fileName ?? ""), latest, isNewer && !fields.isSkipped);
+      }
+      // Windows 下载源改走 R2 镜像(国内/全球都快,与官网同源);fileName 即 R2 对象名。
+      // Linux R2 无预编译包,保留 GitHub Release 直链。
+      if (!RUNNING_IN_CONTAINER && RUNTIME_PLATFORM === "win" && String(fields.fileName ?? "")) {
+        fields.downloadUrl = `${UPDATE_R2_BASE}/${fields.fileName}`;
+      }
+      return json(fields);
+    };
+
+    // Step 1: Use the rate-limit-free HTML redirect (HEAD to github.com/releases/latest)
+    // to discover the latest version tag. This never hits api.github.com so it never
+    // 403s — even when the user's IP has exhausted the 60 req/hr unauthenticated quota.
+    try {
+      const redirect = await fetchLatestReleaseFromHtmlRedirect(repo);
+      const isNewer = compareSemver(redirect.tag, APP_VERSION) > 0;
+
+      // If no update available, return immediately — zero API calls.
+      if (!isNewer) {
+        return buildResponse({
+          latest: redirect.tag,
+          title: "",
+          notes: "",
+          htmlUrl: redirect.htmlUrl,
+          downloadUrl: "",
+          fileName: "",
+          size: 0,
+          source: "redirect",
+        });
+      }
+
+      // Step 2: There IS a newer version. Try the GitHub API for full release details
+      // (release notes, asset URLs, etc.). If the API is rate-limited, fall back to
+      // predicting the asset URL from the naming convention.
+      try {
+        const release = await fetchGithubLatestRelease(repo);
+        const tag = (release.tag_name ?? "").replace(/^v/i, "");
+        const assets = release.assets ?? [];
+        const installer = pickAsset(assets);
+        return buildResponse({
+          latest: tag,
+          title: release.name ?? release.tag_name ?? "",
+          notes: release.body ?? "",
+          htmlUrl: release.html_url ?? redirect.htmlUrl,
+          downloadUrl: installer?.browser_download_url ?? "",
+          fileName: installer?.name ?? "",
+          size: installer?.size ?? 0,
+          source: "api",
+        });
+      } catch {
+        // API failed (rate limit etc.) — use the version from redirect + predicted asset URL.
+        // 容器化或 macOS(无发布物)时不预测 URL,让前端引导用户手动处理。
+        if (RUNNING_IN_CONTAINER || RUNTIME_PLATFORM === "mac") {
+          return buildResponse({
+            latest: redirect.tag,
+            title: `v${redirect.tag}`,
+            notes: "",
+            htmlUrl: redirect.htmlUrl,
+            downloadUrl: "",
+            fileName: "",
+            size: 0,
+            source: "redirect",
+          });
+        }
+        const fileName = predictAssetName(redirect.tag);
+        return buildResponse({
+          latest: redirect.tag,
+          title: `v${redirect.tag}`,
+          notes: "",
+          htmlUrl: redirect.htmlUrl,
+          downloadUrl: `https://github.com/${repo}/releases/download/v${redirect.tag}/${fileName}`,
+          fileName,
+          size: 0,
+          source: "redirect",
+        });
+      }
+    } catch {
+      // Both redirect and API failed — very rare (network down, DNS failure, etc.)
+      return error("检查更新失败：无法连接 GitHub，请检查网络连接", 502);
+    }
+  }
+  // Downloads a release asset to the temp dir's rikkahub-updates subfolder and returns the
+  // local path. Windows: the UI then asks the Tauri shell to launch the .exe installer.
+  // Linux: the UI calls update/apply to swap the running binary. The user explicitly confirms
+  // the restart so we don't race a process that's about to be replaced.
+  if (path === "update/download" && request.method === "POST") {
+    // 流式下载:响应是 text/event-stream,边下载边写盘边推 progress 事件,完成推 done(含
+    // 本地路径)/error。前端用 fetch + ReadableStream 解析——之前用 arrayBuffer 一次性下完
+    // 才返回,前端 XHR onprogress 下载期间收不到任何字节,进度条纹丝不动。
+    let body: { url?: string; fileName?: string };
+    try {
+      body = await readJson<{ url?: string; fileName?: string }>(request);
+    } catch {
+      return error("Invalid request body", 400);
+    }
+    const url = String(body.url ?? "").trim();
+    if (!/^https:\/\//i.test(url)) return error("Invalid download URL", 400);
+    // 只放行 GitHub 与自建 R2 镜像,缩小 URL 被篡改时的攻击面。
+    const host = (() => {
+      try {
+        return new URL(url).host.toLowerCase();
+      } catch {
+        return "";
+      }
+    })();
+    if (!/^(github\.com|.*\.githubusercontent\.com|objects\.githubusercontent\.com|pub-[a-f0-9]+\.r2\.dev)$/i.test(host)) {
+      return error(`Refusing to download from untrusted host: ${host}`, 400);
+    }
+    const sanitized = String(body.fileName ?? "").replace(/[^A-Za-z0-9._\-]/g, "") || "rikkahub-update";
+    // Windows: launch_installer 只认 .exe(lib.rs 路径检查);Linux: asset 是 tar.gz,保留原名。
+    const fileName = RUNTIME_PLATFORM === "win"
+      ? (/\.exe$/i.test(sanitized) ? sanitized : `${sanitized}.exe`)
+      : sanitized;
+    mkdirSync(updatesCacheDir, { recursive: true });
+    const targetPath = join(updatesCacheDir, fileName);
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        const encoder = new TextEncoder();
+        const send = (obj: Record<string, unknown>) => {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+        };
+        try {
+          const res = await fetch(url, { redirect: "follow", headers: { "User-Agent": "RikkaHub-PC" } });
+          if (!res.ok || !res.body) {
+            const text = res.ok ? "no response body" : await res.text().catch(() => "");
+            send({ type: "error", message: `Download failed: ${res.status} ${String(text).slice(0, 200)}` });
+            return;
+          }
+          const total = Number(res.headers.get("content-length") || 0);
+          const reader = res.body.getReader();
+          const writer = Bun.file(targetPath).writer();
+          let received = 0;
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            await writer.write(value);
+            received += value.length;
+            const percent = total > 0 ? Math.round((received / total) * 100) : 0;
+            send({ type: "progress", loaded: received, total, percent });
+          }
+          await writer.end();
+
+          if (RUNTIME_PLATFORM === "win") {
+            // targetPath 指向 .exe 安装器,前端交给 Tauri launch_installer。
+            send({ type: "done", path: targetPath, size: received });
+            return;
+          }
+          // Linux: 下载的是 tar.gz(二进制 + 前端资源),解压后返回内部二进制路径,
+          // update/apply 据此连同同目录的 web-ui 一起替换。
+          const extractBase = fileName.replace(/\.tar\.gz$/i, "") || "rikkahub-pc";
+          const extractDir = join(updatesCacheDir, `extracted-${extractBase}`);
+          try { rmSync(extractDir, { recursive: true, force: true }); } catch { /* 清理上一次解压残留 */ }
+          mkdirSync(extractDir, { recursive: true });
+          const tar = Bun.spawnSync(["tar", "xzf", targetPath, "-C", extractDir]);
+          if (tar.exitCode !== 0) {
+            send({ type: "error", message: `解压更新包失败：${tar.stderr?.toString().trim() || `tar exited ${tar.exitCode}`}` });
+            return;
+          }
+          // 解压后约定结构:extractDir/rikkahub-pc/rikkahub-pc (+ extractDir/rikkahub-pc/web-ui/)
+          const innerExe = join(extractDir, "rikkahub-pc", "rikkahub-pc");
+          if (!existsSync(innerExe) || statSync(innerExe).size === 0) {
+            send({ type: "error", message: "解压后未找到可执行文件（更新包结构异常）" });
+            return;
+          }
+          try { chmodSync(innerExe, 0o755); } catch { /* best-effort */ }
+          send({ type: "done", path: innerExe, size: received });
+        } catch (err) {
+          send({ type: "error", message: err instanceof Error ? err.message : String(err) });
+        } finally {
+          controller.close();
+        }
+      },
+    });
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-store",
+        Connection: "keep-alive",
+      },
+    });
+  }
+  // Linux only: 把刚下载并解压的新版本(二进制 + 前端资源)原地替换到当前应用目录。
+  // download 已把 tar.gz 解压到 <tmp>/rikkahub-updates/extracted-*/rikkahub-pc/,其中含新
+  // 二进制和 web-ui。这里:
+  //   1. 用 staging + rename 原子替换 web-ui 目录(routeStatic 每次请求重读,换完立即生效)
+  //   2. rename 新二进制覆盖正在运行的二进制(Linux 允许,旧进程继续用旧 inode 直到退出)
+  // 替换成功后前端提示用户重启;systemd 配 Restart=always 的会自动拉起新版本。
+  //
+  // Windows 走 Tauri NSIS 安装器,macOS 暂不支持原地更新 —— 都在此拒绝。Docker 也不行
+  // (容器重建即丢失替换),应 docker pull。
+  if (path === "update/apply" && request.method === "POST") {
+    if (RUNTIME_PLATFORM !== "linux") return error("仅 Linux 支持原地更新", 400);
+    if (RUNNING_IN_CONTAINER) return error("容器化部署无法原地更新，请通过 docker pull 升级镜像", 400);
+    try {
+      const body = await readJson<{ path?: string }>(request);
+      const srcExe = String(body.path ?? "").trim();
+      if (!srcExe) return error("缺少更新文件路径", 400);
+      const resolvedSrcExe = resolve(srcExe);
+      if (!existsSync(resolvedSrcExe)) return error("更新文件不存在", 404);
+      if (statSync(resolvedSrcExe).size === 0) return error("更新文件为空", 400);
+
+      // Security: srcExe 必须在我们的受信任更新目录树内(download 解压到这里),否则一个构造
+      // 的请求可能让我们把任意文件拷到可执行路径上。
+      const updatesDir = resolve(updatesCacheDir);
+      const rel = relative(updatesDir, resolvedSrcExe);
+      if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
+        return error("更新文件路径不在受信任目录内", 400);
+      }
+
+      const currentExe = resolve(process.execPath);
+      const currentAppDir = dirname(currentExe);
+      if (!existsSync(currentExe)) return error(`当前可执行文件路径无效：${currentExe}`, 500);
+
+      // 新应用目录 = 解压出的 rikkahub-pc/(新二进制的同级目录,含新 web-ui)。
+      const newAppDir = dirname(resolvedSrcExe);
+
+      // ── 1. 替换前端资源 (web-ui 目录) ──────────────────────────────────
+      // 拷到 .web-ui.new 再原子 rename 覆盖。失败不致命(新版本可能没改前端):记 warning
+      // 后继续替换二进制 —— 避免前端替换的小问题阻塞整个更新。
+      const currentWebUi = join(currentAppDir, "web-ui");
+      const newWebUi = join(newAppDir, "web-ui");
+      if (existsSync(newWebUi)) {
+        const staging = join(currentAppDir, ".web-ui.new");
+        const bak = join(currentAppDir, ".web-ui.bak");
+        try {
+          if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
+          const cp = Bun.spawnSync(["cp", "-r", newWebUi, staging]);
+          if (cp.exitCode !== 0) {
+            console.warn("[update/apply] cp web-ui to staging failed:", cp.stderr?.toString().trim());
+          } else if (existsSync(currentWebUi)) {
+            if (existsSync(bak)) rmSync(bak, { recursive: true, force: true });
+            try { renameSync(currentWebUi, bak); } catch { /* 首次安装可能没有旧 web-ui */ }
+            try {
+              renameSync(staging, currentWebUi);
+              try { rmSync(bak, { recursive: true, force: true }); } catch { /* */ }
+            } catch (swapErr) {
+              console.warn("[update/apply] web-ui swap failed, rolling back:", swapErr);
+              try { if (existsSync(bak)) renameSync(bak, currentWebUi); } catch { /* */ }
+              return error("替换前端资源失败，更新未完成", 500);
+            }
+          } else {
+            // 当前没有 web-ui 目录(异常状态),直接把 staging 就位。
+            renameSync(staging, currentWebUi);
+          }
+        } catch (webUiErr) {
+          console.warn("[update/apply] web-ui update skipped:", webUiErr);
+        }
+      }
+
+      // ── 2. 备份 + 原子替换二进制 ───────────────────────────────────────
+      // 必须同时绕开两个 Linux 约束:
+      //   (a) currentExe 正在运行:Linux 禁止 write/open 它(ETXTBSY),但同文件系统内的
+      //       rename(2) 可以覆盖它——rename 只改目录项,旧 inode 留给运行中的进程直到退出,
+      //       下次启动即用新版本。这是 Linux 自更新二进制的标准机制。
+      //   (b) 下载的新二进制在 /tmp,常与安装目录(/home/...)不在同一文件系统,跨设备
+      //       rename 直接 EXDEV。
+      // 旧逻辑"rename(源→目标),失败 fallback copy"两头堵死:跨设备 rename→EXDEV,
+      // fallback 直接 copy 目标→ETXTBSY(运行中)。正解:先 copy 到安装目录下的临时文件
+      // (跨设备 copy 合法,目标是新文件不触发 ETXTBSY),再在同文件系统内 rename 覆盖当前
+      // 二进制(同设备不 EXDEV,且能覆盖运行中的二进制)。与上面 web-ui 的 staging+rename
+      // 同构。
+      const backupPath = `${currentExe}.bak`;
+      try {
+        if (existsSync(backupPath)) unlinkSync(backupPath);
+        copyFileSync(currentExe, backupPath);
+      } catch (backupErr) {
+        console.warn("[update/apply] binary backup skipped:", backupErr);
+      }
+      const stagingExe = `${currentExe}.new`;
+      try {
+        copyFileSync(resolvedSrcExe, stagingExe);
+        try { chmodSync(stagingExe, 0o755); } catch { /* */ }
+        renameSync(stagingExe, currentExe);
+      } catch (swapErr) {
+        try { if (existsSync(stagingExe)) unlinkSync(stagingExe); } catch { /* */ }
+        console.warn("[update/apply] binary swap failed:", swapErr);
+        return error(`替换二进制失败：${swapErr instanceof Error ? swapErr.message : String(swapErr)}`, 500);
+      }
+
+      return json({ status: "ok", exePath: currentExe, backupPath: existsSync(backupPath) ? backupPath : null, needRestart: true });
+    } catch (err) {
+      return error(`应用更新失败：${err instanceof Error ? err.message : String(err)}`, 500);
+    }
+  }
+  if (path === "update/skip" && request.method === "POST") {
+    const body = await readJson<{ version?: string }>(request);
+    const version = String(body.version ?? "").trim().replace(/^v/i, "");
+    if (!version) return error("Missing version", 400);
+    writeSkippedVersion(version);
+    return json({ status: "ok", skipped: version });
+  }
+
+  if (path === "settings/asr-provider/detail" && request.method === "POST") {
+    const body = await readJson<Partial<AsrProvider>>(request);
+    const type = ["dashscope", "volcengine", "openai_realtime"].includes(String(body.type))
+      ? String(body.type) as AsrProvider["type"]
+      : "openai_realtime";
+    const base = defaultAsrProvider(type);
+    const providerItem = normalizeAsrProviders([{ ...base, ...body, type, id: String(body.id ?? base.id) }])[0];
+    const exists = state.settings.asrProviders.some((item) => item.id === providerItem.id);
+    updateSettings({
+      ...state.settings,
+      asrProviders: exists
+        ? state.settings.asrProviders.map((item) => item.id === providerItem.id ? providerItem : item)
+        : [providerItem, ...state.settings.asrProviders],
+      selectedASRProviderId: state.settings.selectedASRProviderId ?? providerItem.id,
+    });
+    return json({ status: "ok", provider: providerItem });
+  }
+  if (path === "settings/asr-provider/select" && request.method === "POST") {
+    const body = await readJson<{ id: string }>(request);
+    const providerId = String(body.id ?? "");
+    if (!state.settings.asrProviders.some((provider) => provider.id === providerId)) return error("ASR provider not found", 404);
+    updateSettings({ ...state.settings, selectedASRProviderId: providerId });
+    return json({ status: "ok" });
+  }
+  const asrProviderDelete = path.match(/^settings\/asr-provider\/([^/]+)$/);
+  if (asrProviderDelete && request.method === "DELETE") {
+    const providerId = decodeURIComponent(asrProviderDelete[1]);
+    const asrProviders = state.settings.asrProviders.filter((provider) => provider.id !== providerId);
+    updateSettings({
+      ...state.settings,
+      asrProviders,
+      selectedASRProviderId: state.settings.selectedASRProviderId === providerId ? asrProviders[0]?.id ?? null : state.settings.selectedASRProviderId,
+    });
+    return json({ status: "deleted" });
+  }
+  if (path === "settings/asr-provider/reorder" && request.method === "POST") {
+    const body = await readJson<{ ids: string[] }>(request);
+    const byId = new Map(state.settings.asrProviders.map((provider) => [provider.id, provider]));
+    const reordered = (body.ids ?? []).map((providerId) => byId.get(providerId)).filter(Boolean) as AsrProvider[];
+    for (const provider of state.settings.asrProviders) {
+      if (!reordered.some((item) => item.id === provider.id)) reordered.push(provider);
+    }
+    updateSettings({ ...state.settings, asrProviders: reordered });
+    return json({ status: "ok" });
+  }
+
+  if (path === "settings/tts-provider/detail" && request.method === "POST") {
+    const body = await readJson<Partial<TtsProvider>>(request);
+    const type = ["system", "openai", "gemini", "minimax", "qwen", "groq", "xai", "mimo"].includes(String(body.type)) ? body.type as TtsProvider["type"] : "system";
+    const base = defaultTtsProvider(type);
+    const providerItem = normalizeTtsProviders([{ ...base, ...body, type, id: String(body.id ?? base.id) }])[0];
+    const exists = state.settings.ttsProviders.some((item) => item.id === providerItem.id);
+    updateSettings({
+      ...state.settings,
+      ttsProviders: exists
+        ? state.settings.ttsProviders.map((item) => item.id === providerItem.id ? providerItem : item)
+        : [providerItem, ...state.settings.ttsProviders],
+      selectedTTSProviderId: state.settings.selectedTTSProviderId ?? providerItem.id,
+    });
+    return json({ status: "ok", provider: providerItem });
+  }
+  if (path === "settings/tts-provider/select" && request.method === "POST") {
+    const body = await readJson<{ id: string }>(request);
+    const providerId = String(body.id ?? "");
+    if (!state.settings.ttsProviders.some((provider) => provider.id === providerId)) return error("TTS provider not found", 404);
+    updateSettings({ ...state.settings, selectedTTSProviderId: providerId });
+    return json({ status: "ok" });
+  }
+  const ttsProviderDelete = path.match(/^settings\/tts-provider\/([^/]+)$/);
+  if (ttsProviderDelete && request.method === "DELETE") {
+    const providerId = decodeURIComponent(ttsProviderDelete[1]);
+    if (providerId === DEFAULT_SYSTEM_TTS_ID) return error("System TTS provider cannot be deleted", 400);
+    const ttsProviders = state.settings.ttsProviders.filter((provider) => provider.id !== providerId);
+    updateSettings({
+      ...state.settings,
+      ttsProviders,
+      selectedTTSProviderId: state.settings.selectedTTSProviderId === providerId ? ttsProviders[0]?.id ?? null : state.settings.selectedTTSProviderId,
+    });
+    return json({ status: "deleted" });
+  }
+  if (path === "settings/tts-provider/reorder" && request.method === "POST") {
+    const body = await readJson<{ ids: string[] }>(request);
+    const byId = new Map(state.settings.ttsProviders.map((provider) => [provider.id, provider]));
+    const reordered = (body.ids ?? []).map((providerId) => byId.get(providerId)).filter(Boolean) as TtsProvider[];
+    for (const provider of state.settings.ttsProviders) {
+      if (!reordered.some((item) => item.id === provider.id)) reordered.push(provider);
+    }
+    updateSettings({ ...state.settings, ttsProviders: reordered });
+    return json({ status: "ok" });
+  }
+
+  // Cancel all currently-running system-TTS PowerShell processes. Called by the floating
+  // play bar's stop button so the "你点了 ✕ 但 Windows TTS 还在念" gap closes within
+  // ~100 ms. Online-TTS providers don't need cancellation server-side — they're already
+  // synchronous request/response, and the client aborts its fetch directly.
+  if (path === "tts/cancel" && request.method === "POST") {
+    cancelAllSystemTts();
+    return json({ status: "ok" });
+  }
+  if (path === "tts/speech" && request.method === "POST") {
+    const body = await readJson<{ text?: string; providerId?: string; speed?: number }>(request);
+    const text = String(body.text ?? "").trim();
+    if (!text) return error("Text is required", 400);
+    try {
+      const result = await generateSpeechWithTtsProvider(text, body.providerId, body.speed);
+      if (!result.audio) return error("TTS provider returned no audio", 502);
+      return new Response(result.audio, {
+        headers: {
+          "Content-Type": result.mime,
+          "Cache-Control": "no-store",
+          "X-RikkaHub-TTS-Provider": result.provider.id,
+        },
+      });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+
+  if (path === "asr/transcribe" && request.method === "POST") {
+    const form = await request.formData();
+    const file = form.get("audio");
+    if (!(file instanceof File)) return error("No audio file uploaded", 400);
+    try {
+      const text = await transcribeAudioWithAsrProvider(file);
+      return json({ status: "ok", text });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+
+  if (path === "images" && request.method === "GET") {
+    return json({ images: state.generatedImages });
+  }
+  if (path === "images/generate" && request.method === "POST") {
+    const body = await readJson<{ prompt: string; numberOfImages?: number; aspectRatio?: string; referenceFileIds?: number[] }>(request);
+    if (!String(body.prompt ?? "").trim()) return error("Prompt is required", 400);
+    try {
+      const images = await callImageGeneration({
+        prompt: String(body.prompt).trim(),
+        numberOfImages: Number(body.numberOfImages ?? 1),
+        aspectRatio: String(body.aspectRatio ?? "square"),
+        referenceFileIds: Array.isArray(body.referenceFileIds) ? body.referenceFileIds.map(Number).filter(Number.isFinite) : [],
+      });
+      return json({ status: "ok", images });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : String(err), 502);
+    }
+  }
+  const generatedImageDelete = path.match(/^images\/([^/]+)$/);
+  if (generatedImageDelete && request.method === "DELETE") {
+    const imageId = decodeURIComponent(generatedImageDelete[1]);
+    state.generatedImages = state.generatedImages.filter((image) => image.id !== imageId);
+    saveState();
+    return json({ status: "deleted" });
+  }
+
+  console.warn(`[404] ${request.method} /api/${path}`);
+  return error("Not found", 404);
+}
+
+function mime(path: string) {
+  if (path.endsWith(".html")) return "text/html; charset=utf-8";
+  if (path.endsWith(".js")) return "text/javascript; charset=utf-8";
+  if (path.endsWith(".css")) return "text/css; charset=utf-8";
+  if (path.endsWith(".svg")) return "image/svg+xml";
+  if (path.endsWith(".png")) return "image/png";
+  if (path.endsWith(".webp")) return "image/webp";
+  if (path.endsWith(".ico")) return "image/x-icon";
+  return "application/octet-stream";
+}
+
+async function routeStatic(url: URL) {
+  const candidates = [
+    resolve(executableDir, "web-ui", "build", "client"),
+    resolve(executableDir, "web-ui", "build"),
+    resolve(rootDir, "web-ui", "build", "client"),
+    resolve(rootDir, "web-ui", "build"),
+    resolve(rootDir, "web-ui", "dist"),
+  ];
+  const staticRoot = candidates.find((candidate) => existsSync(join(candidate, "index.html")));
+  if (!staticRoot) {
+    return new Response("web-ui is not built. Run `cd web-ui && bun install && bun run build`.", { status: 200 });
+  }
+  const requested = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
+  const target = resolve(staticRoot, requested);
+  if (target.startsWith(staticRoot) && existsSync(target)) {
+    return new Response(Bun.file(target), {
+      headers: { "Content-Type": mime(target), "Cache-Control": staticCacheControl(url.pathname, target) },
+    });
+  }
+  // SPA fallback (index.html): 绝不缓存。覆盖安装后 WebView2 每次都拿最新的 index.html,
+  // 它引用的 hash 化 css/js 会自然跟到新版本,彻底杜绝"装了新版还在跑旧前端"的缓存污染。
+  return new Response(Bun.file(join(staticRoot, "index.html")), {
+    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+  });
+}
+
+// 静态资源 Cache-Control 策略,解决覆盖安装时 WebView2 缓存旧前端的问题:
+//   index.html → no-store:唯一被直接请求的"无 hash"入口,只要它最新,引用的
+//               /assets/*.<hash>.css|js 会自动指向新版本。
+//   /assets/* → immutable + 1 年:Vite 按内容 hash 命名,内容变则文件名变,可安全永久缓存。
+//   其余(favicon 等,无 hash)→ 1 小时短缓存兜底。
+function staticCacheControl(pathname: string, target: string): string {
+  if (target.endsWith("index.html") || pathname === "/") return "no-store";
+  if (pathname.startsWith("/assets/") && /\.(css|js|mjs|woff2?|ttf|otf|wasm)$/i.test(target)) {
+    return "public, max-age=31536000, immutable";
+  }
+  return "public, max-age=3600";
+}
+
+// Tolerate both layouts: when run via `bun run server.ts`, argv[0..1] are bun + script;
+// when run as a `bun build --compile` exe, argv[0] is the exe itself. `slice(1)` strips
+// the leading process binary in both cases, leaving just user flags.
+const args = new Set(Bun.argv.slice(1));
+const portIndex = Bun.argv.findIndex((arg) => arg === "--port");
+const portEqualsArg = Bun.argv.find((arg) => arg.startsWith("--port="));
+const portValue = portEqualsArg?.split("=")[1] ?? (portIndex >= 0 ? Bun.argv[portIndex + 1] : undefined);
+
+if (process.platform === "linux") {
+  const missing: string[] = [];
+  const has = (cmd: string) => Bun.which(cmd) !== null;
+  if (!has("unzip")) missing.push("unzip  (backup restore / skill import from ZIP / large DOCX streaming extract)");
+  if (!has("zip")) missing.push("zip  (backup export)");
+  if (!has("wl-copy") && !has("xclip")) missing.push("wl-clipboard or xclip  (clipboard tool)");
+  if (!has("espeak-ng")) missing.push("espeak-ng  (system TTS)");
+  if (missing.length > 0) {
+    console.warn("[startup] Missing optional Linux tools — some features will not work:");
+    for (const dep of missing) console.warn(`  - ${dep}`);
+  }
+}
+
+// Resolve the preferred port by priority: explicit `--port` flag > `PORT` env > user setting
+// > 8080. Containerized deploys skip the user setting — inside a container the port is fixed
+// by the image / `docker -p` mapping, so honoring a UI change there would be misleading.
+function resolvePreferredPort(): number {
+  if (portValue) {
+    const cli = Number(portValue);
+    if (cli > 0 && cli <= 65535) return cli;
+  }
+  if (process.env.PORT) {
+    const envPort = Number(process.env.PORT);
+    if (envPort > 0 && envPort <= 65535) return envPort;
+  }
+  if (!RUNNING_IN_CONTAINER && state.settings.preferredPort) {
+    return state.settings.preferredPort;
+  }
+  return 8080;
+}
+
+const preferredPort = resolvePreferredPort();
+// Try the preferred port first; on EADDRINUSE walk upward. Containers don't walk — a port
+// collision inside a container is unexpected, and silently hopping would hide a real problem.
+const MAX_PORT_ATTEMPTS = RUNNING_IN_CONTAINER ? 1 : 20;
+
+const { server, port } = (() => {
+  for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt += 1) {
+    const tryPort = preferredPort + attempt;
+    if (tryPort > 65535) break;
+    try {
+      return {
+        server: Bun.serve({
+          port: tryPort,
+          idleTimeout: 0,
+          // Default is 128 MB — way too small. Users have reported backup zips of 10+ GB
+          // (months of conversations + image attachments). The streaming `data/import` path
+          // never holds the full body in memory anyway (pipes request.body directly to disk),
+          // so this just acts as a sanity-check ceiling against truly absurd uploads.
+          maxRequestBodySize: 64 * 1024 * 1024 * 1024,
+          async fetch(request, server) {
+            server.timeout(request, 0);
+            const url = new URL(request.url);
+            try {
+              if (url.pathname === "/api/asr/realtime" && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+                const upgraded = server.upgrade(request, { data: { kind: "asr" } });
+                return upgraded ? undefined : error("WebSocket upgrade failed", 400);
+              }
+              if (url.pathname.startsWith("/api/")) return await routeApi(request, url);
+              return await routeStatic(url);
+            } catch (err) {
+              console.error(err);
+              return error(err instanceof Error ? err.message : String(err), 500);
+            }
+          },
+          websocket: {
+            message(ws, data) {
+              if ((ws.data as { kind?: string } | undefined)?.kind !== "asr") return;
+              if (typeof data === "string") {
+                const payload = JSON.parse(data || "{}") as { type?: string; providerId?: string };
+                if (payload.type === "start") startAsrRealtimeSession(ws, payload.providerId);
+                if (payload.type === "stop") stopAsrRealtimeSession(ws);
+                return;
+              }
+              const session = asrRealtimeSessions.get(ws);
+              if (!session) return;
+              const buffer = data instanceof ArrayBuffer
+                ? data
+                : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+              sendAsrAudio(session, buffer);
+            },
+            close(ws) {
+              if ((ws.data as { kind?: string } | undefined)?.kind === "asr") stopAsrRealtimeSession(ws);
+            },
+          },
+        }),
+        port: tryPort,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Non-port-conflict errors (permission denied, bad config, etc.) must not silently hop
+      // to the next port — surface them and stop.
+      if (!/EADDRINUSE|address already in use|in use/i.test(message)) {
+        console.error(`[rikkahub-server] Failed to start on port ${tryPort}: ${message}`);
+        process.exit(1);
+      }
+      if (attempt === 0) {
+        console.warn(
+          `[startup] Port ${tryPort} busy, trying alternatives up to ${Math.min(preferredPort + MAX_PORT_ATTEMPTS - 1, 65535)}...`,
+        );
+      }
+    }
+  }
+  // Exhausted the whole range. Emit the single-line marker the Tauri shell parses
+  // (`port_in_use:<port>`) so it shows a friendly dialog instead of hanging silently.
+  const top = Math.min(preferredPort + MAX_PORT_ATTEMPTS - 1, 65535);
+  console.error(`[rikkahub-server] port_in_use:${preferredPort}`);
+  console.error(
+    `No available port in range ${preferredPort}-${top}. Close other apps using these ports, ` +
+      `or change the preferred port in 设置 → 代理与端口.`,
+  );
+  process.exit(2);
+})();
+
+// Machine-readable marker parsed by the Tauri shell (src-tauri/src/lib.rs) to learn which port
+// the sidecar actually bound to — the shell navigates the webview here when 8080 was taken.
+// Keep it a single line with the exact `RIKKAHUB_PORT:<port>` prefix.
+console.log(`RIKKAHUB_PORT:${port}`);
+
+console.log(`RikkaHub PC server running at http://localhost:${port}`);
+console.log(`Data directory: ${dataDir}`);
+// 懒加载 models.dev 模型目录(用于 context window 显示)。fire-and-forget,失败不影响启动。
+void loadModelsDev();
+console.log("Press Ctrl+C to stop RikkaHub PC.");
+
+// Start anonymous analytics (DAU tracking).  Fire-and-forget — a failed ping
+// must never block or crash the server.  The endpoint resolves to a Cloudflare
+// Worker that stores only an anonymous device UUID + date + version.
+startAnalytics();
+
+function shutdown() {
+  server.stop(true);
+  // 1.2.6:关停前刷活库残余脏标记 + WAL checkpoint(TRUNCATE 把 -wal 并入主库并截断),
+  // 确保活库数据完整落盘、下次启动读到最新。
+  try {
+    flushConvDirtyNow();
+    conversationsDb?.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  } catch (err) {
+    console.warn("[conv-db] 关停刷库失败", err);
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+if (!args.has("--dev") && !args.has("--no-open")) {
+  const opener = process.platform === "win32" ? "cmd" : "sh";
+  const command = process.platform === "win32"
+    ? ["/c", "start", `http://localhost:${port}`]
+    : ["-c", `open http://localhost:${port} || xdg-open http://localhost:${port}`];
+  Bun.spawn([opener, ...command], { stdout: "ignore", stderr: "ignore" });
+}
